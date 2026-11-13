@@ -338,6 +338,23 @@ STOCK_STOPWORDS = (
 STOCK_DELIMITERS = r"\b(?:dan|serta|di|ke|pada|untuk|bulan|hari|berapa|status|faktur|tagihan|invoice|saldo|jurnal|gudang|lokasi)\b"
 
 
+def _is_pure_branch_token(token: Optional[str]) -> bool:
+    """Return True if token is solely a branch/store location phrase with no SKU/product info."""
+    if not token:
+        return False
+    return bool(
+        resolve_branch_company_id(token) is not None
+        and (
+            re.match(r"^(?:cabang|toko|kantor)\s+", token, re.IGNORECASE)
+            or token.lower().strip() in {
+                "bandung", "jakarta", "surabaya", "makassar", "makasar",
+                "medan", "bekasi", "tangerang", "malang",
+                "kantor pusat", "toko pusat", "head office", "main store", "mainstore",
+            }
+        )
+    )
+
+
 def _fallback_extract_stock_level(
     query: str,
     history: Optional[list] = None,
@@ -347,17 +364,25 @@ def _fallback_extract_stock_level(
     cleaned = re.sub(r"[^\w\)]+$", "", (query or "").strip(), flags=re.UNICODE).strip()
 
     loc_match = re.search(
-        r"(?:\bdi\s+(?:gudang\s+|lokasi\s+)?|\b(?:gudang|lokasi)\s+)([A-Za-z0-9\_\-]+)",
+        r"(?:\bdi\s+(?:gudang\s+|lokasi\s+)?|\b(?:gudang|lokasi)\s+)(?:cabang\s+|toko\s+|kantor\s+)?([A-Za-z0-9\_\-]+(?:\s+[A-Za-z0-9\_\-]+)?)",
         cleaned,
         re.IGNORECASE,
     )
     if loc_match:
-        loc_candidate = loc_match.group(1).strip()
-        if (
-            loc_candidate.lower() not in ("mana", "sini", "situ", "kantor", "semua", "ini", "itu", "gudang", "lokasi")
-            and loc_candidate.lower() not in STOCK_STOPWORDS
-        ):
-            params["location_name"] = loc_candidate
+        raw_loc = loc_match.group(1).strip()
+        loc_stop_tokens = {
+            "mana", "sini", "situ", "kantor", "semua", "ini", "itu",
+            "gudang", "lokasi", "cabang", "saat", "sekarang",
+            "berapa", "status", "bulan", "hari", "minggu", "tahun", "kemarin",
+            *STOCK_STOPWORDS,
+        }
+        loc_words: List[str] = []
+        for w in raw_loc.split():
+            if w.lower() in loc_stop_tokens:
+                break
+            loc_words.append(w)
+        if loc_words:
+            params["location_name"] = " ".join(loc_words)
 
     pattern = re.compile(
         r"(?:(?:stok|stock|sisa|barang|produk|product|item)\s+)+(?:untuk\s+|terkait\s+|dari\s+|tentang\s+)?"
@@ -377,7 +402,7 @@ def _fallback_extract_stock_level(
         token = match.group(1).strip().rstrip("?!.,; '\"")
         token = clean_product_identifier(token)
         words = [w for w in token.split() if w.lower() not in STOCK_STOPWORDS]
-        if words:
+        if words and not _is_pure_branch_token(token):
             params["code"] = token
             return params
 
@@ -392,7 +417,7 @@ def _fallback_extract_stock_level(
     )
     # Check history if referential or if code is missing but history exists (follow-up slot filling)
     if (is_referential or not params.get("code")) and history:
-        prior_msgs = history[:-1] if (len(history) > 1 and cleaned.lower() in getattr(history[-1], "content", "").lower()) else history
+        prior_msgs = history[:-1] if (history and cleaned and cleaned.lower() in str(getattr(history[-1], "content", "") or "").lower()) else history
         for prev_msg in reversed(prior_msgs):
             content = getattr(prev_msg, "content", "") or ""
             is_human = isinstance(prev_msg, HumanMessage) or getattr(prev_msg, "type", "") == "human"
@@ -479,7 +504,12 @@ def _fallback_extract_product_info(
         words = [w for w in term.split() if w.lower() not in PRODUCT_STOPWORDS]
         if words:
             candidate = " ".join(words)
-            if not is_vendor_name(candidate) and not is_account_code_or_name(candidate) and not is_accounting_term(candidate):
+            if (
+                not is_vendor_name(candidate)
+                and not is_account_code_or_name(candidate)
+                and not is_accounting_term(candidate)
+                and not _is_pure_branch_token(candidate)
+            ):
                 params["search"] = candidate
                 return params
 
@@ -488,7 +518,7 @@ def _fallback_extract_product_info(
         or any(ref in cleaned.lower() for ref in ("itu", "tersebut", "tadi", "produk", "barang", "coba lagi", "cek lagi", "periksa lagi", "cari lagi", "ulang", "retry"))
     )
     if is_referential and history:
-        prior_msgs = history[:-1] if (len(history) > 1 and cleaned.lower() in getattr(history[-1], "content", "").lower()) else history
+        prior_msgs = history[:-1] if (history and cleaned and cleaned.lower() in str(getattr(history[-1], "content", "") or "").lower()) else history
         for prev_msg in reversed(prior_msgs):
             content = getattr(prev_msg, "content", "") or ""
             prev_tokens = re.findall(r"\b([A-Z0-9]+(?:-[A-Z0-9]+)+|\d{4,8})\b", content)
@@ -952,7 +982,11 @@ def _extract_single_tool_params(
 
             if not extracted_dict.get("code"):
                 history_msgs = state.get("messages") or []
-                prior_msgs = history_msgs[:-1] if (len(history_msgs) > 1 and user_query.lower() in getattr(history_msgs[-1], "content", "").lower()) else history_msgs
+                prior_msgs = (
+                    history_msgs[:-1]
+                    if (history_msgs and user_query and user_query.lower() in str(getattr(history_msgs[-1], "content", "") or "").lower())
+                    else history_msgs
+                )
                 for prev_msg in reversed(prior_msgs):
                     if not isinstance(prev_msg, HumanMessage) and getattr(prev_msg, "type", "") != "human":
                         continue

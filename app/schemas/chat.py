@@ -66,3 +66,11 @@ class ChatResponse(BaseModel):
         default_factory=list,
         description="Context-aware follow-up queries generated directly by AI provider"
     )
+    resolved_company_id: Optional[int] = Field(
+        default=None,
+        description="Effective ERP company ID used for query execution (reflects branch switches)"
+    )
+    execution_time_ms: Optional[float] = Field(
+        default=None,
+        description="End-to-end workflow execution latency in milliseconds"
+    )

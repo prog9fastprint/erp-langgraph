@@ -329,6 +329,45 @@ def _enforce_checkpoint_lru_bound(
     return evicted
 
 
+def _resolve_effective_company_id(
+    user_query: str,
+    company_id: Optional[int],
+    company_id_explicit: Optional[bool],
+    checkpoint_values: Optional[Dict[str, Any]],
+) -> int:
+    """
+    Resolve effective company_id with strict 4-tier priority:
+      1. Explicit branch name in current user_query text
+      2. Explicit company_id provided by API payload / caller (including company_id=1)
+      3. Sticky company_id from previous checkpoint turn
+      4. Fallback to company_id argument or settings.DEFAULT_COMPANY_ID
+    """
+    from app.graph.nodes.extractor import resolve_branch_company_id
+
+    # Priority 1: Explicit branch name mentioned in current query text
+    branch_from_text = resolve_branch_company_id(user_query)
+    if branch_from_text is not None:
+        return int(branch_from_text)
+
+    # Compatibility: if caller omitted company_id_explicit, treat non-default ID as explicit
+    is_explicit = (
+        bool(company_id_explicit)
+        if company_id_explicit is not None
+        else (company_id is not None and company_id != settings.DEFAULT_COMPANY_ID)
+    )
+
+    # Priority 2: Explicit company_id supplied in payload/caller (including company_id=1)
+    if is_explicit and company_id is not None:
+        return int(company_id)
+
+    # Priority 3: Sticky company_id from previous checkpoint turn
+    if checkpoint_values and checkpoint_values.get("company_id"):
+        return int(checkpoint_values["company_id"])
+
+    # Priority 4: Fallback to provided company_id or DEFAULT_COMPANY_ID
+    return int(company_id) if company_id is not None else int(settings.DEFAULT_COMPANY_ID)
+
+
 async def _prepare_workflow_execution(
     user_query: str,
     user_token: Optional[str] = None,
@@ -336,6 +375,7 @@ async def _prepare_workflow_execution(
     thread_id: Optional[str] = None,
     graph: Optional[Any] = None,
     history: Optional[List[Any]] = None,
+    company_id_explicit: Optional[bool] = None,
 ) -> Tuple[Any, Dict[str, Any], AgentState, bool, str]:
     """
     Resolve thread isolation, checkpoint state, and hydrated initial state for workflow execution.
@@ -355,15 +395,17 @@ async def _prepare_workflow_execution(
             pass
         _touch_checkpoint_lru(active_graph, effective_thread_id)
 
-    # Multi-turn company ID persistence across turns in the same thread session
-    effective_company_id = company_id
-    if effective_company_id is None or effective_company_id == settings.DEFAULT_COMPANY_ID:
-        if checkpoint and checkpoint.values and checkpoint.values.get("company_id"):
-            effective_company_id = checkpoint.values["company_id"]
+    checkpoint_values = checkpoint.values if (checkpoint and checkpoint.values) else None
+    effective_company_id = _resolve_effective_company_id(
+        user_query=user_query,
+        company_id=company_id,
+        company_id_explicit=company_id_explicit,
+        checkpoint_values=checkpoint_values,
+    )
 
     # History hydration for stateless requests or recovery after checkpoint eviction/restart
     hydrated_messages = None
-    existing_messages = checkpoint.values.get("messages", []) if (checkpoint and checkpoint.values) else []
+    existing_messages = checkpoint_values.get("messages", []) if checkpoint_values else []
     if not existing_messages and history:
         hydrated_messages = _hydrate_messages_from_history(history, user_query)
 
@@ -383,6 +425,7 @@ async def arun_workflow(
     thread_id: Optional[str] = None,
     graph: Optional[Any] = None,
     history: Optional[List[Any]] = None,
+    company_id_explicit: Optional[bool] = None,
 ) -> AgentState:
     """
     Asynchronously run the compiled workflow graph for a user query.
@@ -394,6 +437,7 @@ async def arun_workflow(
         thread_id: Optional conversational session thread ID for MemorySaver.
         graph: Optional compiled StateGraph instance.
         history: Optional list of past conversation messages for stateless memory recovery.
+        company_id_explicit: Whether company_id was explicitly provided by caller/payload.
 
     Returns:
         Final resulting AgentState dictionary.
@@ -406,6 +450,7 @@ async def arun_workflow(
             thread_id=thread_id,
             graph=graph,
             history=history,
+            company_id_explicit=company_id_explicit,
         )
     )
 
@@ -430,6 +475,7 @@ async def astream_workflow_steps(
     thread_id: Optional[str] = None,
     graph: Optional[Any] = None,
     history: Optional[List[Any]] = None,
+    company_id_explicit: Optional[bool] = None,
 ):
     """
     Asynchronously stream individual node completion events from the workflow StateGraph.
@@ -443,6 +489,7 @@ async def astream_workflow_steps(
             thread_id=thread_id,
             graph=graph,
             history=history,
+            company_id_explicit=company_id_explicit,
         )
     )
     accumulated_state = dict(initial_state)
@@ -506,6 +553,7 @@ def run_workflow_sync(
     graph: Optional[Any] = None,
     on_node_finish: Optional[Any] = None,
     history: Optional[List[Any]] = None,
+    company_id_explicit: Optional[bool] = None,
 ) -> AgentState:
     """
     Synchronously run the compiled workflow graph (safe for CLI and test runners).
@@ -528,6 +576,7 @@ def run_workflow_sync(
                 thread_id=thread_id,
                 graph=graph,
                 history=history,
+                company_id_explicit=company_id_explicit,
             ):
                 on_node_finish(node_name, update, acc_state)
                 acc = acc_state
@@ -541,6 +590,7 @@ def run_workflow_sync(
             thread_id=thread_id,
             graph=graph,
             history=history,
+            company_id_explicit=company_id_explicit,
         )
 
     if loop and loop.is_running():

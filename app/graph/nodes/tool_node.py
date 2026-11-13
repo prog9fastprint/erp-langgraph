@@ -27,6 +27,8 @@ async def _execute_single_tool(
     user_token: Optional[str],
     default_company_id: Optional[int],
     dispatch_map: Dict[str, Any],
+    user_query: str = "",
+    allow_empty_stock_params: bool = False,
 ) -> Tuple[Any, Optional[str]]:
     """Execute a single ERP tool, handling parameter adaptation, location resolution, and error capturing."""
     clean_params = dict(params or {})
@@ -94,6 +96,55 @@ async def _execute_single_tool(
                     clean_params["matched_location_name"] = matched_wh.get("name")
         except Exception as loc_err:
             logger.warning(f"Could not resolve location_name '{clean_params.get('location_name')}': {loc_err}")
+
+    # Auto-resolve branch warehouse or fail-fast locally when stock query has no identifier
+    if tool_name == "get_stock_level":
+        has_product_identifier = bool(
+            clean_params.get("product_id") is not None
+            or clean_params.get("code")
+            or clean_params.get("codes")
+            or clean_params.get("product_ids")
+        )
+        has_resolved_location = bool(
+            clean_params.get("warehouse_id") is not None
+            or clean_params.get("location_id") is not None
+        )
+        has_location_name = bool(clean_params.get("location_name"))
+
+        if not has_product_identifier and not has_resolved_location:
+            from app.graph.nodes.extractor import resolve_branch_company_id
+
+            has_explicit_branch = bool(
+                user_query and resolve_branch_company_id(user_query) is not None
+            )
+            if has_explicit_branch:
+                try:
+                    wh_res = await erp_client.fetch_warehouses(
+                        params={},
+                        user_token=user_token,
+                        company_id=target_company_id,
+                    )
+                    warehouses = (
+                        wh_res.get("warehouses", [])
+                        if isinstance(wh_res, dict)
+                        else (wh_res if isinstance(wh_res, list) else [])
+                    )
+                    if warehouses and isinstance(warehouses[0], dict) and warehouses[0].get("id") is not None:
+                        clean_params["warehouse_id"] = warehouses[0]["id"]
+                        clean_params["matched_location_name"] = warehouses[0].get("name")
+                        has_resolved_location = True
+                except Exception as wh_err:
+                    logger.warning(
+                        "Could not auto-resolve branch warehouse for company_id=%s: %s",
+                        target_company_id,
+                        wh_err,
+                    )
+
+            if not allow_empty_stock_params and not has_resolved_location and not has_location_name:
+                return (
+                    None,
+                    "MISSING_PRODUCT_IDENTIFIER: Mohon sertakan kode SKU, nama produk, atau nama gudang/cabang.",
+                )
 
     handler = dispatch_map.get(tool_name)
     if not handler:
@@ -181,6 +232,8 @@ async def tool_node(
                     user_token=user_token,
                     default_company_id=state.get("company_id"),
                     dispatch_map=dispatch_map,
+                    user_query=plan.get("sub_query") or state.get("user_query") or "",
+                    allow_empty_stock_params=not bool(plan.get("sub_query")),
                 )
                 for plan in active_tools
             ]
@@ -258,6 +311,7 @@ async def tool_node(
             user_token=user_token,
             default_company_id=target_company_id,
             dispatch_map=dispatch_map,
+            user_query=state.get("user_query") or "",
         )
 
         if err:

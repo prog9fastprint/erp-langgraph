@@ -122,6 +122,7 @@ class TestChatEndpoint(unittest.TestCase):
             user_token=None,
             company_id=1,
             thread_id=None,
+            company_id_explicit=False,
         )
 
     @patch("app.main.arun_workflow", new_callable=AsyncMock)
@@ -176,6 +177,7 @@ class TestChatEndpoint(unittest.TestCase):
             user_token="bearer_jwt_auth_xyz",
             company_id=2,
             thread_id="thread_custom_abc_456",
+            company_id_explicit=True,
         )
 
     @patch("app.main.arun_workflow", new_callable=AsyncMock)
@@ -308,6 +310,7 @@ class TestChatEndpoint(unittest.TestCase):
             user_token=None,
             company_id=1,
             thread_id=thread_id,
+            company_id_explicit=False,
         )
 
         # Turn 2
@@ -321,6 +324,7 @@ class TestChatEndpoint(unittest.TestCase):
             user_token=None,
             company_id=1,
             thread_id=thread_id,
+            company_id_explicit=False,
         )
 
 

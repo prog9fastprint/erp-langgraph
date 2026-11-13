@@ -4,14 +4,17 @@ Main FastAPI application entry point for ERP AI Orchestrator.
 import asyncio
 from contextlib import asynccontextmanager
 import hmac
+import json
 import logging
 import re
+import time
 from typing import Annotated, Any, Dict, Optional
 
 from fastapi import FastAPI, Header, HTTPException, status
+from fastapi.responses import StreamingResponse
 
 from app.core.config import settings
-from app.graph.workflow import arun_workflow
+from app.graph.workflow import arun_workflow, astream_workflow_steps
 from app.schemas.chat import ChatRequest, ChatResponse
 from app.services.llm import afetch_free_models_catalog
 
@@ -95,6 +98,43 @@ def _resolve_and_validate_auth(
     return effective_token
 
 
+def _build_workflow_kwargs(payload: ChatRequest, effective_token: Optional[str]) -> Dict[str, Any]:
+    """Construct keyword arguments forwarded to arun_workflow and astream_workflow_steps."""
+    kwargs: Dict[str, Any] = {
+        "user_query": payload.query,
+        "user_token": effective_token,
+        "company_id": payload.company_id,
+        "thread_id": payload.thread_id,
+        "company_id_explicit": ("company_id" in payload.model_fields_set),
+    }
+    if payload.history is not None:
+        kwargs["history"] = payload.history
+    return kwargs
+
+
+def _build_chat_response(final_state: Dict[str, Any], started_at: float) -> ChatResponse:
+    """Serialize final AgentState into ChatResponse with resolved_company_id and timing."""
+    raw_status = final_state.get("verification_status")
+    if raw_status is not None:
+        verification_status_str = str(raw_status.value) if hasattr(raw_status, "value") else str(raw_status)
+    else:
+        verification_status_str = None
+
+    raw_company_id = final_state.get("company_id")
+    resolved_company_id = int(raw_company_id) if raw_company_id is not None else None
+    execution_time_ms = round((time.perf_counter() - started_at) * 1000.0, 2)
+
+    return ChatResponse(
+        final_answer=final_state.get("final_answer"),
+        detected_domain=final_state.get("detected_domain"),
+        verification_status=verification_status_str,
+        error_message=final_state.get("error_message"),
+        suggested_followups=final_state.get("suggested_followups") or [],
+        resolved_company_id=resolved_company_id,
+        execution_time_ms=execution_time_ms,
+    )
+
+
 @app.post(
     "/api/v1/chat",
     response_model=ChatResponse,
@@ -116,34 +156,10 @@ async def chat_endpoint(
             authorization=authorization,
             x_internal_service_key=x_internal_service_key,
         )
-
-        workflow_kwargs = {
-            "user_query": payload.query,
-            "user_token": effective_token,
-            "company_id": payload.company_id,
-            "thread_id": payload.thread_id,
-        }
-        if payload.history is not None:
-            workflow_kwargs["history"] = payload.history
-
+        started_at = time.perf_counter()
+        workflow_kwargs = _build_workflow_kwargs(payload, effective_token)
         final_state: Dict[str, Any] = await arun_workflow(**workflow_kwargs)
-
-        raw_status = final_state.get("verification_status")
-        if raw_status is not None:
-            if hasattr(raw_status, "value"):
-                verification_status_str = str(raw_status.value)
-            else:
-                verification_status_str = str(raw_status)
-        else:
-            verification_status_str = None
-
-        return ChatResponse(
-            final_answer=final_state.get("final_answer"),
-            detected_domain=final_state.get("detected_domain"),
-            verification_status=verification_status_str,
-            error_message=final_state.get("error_message"),
-            suggested_followups=final_state.get("suggested_followups") or [],
-        )
+        return _build_chat_response(final_state, started_at)
     except HTTPException:
         raise
     except Exception as exc:
@@ -157,6 +173,63 @@ async def chat_endpoint(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=detail,
         )
+
+
+@app.post(
+    "/api/v1/chat/stream",
+    status_code=status.HTTP_200_OK,
+    summary="Stream real-time LangGraph node progress and final response via SSE",
+    tags=["Chat"],
+)
+async def chat_stream_endpoint(
+    payload: ChatRequest,
+    authorization: Annotated[Optional[str], Header()] = None,
+    x_internal_service_key: Annotated[Optional[str], Header(alias="X-Internal-Service-Key")] = None,
+) -> StreamingResponse:
+    """
+    Execute LangGraph StateGraph pipeline and stream node progress events (event: step)
+    followed by the final ChatResponse payload (event: complete) as Server-Sent Events.
+    """
+    effective_token = _resolve_and_validate_auth(
+        payload=payload,
+        authorization=authorization,
+        x_internal_service_key=x_internal_service_key,
+    )
+    workflow_kwargs = _build_workflow_kwargs(payload, effective_token)
+    started_at = time.perf_counter()
+
+    async def _event_generator():
+        accumulated_state: Dict[str, Any] = {}
+        try:
+            async for node_name, _update, acc_state in astream_workflow_steps(**workflow_kwargs):
+                accumulated_state = acc_state
+                step_payload = {
+                    "node": node_name,
+                    "status": "completed",
+                    "elapsed_ms": round((time.perf_counter() - started_at) * 1000.0, 2),
+                }
+                yield f"event: step\ndata: {json.dumps(step_payload, ensure_ascii=False)}\n\n"
+
+            chat_resp = _build_chat_response(accumulated_state, started_at)
+            yield f"event: complete\ndata: {chat_resp.model_dump_json()}\n\n"
+        except Exception as exc:
+            logger.exception("Unhandled error during chat SSE stream: %s", exc)
+            detail = (
+                "Chat workflow failed due to an internal server error."
+                if settings.APP_ENV.strip().lower() == "production"
+                else f"Chat workflow failed: {str(exc)}"
+            )
+            yield f"event: error\ndata: {json.dumps({'detail': detail}, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(
+        _event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 __all__ = ["app", "ChatRequest", "ChatResponse"]

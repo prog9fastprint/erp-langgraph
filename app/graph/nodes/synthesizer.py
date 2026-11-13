@@ -52,6 +52,25 @@ def _format_rag_section(
     return "\n".join(lines)
 
 
+def _extract_total_count(tool_result: Any, displayed_count: int) -> int:
+    """Resolve pre-truncation record count from total_count or total_found."""
+    if isinstance(tool_result, dict):
+        if tool_result.get("total_count") is not None:
+            return int(tool_result["total_count"])
+        if tool_result.get("total_found") is not None:
+            return int(tool_result["total_found"])
+    return displayed_count
+
+
+def _append_pagination_footer(lines: List[str], displayed_count: int, total_count: int) -> None:
+    """Append Markdown pagination notice when displayed rows are fewer than total records."""
+    if displayed_count > 0 and total_count > displayed_count:
+        lines.append(
+            f"\n*Menampilkan {displayed_count} dari {total_count} data. "
+            f"Gunakan filter periode tanggal atau kata kunci lebih spesifik untuk menelusuri data lainnya.*"
+        )
+
+
 def _format_single_tool_presentation(tool: Optional[str], tool_result: Any) -> str:
     """Format an individual tool's response payload into Markdown."""
     if not tool or not tool_result:
@@ -62,7 +81,7 @@ def _format_single_tool_presentation(tool: Optional[str], tool_result: Any) -> s
     # 1. Vendor Invoices / Journal Entries
     if tool in ("fetch_vendor_invoices", "get_journal_entries"):
         entries = tool_result.get("entries") or []
-        total_count = tool_result.get("total_count", len(entries))
+        total_count = _extract_total_count(tool_result, len(entries))
         calculations = tool_result.get("calculations") or {}
 
         # Single document detail presentation with line items
@@ -123,6 +142,7 @@ def _format_single_tool_presentation(tool: Optional[str], tool_result: Any) -> s
                 debit = _format_rupiah(item.get("total_debit", 0.0))
                 st = item.get("status") or item.get("state") or "posted"
                 lines.append(f"| {idx} | `{num}` | {tgl} | {vendor} | {debit} | {st.upper()} |")
+            _append_pagination_footer(lines, len(entries), total_count)
         else:
             lines.append("Tidak ada transaksi tercatat pada periode ini.")
 
@@ -142,6 +162,7 @@ def _format_single_tool_presentation(tool: Optional[str], tool_result: Any) -> s
     # 2. Account Balance
     if tool == "get_account_balance":
         accounts = tool_result.get("accounts") or []
+        total_count = _extract_total_count(tool_result, len(accounts))
         totals = tool_result.get("totals") or {}
         lines.append("### Informasi Saldo Chart of Account (Accounting Balance)\n")
         if totals:
@@ -166,6 +187,7 @@ def _format_single_tool_presentation(tool: Optional[str], tool_result: Any) -> s
                 kred = _format_rupiah(acc.get("period_credit", acc.get("total_credit", 0.0)))
                 net = _format_rupiah(acc.get("ending_balance", acc.get("net_balance", 0.0)))
                 lines.append(f"| `{code}` | {name} | {op} | {deb} | {kred} | **{net}** |")
+            _append_pagination_footer(lines, len(accounts), total_count)
         elif not totals:
             net = _format_rupiah(tool_result.get("net_balance", 0.0))
             deb = _format_rupiah(tool_result.get("total_debit", 0.0))
@@ -289,7 +311,8 @@ def _format_single_tool_presentation(tool: Optional[str], tool_result: Any) -> s
     # 2.4 Vendor Bills (Tagihan Vendor & AP Aging)
     if tool == "get_vendor_bills":
         bills = tool_result.get("bills") or []
-        total_count = tool_result.get("total_count", len(bills))
+        total_count = _extract_total_count(tool_result, len(bills))
+        calculations = tool_result.get("calculations") or {}
         lines.append(f"### Daftar Tagihan Faktur Vendor (Vendor Bills) — ({total_count} Tagihan Ditemukan)\n")
         if bills:
             lines.append("| No | No. Faktur | Tanggal | Jatuh Tempo | Vendor / Rekanan | Total Nilai | Terbayar | Sisa Hutang | Status Bayar | Tempo |")
@@ -312,6 +335,17 @@ def _format_single_tool_presentation(tool: Optional[str], tool_result: Any) -> s
                 total_amount_sum += amt
                 total_residual_sum += res
                 lines.append(f"| {idx} | `{num}` | {b_date} | {due_d} | {v_name} | {_format_rupiah(amt)} | {_format_rupiah(paid)} | **{_format_rupiah(res)}** | {p_st} | {d_st} |")
+
+            # Prefer pre-truncated server/sanitization aggregates across all rows over visible-page sum
+            if calculations:
+                if calculations.get("total_amount") is not None:
+                    total_amount_sum = float(calculations["total_amount"])
+                if calculations.get("total_residual") is not None:
+                    total_residual_sum = float(calculations["total_residual"])
+                if calculations.get("overdue_count") is not None:
+                    overdue_count = int(calculations["overdue_count"])
+
+            _append_pagination_footer(lines, len(bills), total_count)
 
             lines.append("\n#### Ringkasan Hutang Dagang (AP):")
             lines.append(f"- **Total Tagihan Faktur**: {_format_rupiah(total_amount_sum)}")
@@ -365,6 +399,7 @@ def _format_single_tool_presentation(tool: Optional[str], tool_result: Any) -> s
             items = tool_result
         else:
             items = [tool_result]
+        total_count = _extract_total_count(tool_result, len(items))
 
         lines.append("| SKU / Kode | Nama Produk | Perusahaan | Lokasi / Gudang | Qty Fisik |")
         lines.append("|:---|:---|:---|:---|:---|")
@@ -375,6 +410,8 @@ def _format_single_tool_presentation(tool: Optional[str], tool_result: Any) -> s
             loc = st_item.get("location_name") or (f"Location #{st_item.get('location_id')}" if st_item.get("location_id") else "Semua Lokasi")
             qty = st_item.get("qty_on_hand") or st_item.get("quantity") or 0.0
             lines.append(f"| `{code}` | {name} | {comp} | {loc} | **{qty} unit** |")
+
+        _append_pagination_footer(lines, len(items), total_count)
 
         # Render breakdown if available (e.g. single product multi-location breakdown)
         if isinstance(tool_result, dict) and tool_result.get("breakdown"):
@@ -394,6 +431,7 @@ def _format_single_tool_presentation(tool: Optional[str], tool_result: Any) -> s
         products = tool_result.get("products") if isinstance(tool_result, dict) else (
             tool_result if isinstance(tool_result, list) else [tool_result]
         )
+        total_count = _extract_total_count(tool_result, len(products))
         if products:
             for p in products:
                 lines.append(f"- **Nama Produk**: {p.get('name', '-')}")
@@ -413,6 +451,7 @@ def _format_single_tool_presentation(tool: Optional[str], tool_result: Any) -> s
                     lines.append(f"  - Harga Jual: {_format_rupiah(price_val)}")
                 if p.get("default_cost") is not None:
                     lines.append(f"  - Estimasi HPP: {_format_rupiah(p.get('default_cost'))}")
+            _append_pagination_footer(lines, len(products), total_count)
         return "\n".join(lines)
 
     # 5. Locations
@@ -420,7 +459,7 @@ def _format_single_tool_presentation(tool: Optional[str], tool_result: Any) -> s
         locs = tool_result.get("locations") if isinstance(tool_result, dict) else (
             tool_result if isinstance(tool_result, list) else [tool_result]
         )
-        total_found = tool_result.get("total_found", len(locs)) if isinstance(tool_result, dict) else len(locs)
+        total_found = _extract_total_count(tool_result, len(locs))
         lines.append(f"### Informasi Daftar Lokasi & Gudang ({total_found} Lokasi Ditemukan)\n")
         if locs:
             lines.append("| ID | Nama Lokasi | Gudang Induk | Tipe | Kategori |")
@@ -432,6 +471,7 @@ def _format_single_tool_presentation(tool: Optional[str], tool_result: Any) -> s
                 ltype = (l.get("type") or "-").capitalize()
                 lcat = (l.get("category") or "-").capitalize()
                 lines.append(f"| `{lid}` | {lname} | {wh} | {ltype} | {lcat} |")
+            _append_pagination_footer(lines, len(locs), total_found)
         return "\n".join(lines)
 
     # 6. Stock History (Kartu Stok / Buku Besar Persediaan)
@@ -439,7 +479,7 @@ def _format_single_tool_presentation(tool: Optional[str], tool_result: Any) -> s
         hist = tool_result.get("history") if isinstance(tool_result, dict) else (
             tool_result if isinstance(tool_result, list) else [tool_result]
         )
-        total_count = tool_result.get("total_count", len(hist)) if isinstance(tool_result, dict) else len(hist)
+        total_count = _extract_total_count(tool_result, len(hist))
         lines.append(f"### Riwayat Kartu Stok / Pergerakan Barang ({total_count} Catatan Ditemukan)\n")
         if hist:
             lines.append("| No | Tanggal | Referensi | Produk / SKU | Operasi | Lokasi / Rak | Mutasi Qty | Saldo Akhir |")
@@ -454,6 +494,7 @@ def _format_single_tool_presentation(tool: Optional[str], tool_result: Any) -> s
                 bal = h.get("balance")
                 bal_str = f"{bal:g}" if bal is not None else "-"
                 lines.append(f"| {idx} | {tgl} | `{ref}` | {p_label} | {op} | {loc} | **{qty_done:+g}** | {bal_str} |")
+            _append_pagination_footer(lines, len(hist), total_count)
         else:
             lines.append("Tidak ada riwayat pergerakan stok tercatat pada periode ini.")
         return "\n".join(lines)
@@ -463,7 +504,7 @@ def _format_single_tool_presentation(tool: Optional[str], tool_result: Any) -> s
         transfers = tool_result.get("transfers") if isinstance(tool_result, dict) else (
             tool_result if isinstance(tool_result, list) else [tool_result]
         )
-        total_count = tool_result.get("total_count", len(transfers)) if isinstance(tool_result, dict) else len(transfers)
+        total_count = _extract_total_count(tool_result, len(transfers))
         lines.append(f"### Dokumen Transfer & Mutasi Persediaan ({total_count} Dokumen Ditemukan)\n")
         if transfers:
             lines.append("| No | No. Dokumen | Tanggal | Tipe Operasi | Dokumen Asal | Rekanan | Status |")
@@ -476,6 +517,8 @@ def _format_single_tool_presentation(tool: Optional[str], tool_result: Any) -> s
                 contact = t.get("contact_name") or "-"
                 st = (t.get("status") or "-").upper()
                 lines.append(f"| {idx} | `{doc_num}` | {tgl} | {op} | {src} | {contact} | **{st}** |")
+
+            _append_pagination_footer(lines, len(transfers), total_count)
 
             # If single transfer with item lines
             if len(transfers) == 1 and transfers[0].get("lines"):
@@ -497,7 +540,7 @@ def _format_single_tool_presentation(tool: Optional[str], tool_result: Any) -> s
         alerts = tool_result.get("alerts") if isinstance(tool_result, dict) else (
             tool_result if isinstance(tool_result, list) else [tool_result]
         )
-        total_found = tool_result.get("total_found", len(alerts)) if isinstance(tool_result, dict) else len(alerts)
+        total_found = _extract_total_count(tool_result, len(alerts))
         lines.append(f"### Peringatan Stok Menipis / Kritis ({total_found} Produk Perlu Perhatian)\n")
         if alerts:
             lines.append("| No | SKU | Nama Produk | Gudang | Stok Saat Ini | Batas Minimum | Status |")
@@ -510,6 +553,7 @@ def _format_single_tool_presentation(tool: Optional[str], tool_result: Any) -> s
                 thresh = a.get("threshold", 0.0)
                 status_label = "HABIS" if qty <= 0 else "MENIPIS"
                 lines.append(f"| {idx} | `{code}` | {name} | {wh} | **{qty:g} unit** | {thresh:g} | **{status_label}** |")
+            _append_pagination_footer(lines, len(alerts), total_found)
         else:
             lines.append("Semua stok produk terpantau dalam batas aman.")
         return "\n".join(lines)
@@ -519,7 +563,7 @@ def _format_single_tool_presentation(tool: Optional[str], tool_result: Any) -> s
         adjustments = tool_result.get("adjustments") if isinstance(tool_result, dict) else (
             tool_result if isinstance(tool_result, list) else [tool_result]
         )
-        total_count = tool_result.get("total_count", len(adjustments)) if isinstance(tool_result, dict) else len(adjustments)
+        total_count = _extract_total_count(tool_result, len(adjustments))
         lines.append(f"### Catatan Penyesuaian Stock Opname ({total_count} Catatan Ditemukan)\n")
         if adjustments:
             lines.append("| No | Referensi | Produk | Lokasi / Rak | Qty Sistem | Qty Fisik | Selisih | Status |")
@@ -533,6 +577,7 @@ def _format_single_tool_presentation(tool: Optional[str], tool_result: Any) -> s
                 diff = adj.get("difference", 0.0)
                 st = (adj.get("status") or "-").upper()
                 lines.append(f"| {idx} | `{ref}` | {p_name} | {loc} | {theo:g} | {real:g} | **{diff:+g}** | {st} |")
+            _append_pagination_footer(lines, len(adjustments), total_count)
         else:
             lines.append("Tidak ada catatan penyesuaian stock opname pada filter ini.")
         return "\n".join(lines)
@@ -542,7 +587,7 @@ def _format_single_tool_presentation(tool: Optional[str], tool_result: Any) -> s
         scraps = tool_result.get("scraps") if isinstance(tool_result, dict) else (
             tool_result if isinstance(tool_result, list) else [tool_result]
         )
-        total_count = tool_result.get("total_count", len(scraps)) if isinstance(tool_result, dict) else len(scraps)
+        total_count = _extract_total_count(tool_result, len(scraps))
         lines.append(f"### Catatan Barang Rusak / Scrap Order ({total_count} Catatan Ditemukan)\n")
         if scraps:
             lines.append("| No | Referensi | Produk | Lokasi Asal | Kuantitas Cacat | Alasan / Keterangan | Tanggal |")
@@ -555,6 +600,7 @@ def _format_single_tool_presentation(tool: Optional[str], tool_result: Any) -> s
                 reason = sc.get("reason") or "-"
                 tgl = sc.get("date") or "-"
                 lines.append(f"| {idx} | `{ref}` | {p_name} | {loc} | **{qty:g} unit** | {reason} | {tgl} |")
+            _append_pagination_footer(lines, len(scraps), total_count)
         else:
             lines.append("Tidak ada catatan barang rusak / scrap pada filter ini.")
         return "\n".join(lines)
@@ -564,7 +610,7 @@ def _format_single_tool_presentation(tool: Optional[str], tool_result: Any) -> s
         whs = tool_result.get("warehouses") if isinstance(tool_result, dict) else (
             tool_result if isinstance(tool_result, list) else [tool_result]
         )
-        total_found = tool_result.get("total_found", len(whs)) if isinstance(tool_result, dict) else len(whs)
+        total_found = _extract_total_count(tool_result, len(whs))
         lines.append(f"### Daftar Master Gudang Perusahaan ({total_found} Gudang Ditemukan)\n")
         if whs:
             lines.append("| ID | Nama Gudang | Kode Referensi | Perusahaan | Lokasi Internal Terkait |")
@@ -576,6 +622,7 @@ def _format_single_tool_presentation(tool: Optional[str], tool_result: Any) -> s
                 comp = f"Company #{w.get('company_id', 1)}"
                 locs_count = len(w.get("locations") or [])
                 lines.append(f"| `{wid}` | {wname} | `{code}` | {comp} | {locs_count} lokasi |")
+            _append_pagination_footer(lines, len(whs), total_found)
         return "\n".join(lines)
 
     # 12. Product Categories
@@ -583,7 +630,7 @@ def _format_single_tool_presentation(tool: Optional[str], tool_result: Any) -> s
         cats = tool_result.get("categories") if isinstance(tool_result, dict) else (
             tool_result if isinstance(tool_result, list) else [tool_result]
         )
-        total_found = tool_result.get("total_found", len(cats)) if isinstance(tool_result, dict) else len(cats)
+        total_found = _extract_total_count(tool_result, len(cats))
         lines.append(f"### Daftar Master Kategori Produk ({total_found} Kategori Ditemukan)\n")
         if cats:
             lines.append("| ID | Nama Kategori | Metode Costing | UoM Standar |")
@@ -594,6 +641,7 @@ def _format_single_tool_presentation(tool: Optional[str], tool_result: Any) -> s
                 cm = c.get("costing_method") or "-"
                 uom_n = c.get("standard_uom") or "-"
                 lines.append(f"| `{cid}` | {cname} | {cm} | {uom_n} |")
+            _append_pagination_footer(lines, len(cats), total_found)
         return "\n".join(lines)
 
     # Default fallback

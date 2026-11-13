@@ -72,6 +72,57 @@ def trim_conversation_messages(
     return valid_messages[-max_messages:]
 
 
+# Collection keys whose pre-truncation length should be preserved as total_count/total_found
+_PAGINATED_COLLECTION_KEYS: Set[str] = {
+    "bills",
+    "entries",
+    "accounts",
+    "products",
+    "locations",
+    "history",
+    "transfers",
+    "alerts",
+    "adjustments",
+    "scraps",
+}
+
+_TOTAL_FOUND_COLLECTION_KEYS: Set[str] = {"locations", "alerts"}
+
+
+def _safe_float(value: Any) -> float:
+    """Safely coerce numeric payload values to float, returning 0.0 on None/invalid."""
+    if value is None:
+        return 0.0
+    try:
+        return float(value)
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def _compute_bills_calculations(bills: List[Any]) -> Dict[str, Any]:
+    """Compute pre-truncation aggregate totals across all vendor bill rows."""
+    total_amount = 0.0
+    total_paid = 0.0
+    total_residual = 0.0
+    overdue_count = 0
+
+    for bill in bills:
+        if not isinstance(bill, dict):
+            continue
+        total_amount += _safe_float(bill.get("total_amount"))
+        total_paid += _safe_float(bill.get("paid_amount"))
+        total_residual += _safe_float(bill.get("residual_balance"))
+        if str(bill.get("due_status") or "").strip().lower() == "overdue":
+            overdue_count += 1
+
+    return {
+        "total_amount": round(total_amount, 2),
+        "total_paid": round(total_paid, 2),
+        "total_residual": round(total_residual, 2),
+        "overdue_count": overdue_count,
+    }
+
+
 def sanitize_erp_payload(data: Any, max_records: int = 50) -> Any:
     """
     Recursively sanitize and prune ERP data payloads from Django Core.
@@ -100,6 +151,8 @@ def sanitize_erp_payload(data: Any, max_records: int = 50) -> Any:
 
     if isinstance(data, dict):
         sanitized_dict: Dict[str, Any] = {}
+        pre_truncation_count: Optional[tuple[str, int]] = None
+
         for key, value in data.items():
             # 1. Skip technical Django fields
             if key in DJANGO_TECHNICAL_FIELDS or key.startswith("_"):
@@ -111,6 +164,16 @@ def sanitize_erp_payload(data: Any, max_records: int = 50) -> Any:
             if isinstance(value, str) and not value.strip():
                 continue
 
+            # Track pre-truncation collection length for downstream pagination footers
+            if (
+                key in _PAGINATED_COLLECTION_KEYS
+                and isinstance(value, list)
+                and len(value) > max_records
+                and pre_truncation_count is None
+            ):
+                count_key = "total_found" if key in _TOTAL_FOUND_COLLECTION_KEYS else "total_count"
+                pre_truncation_count = (count_key, len(value))
+
             # 3. Recursively sanitize nested structures
             if isinstance(value, (dict, list)):
                 cleaned_val = sanitize_erp_payload(value, max_records=max_records)
@@ -119,6 +182,19 @@ def sanitize_erp_payload(data: Any, max_records: int = 50) -> Any:
                     sanitized_dict[key] = cleaned_val
             else:
                 sanitized_dict[key] = value
+
+        # Pre-compute vendor bill aggregates from full list before truncation if absent
+        bills_raw = data.get("bills")
+        if isinstance(bills_raw, list) and len(bills_raw) > 0 and not sanitized_dict.get("calculations"):
+            sanitized_dict["calculations"] = _compute_bills_calculations(bills_raw)
+
+        # Preserve pre-truncation count when total_count/total_found was absent or empty
+        if (
+            pre_truncation_count is not None
+            and not sanitized_dict.get("total_count")
+            and not sanitized_dict.get("total_found")
+        ):
+            sanitized_dict[pre_truncation_count[0]] = pre_truncation_count[1]
 
         return sanitized_dict
 

@@ -182,6 +182,7 @@ class TestApiChatAdversarial(unittest.IsolatedAsyncioTestCase):
             user_token=None,
             company_id=1,
             thread_id=None,
+            company_id_explicit=False,
         )
 
     @patch("app.main.arun_workflow", new_callable=AsyncMock)
