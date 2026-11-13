@@ -1,7 +1,9 @@
 """
-Verification tests for production readiness improvements (D1, D2, D3, D4, D5, D6).
+Verification tests for production readiness improvements (D1, D2, D3, D4, D5, D6, Lifespan & Pool Cleanup).
 """
+import asyncio
 import json
+import threading
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -18,8 +20,14 @@ from app.graph.workflow import (
     astream_workflow_steps,
     create_workflow_graph,
 )
+import app.main as main_module
 from app.main import app
-from app.services.django_client import DjangoAuthError, DjangoCoreClient
+import app.services.django_client as django_client_module
+from app.services.django_client import (
+    DjangoAuthError,
+    DjangoCoreClient,
+    aclose_shared_django_client,
+)
 
 
 class TestD1SessionStateAndBoundedCheckpointer(unittest.IsolatedAsyncioTestCase):
@@ -880,6 +888,149 @@ class TestD6StockLocationAndBranchWarehouseAutoResolve(unittest.IsolatedAsyncioT
 
         p4 = _fallback_extract_stock_level("cek stok di gudang untuk customer Andi")
         self.assertIsNone(p4.get("location_name"))
+
+
+class TestLifespanCleanupAndSharedHttpPool(unittest.IsolatedAsyncioTestCase):
+    """Verify FastAPI lifespan cleanup, background task tracking, shared httpx pool, and token cache."""
+
+    async def asyncTearDown(self):
+        await aclose_shared_django_client()
+        main_module._BACKGROUND_TASKS.clear()
+
+    async def test_shared_httpx_pool_system_token_cache_and_shutdown(self):
+        """
+        Internal DjangoCoreClient instances share one httpx.AsyncClient per active event loop,
+        coalesce concurrent system logins into _CACHED_SYSTEM_TOKEN, invalidate cleanly on 401,
+        keep pooled transport open across per-node aclose(), and close cleanly on
+        aclose_shared_django_client().
+        """
+        await aclose_shared_django_client()
+
+        c1 = DjangoCoreClient(base_url="http://test-erp:8000", username="admin", password="secret", token=None)
+        c2 = DjangoCoreClient(base_url="http://test-erp:8000", username="admin", password="secret", token=None)
+        self.assertIs(c1.client, c2.client)
+        self.assertFalse(c1.client.is_closed)
+
+        shared_http = c1.client
+        login_calls = 0
+
+        async def _handler(request: httpx.Request) -> httpx.Response:
+            nonlocal login_calls
+            if request.url.path == "/external_api/get_token/":
+                login_calls += 1
+                await asyncio.sleep(0.02)
+                return httpx.Response(200, json={"access": f"sys-jwt-{login_calls}"})
+            auth_header = request.headers.get("Authorization")
+            if auth_header == "Bearer sys-jwt-1":
+                return httpx.Response(401, text="Expired")
+            return httpx.Response(200, json={"success": True, "data": {"ok": True, "token": auth_header}})
+
+        shared_http._transport = httpx.MockTransport(_handler)
+
+        # Concurrent login() calls coalesce into a single HTTP login request
+        t1, t2 = await asyncio.gather(c1.login(), c2.login())
+        self.assertEqual(t1, "sys-jwt-1")
+        self.assertEqual(t2, "sys-jwt-1")
+        self.assertEqual(login_calls, 1)
+        self.assertEqual(django_client_module._CACHED_SYSTEM_TOKEN, "sys-jwt-1")
+
+        # Per-instance aclose() does not kill the shared pooled httpx client
+        await c1.aclose()
+        await c2.aclose()
+        self.assertFalse(shared_http.is_closed)
+
+        # New DjangoCoreClient picks up _CACHED_SYSTEM_TOKEN immediately; 401 triggers refresh -> sys-jwt-2
+        with patch.object(settings, "ERP_API_TOKEN", ""):
+            c3 = DjangoCoreClient(base_url="http://test-erp:8000", username="admin", password="secret")
+            self.assertEqual(c3.token, "sys-jwt-1")
+            res = await c3.execute_tool(domain="accounting", tool_name="get_account_balance", params={})
+            self.assertEqual(res["ok"], True)
+            self.assertEqual(res["token"], "Bearer sys-jwt-2")
+            self.assertEqual(login_calls, 2)
+            self.assertEqual(django_client_module._CACHED_SYSTEM_TOKEN, "sys-jwt-2")
+
+        # Shared pool shutdown closes httpx client and wipes cached system token
+        await aclose_shared_django_client()
+        self.assertTrue(shared_http.is_closed)
+        self.assertIsNone(django_client_module._CACHED_SYSTEM_TOKEN)
+
+    def test_fastapi_lifespan_tracks_background_tasks_and_closes_all_resources(self):
+        """
+        FastAPI lifespan tracks afetch_free_models_catalog in _BACKGROUND_TASKS during startup,
+        closes real shared httpx client + VectorService asyncpg pool + workflow executor on exit,
+        and remains resilient when one shutdown hook raises.
+        """
+        gate = asyncio.Event()
+        prewarm_started = threading.Event()
+        created_shared_clients = []
+
+        async def _slow_prewarm(*args, **kwargs):
+            # Capture the FastAPI portal loop's shared httpx client while inside lifespan
+            portal_client = DjangoCoreClient()
+            created_shared_clients.append(portal_client.client)
+            prewarm_started.set()
+            try:
+                await gate.wait()
+            except asyncio.CancelledError:
+                raise
+
+        with patch("app.main.afetch_free_models_catalog", side_effect=_slow_prewarm), \
+             patch("app.main.vector_service.close_pool", new_callable=AsyncMock) as mock_close_pool, \
+             patch("app.main.shutdown_workflow_executor") as mock_shutdown_exec:
+            with TestClient(app) as test_client:
+                self.assertTrue(prewarm_started.wait(timeout=2.0))
+                resp = test_client.get("/health")
+                self.assertEqual(resp.status_code, 200)
+                self.assertGreaterEqual(len(main_module._BACKGROUND_TASKS), 1)
+
+            # After TestClient exits lifespan: task set drained, pools & executor closed cleanly
+            self.assertEqual(len(main_module._BACKGROUND_TASKS), 0)
+            mock_close_pool.assert_awaited_once()
+            mock_shutdown_exec.assert_called_once_with(wait=False)
+            self.assertEqual(len(created_shared_clients), 1)
+            self.assertTrue(created_shared_clients[0].is_closed)
+
+        # Shutdown resilience: failure in close_pool still closes django client & workflow executor
+        with patch("app.main.afetch_free_models_catalog", new_callable=AsyncMock, return_value=["openrouter/free"]), \
+             patch("app.main.vector_service.close_pool", new_callable=AsyncMock, side_effect=RuntimeError("pg shutdown boom")), \
+             patch("app.main.aclose_shared_django_client", new_callable=AsyncMock) as mock_aclose_http, \
+             patch("app.main.shutdown_workflow_executor") as mock_shutdown_exec:
+            with TestClient(app) as test_client:
+                self.assertEqual(test_client.get("/health").status_code, 200)
+
+            mock_aclose_http.assert_awaited_once()
+            mock_shutdown_exec.assert_called_once_with(wait=False)
+
+    def test_fastapi_lifespan_closes_real_asyncpg_pool_and_workflow_executor(self):
+        """
+        End-to-end lifespan shutdown closes an active VectorService asyncpg pool
+        and shuts down the reusable workflow ThreadPoolExecutor on TestClient exit.
+        """
+        import app.graph.workflow as workflow_module
+
+        mock_pg_pool = MagicMock()
+        mock_pg_pool._closed = False
+        mock_pg_pool.close = AsyncMock()
+        initialized = threading.Event()
+
+        async def _prewarm_with_resources(*args, **kwargs):
+            await main_module.vector_service.get_pool()
+            workflow_module.get_workflow_executor()
+            initialized.set()
+            return ["openrouter/free"]
+
+        with patch("app.main.afetch_free_models_catalog", side_effect=_prewarm_with_resources), \
+             patch.object(main_module.vector_service, "db_url", "postgresql://user:pass@localhost:5432/vec"), \
+             patch("asyncpg.create_pool", new_callable=AsyncMock, return_value=mock_pg_pool):
+            with TestClient(app) as test_client:
+                self.assertTrue(initialized.wait(timeout=2.0))
+                self.assertIsNotNone(main_module.vector_service._pool)
+                self.assertIsNotNone(workflow_module._WORKFLOW_EXECUTOR)
+                self.assertEqual(test_client.get("/health").status_code, 200)
+
+        mock_pg_pool.close.assert_awaited_once()
+        self.assertIsNone(main_module.vector_service._pool)
+        self.assertIsNone(workflow_module._WORKFLOW_EXECUTOR)
 
 
 if __name__ == "__main__":

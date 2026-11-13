@@ -8,29 +8,72 @@ import json
 import logging
 import re
 import time
-from typing import Annotated, Any, Dict, Optional
+from typing import Annotated, Any, Dict, Optional, Set
 
 from fastapi import FastAPI, Header, HTTPException, status
 from fastapi.responses import StreamingResponse
 
 from app.core.config import settings
-from app.graph.workflow import arun_workflow, astream_workflow_steps
+from app.graph.workflow import (
+    arun_workflow,
+    astream_workflow_steps,
+    shutdown_workflow_executor,
+)
 from app.schemas.chat import ChatRequest, ChatResponse
+from app.services.django_client import aclose_shared_django_client
 from app.services.llm import afetch_free_models_catalog
+from app.services.vector_service import vector_service
 
 logger = logging.getLogger("api_main")
+
+_BACKGROUND_TASKS: Set[asyncio.Task[Any]] = set()
+
+
+def _on_background_task_done(task: asyncio.Task[Any]) -> None:
+    """Detach finished lifespan background task and consume unexpected exceptions."""
+    _BACKGROUND_TASKS.discard(task)
+    if not task.cancelled():
+        exc = task.exception()
+        if exc is not None:
+            logger.debug("Background lifespan task exited with error: %s", exc)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Lifespan context manager for background initialization."""
+    """Manage startup pre-warm tasks and graceful resource cleanup on shutdown."""
     try:
         loop = asyncio.get_running_loop()
         if loop.is_running():
-            loop.create_task(afetch_free_models_catalog())
+            prewarm_task = loop.create_task(afetch_free_models_catalog())
+            _BACKGROUND_TASKS.add(prewarm_task)
+            prewarm_task.add_done_callback(_on_background_task_done)
     except Exception as exc:
         logger.debug("Catalog pre-warm skipped during lifespan initialization: %s", exc)
-    yield
+
+    try:
+        yield
+    finally:
+        pending_tasks = [task for task in list(_BACKGROUND_TASKS) if not task.done()]
+        for task in pending_tasks:
+            task.cancel()
+        if pending_tasks:
+            await asyncio.gather(*pending_tasks, return_exceptions=True)
+        _BACKGROUND_TASKS.clear()
+
+        try:
+            await vector_service.close_pool()
+        except Exception as exc:
+            logger.warning("Failed to close VectorService asyncpg pool during shutdown: %s", exc)
+
+        try:
+            await aclose_shared_django_client()
+        except Exception as exc:
+            logger.warning("Failed to close shared Django httpx client during shutdown: %s", exc)
+
+        try:
+            shutdown_workflow_executor(wait=False)
+        except Exception as exc:
+            logger.warning("Failed to shutdown workflow executor during shutdown: %s", exc)
 
 
 app = FastAPI(

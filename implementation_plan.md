@@ -1,6 +1,6 @@
 # Implementation Plan: Production-Ready FastPrint ERP AI Orchestrator
 
-Dokumen ini berisi hasil audit teknis menyeluruh dan spesifikasi implementasi detail yang telah diselaraskan dengan seluruh keputusan desain dari sesi `/grill-me`. **Status Progres: D1–D6 selesai diimplementasikan dan terverifikasi.**
+Dokumen ini berisi hasil audit teknis menyeluruh dan spesifikasi implementasi detail yang telah diselaraskan dengan seluruh keputusan desain dari sesi `/grill-me`. **Status Progres: D1–D6 & Lifespan Cleanup / Shared HTTP Pool selesai diimplementasikan dan terverifikasi.**
 
 ---
 
@@ -25,8 +25,8 @@ Dokumen ini berisi hasil audit teknis menyeluruh dan spesifikasi implementasi de
 4. **[PENDING]** **Re-eksekusi Tool Valid & Absennya Identifier Guard di Multi-Tool Retry** ([verifier.py](file:///d:/erp-fastprint/erp-langgraph/app/graph/nodes/verifier.py#L236-L255), [extractor.py](file:///d:/erp-fastprint/erp-langgraph/app/graph/nodes/extractor.py#L1235-L1237)): Saat 1 dari 2 tool kosong, tool yang sudah `VALID` ikut dipanggil ulang ke Django, nomor dokumen spesifik tidak di-guard di multi-tool, dan `branch_co_id` hanya masuk ke `active_tools[0]`.
 5. **[DONE - D6]** **Regex Lokasi Satu Kata & Gagal Resolve Stok Cabang** ([extractor.py](file:///C:/laragon/www/erp-langgraph/app/graph/nodes/extractor.py#L341-L407), [tool_node.py](file:///C:/laragon/www/erp-langgraph/app/graph/nodes/tool_node.py#L100-L147)): `_fallback_extract_stock_level` kini mendukung frasa multi-kata dengan pemangkasan awalan cabang/toko/kantor, `_is_pure_branch_token` mencegah token cabang bocor ke `code`/`search`, serta `tool_node` otomatis resolve `warehouse_id` via `fetch_warehouses` untuk cabang eksplisit atau langsung fail-fast `MISSING_PRODUCT_IDENTIFIER` bila query kosong tanpa identifier.
 6. **[PENDING]** **Timezone Drift UTC vs WIB (`Asia/Jakarta`)** ([extractor.py](file:///d:/erp-fastprint/erp-langgraph/app/graph/nodes/extractor.py#L163), [django_client.py](file:///d:/erp-fastprint/erp-langgraph/app/services/django_client.py#L140)): `date.today()` dan `datetime.now()` mengikuti jam OS container (UTC), menyebabkan melesetnya tanggal `"hari ini"` / `"bulan ini"` pada pukul 00:00–07:00 WIB dan gagalnya MD5 key login ke ERP.
-7. **[PENDING]** **Blocking Event Loop & Per-Request HTTP Client/Login** ([vector_service.py](file:///d:/erp-fastprint/erp-langgraph/app/services/vector_service.py#L131), [tool_node.py](file:///d:/erp-fastprint/erp-langgraph/app/graph/nodes/tool_node.py#L144)): `embed_content()` berjalan sinkron di dalam `async def`, serta `DjangoCoreClient` selalu membuat `httpx.AsyncClient` baru dan login ulang di setiap turn.
-8. **[PARTIAL: Checkpointer LRU DONE (D1), Lifespan Cleanup PENDING]** **Unbounded RAM Checkpointer & Lifespan Leak** ([workflow.py](file:///C:/laragon/www/erp-langgraph/app/graph/workflow.py#L285-L329), [main.py](file:///d:/erp-fastprint/erp-langgraph/app/main.py#L20-L28)): `MemorySaver` tumbuh tanpa batas di RAM, dan shutdown FastAPI tidak menutup pool `asyncpg` / `httpx`.
+7. **[PARTIAL: Shared httpx Pool & Token Cache DONE, Non-Blocking Embedding PENDING]** **Blocking Event Loop & Per-Request HTTP Client/Login** ([vector_service.py](file:///C:/laragon/www/erp-langgraph/app/services/vector_service.py#L140), [django_client.py](file:///C:/laragon/www/erp-langgraph/app/services/django_client.py#L102-L355)): `DjangoCoreClient` kini berbagi `httpx.AsyncClient` pool per event loop dan cache token sistem `_CACHED_SYSTEM_TOKEN`; `embed_content()` masih berjalan sinkron di dalam `async def`.
+8. **[DONE - D1 & Lifespan Cleanup]** **Unbounded RAM Checkpointer & Lifespan Leak** ([workflow.py](file:///C:/laragon/www/erp-langgraph/app/graph/workflow.py#L285-L329), [main.py](file:///C:/laragon/www/erp-langgraph/app/main.py#L29-L77)): `MemorySaver` dibatasi LRU max `500` threads (plus cleanup ephemeral thread `thread_id=None`), dan shutdown FastAPI (`lifespan`) membatalkan `_BACKGROUND_TASKS` lalu menutup pool `asyncpg` (`vector_service.close_pool()`), shared `httpx.AsyncClient` (`aclose_shared_django_client()`), serta workflow executor (`shutdown_workflow_executor()`).
 
 ---
 
@@ -234,9 +234,9 @@ Tambahkan **Strict Identifier Guard** pada Path A (Multi-Tool) agar tool yang me
 ### Phase 3: Shared Connection Pool, Caching Token Sistem, & Non-Blocking Embedding
 
 #### [MODIFY] [django_client.py](file:///C:/laragon/www/erp-langgraph/app/services/django_client.py) & [erp_client.py](file:///d:/erp-fastprint/erp-langgraph/app/services/erp_client.py)
-1. **[PENDING]** **Shared `httpx.AsyncClient` Pool & System Token Cache**:
-   - Sediakan pool `httpx.AsyncClient` tingkat modul (diikat ke event loop yang sedang aktif agar aman bagi test runner yang berganti loop) serta fungsi `aclose_shared_django_client()` untuk lifespan shutdown.
-   - Simpan token hasil `login()` sistem di variabel cache modul (`_CACHED_SYSTEM_TOKEN`) yang dilindungi `asyncio.Lock()` sehingga `DjangoCoreClient()` baru tanpa `token` langsung memakai token sistem yang sudah di-cache tanpa login berulang setiap request.
+1. **[DONE]** **Shared `httpx.AsyncClient` Pool & System Token Cache**:
+   - Diimplementasikan di [django_client.py](file:///C:/laragon/www/erp-langgraph/app/services/django_client.py#L102-L355): pool `httpx.AsyncClient` tingkat modul terikat ke event loop aktif (`WeakKeyDictionary`) beserta `aclose_shared_django_client()` untuk lifespan shutdown.
+   - Token hasil `login()` sistem disimpan di cache modul (`_CACHED_SYSTEM_TOKEN`) dengan proteksi `_get_token_lock()` (`asyncio.Lock`) dan invalidasi otomatis saat HTTP `401`.
 2. **[DONE - D2]** **Strict User Token Guard (`require_user_token`)**:
    - Parameter `require_user_token: bool = False` sudah ditambahkan pada `DjangoCoreClient` ([django_client.py](file:///C:/laragon/www/erp-langgraph/app/services/django_client.py#L116)), memblokir fallback ke `self.token` atau `self.login()` dengan `DjangoAuthError(..., status_code=401)` saat `user_token` kosong, serta diteruskan dari [tool_node.py](file:///C:/laragon/www/erp-langgraph/app/graph/nodes/tool_node.py#L144) dan [rag_node.py](file:///C:/laragon/www/erp-langgraph/app/graph/nodes/rag_node.py#L63).
 3. **[PENDING]** **Timezone-Aware MD5 Secret Key**:
@@ -327,9 +327,8 @@ Jalankan pemanggilan sinkron Google GenAI SDK `client.models.embed_content` di d
 ```
 
 #### [MODIFY] [main.py](file:///C:/laragon/www/erp-langgraph/app/main.py)
-1. **[PENDING]** **Lifespan Management**:
-   - Simpan reference task `afetch_free_models_catalog()` di dalam `_BACKGROUND_TASKS: set`.
-   - Saat shutdown (`after yield`), panggil `await vector_service.close_pool()`, `await aclose_shared_django_client()`, dan `shutdown_workflow_executor()`.
+1. **[DONE]** **Lifespan Management**:
+   - Diimplementasikan di [main.py](file:///C:/laragon/www/erp-langgraph/app/main.py#L29-L77): menyimpan reference task `afetch_free_models_catalog()` di dalam `_BACKGROUND_TASKS` (plus `_on_background_task_done`), dan pada blok `finally` shutdown membatalkan task tersisa lalu memanggil `await vector_service.close_pool()`, `await aclose_shared_django_client()`, serta `shutdown_workflow_executor(wait=False)`.
 2. **[DONE - D2]** **Helper Autentikasi & Ekstraksi Token (`_resolve_and_validate_auth`)**:
    - Sudah diimplementasikan di [main.py](file:///C:/laragon/www/erp-langgraph/app/main.py#L54-L98) (`_extract_bearer_token` + `_resolve_and_validate_auth`): mengambil token dari `payload.user_token` atau header `Authorization: Bearer <token>`, memvalidasi `X-Internal-Service-Key` saat `REQUIRE_SERVICE_KEY=True` (HTTP 403), dan mewajibkan token saat `APP_ENV=production` atau `REQUIRE_USER_TOKEN=True` (HTTP 401).
 3. **[DONE - D2, D3, & D4]** **Update `POST /api/v1/chat`**:
@@ -354,6 +353,7 @@ Jalankan pemanggilan sinkron Google GenAI SDK `client.models.embed_content` di d
    - [x] **[DONE saat D4]** `.\.venv\Scripts\python.exe -m unittest discover tests` $\rightarrow$ **506 tests passed** (`OK` in `17.635s`).
    - [x] **[DONE saat D5]** `.\.venv\Scripts\python.exe -m unittest discover tests` $\rightarrow$ **509 tests passed** (`OK` in `18.137s`).
    - [x] **[DONE saat D6]** `.\.venv\Scripts\python.exe -m unittest discover tests` $\rightarrow$ **511 tests passed** (`OK`).
+   - [x] **[DONE - Lifespan Cleanup & Shared HTTP Pool]** `.\.venv\Scripts\python.exe -m unittest discover tests` $\rightarrow$ **514 tests passed** (`OK`).
    ```powershell
    .\.venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py" -v
    ```
@@ -375,3 +375,4 @@ Jalankan pemanggilan sinkron Google GenAI SDK `client.models.embed_content` di d
    - [x] `test_chat_endpoint_returns_resolved_company_id_and_execution_time_ms`: Memastikan `POST /api/v1/chat` mengisi `resolved_company_id` dan `execution_time_ms`. *(D4)*
    - [x] `test_chat_stream_sse_endpoint`: Menguji `POST /api/v1/chat/stream` memancarkan event `step` dan `complete` dengan `resolved_company_id` & `execution_time_ms` serta header SSE. *(D4)*
    - [x] `test_chat_stream_enforces_production_auth_401_and_bearer_header` & `test_chat_stream_emits_error_event_on_stream_exception`: Menguji penolakan 401 di mode production, autentikasi `Authorization: Bearer`, dan `event: error` saat exception mid-stream. *(D4)*
+   - [x] `test_shared_httpx_pool_system_token_cache_and_shutdown`, `test_fastapi_lifespan_tracks_background_tasks_and_closes_all_resources`, & `test_fastapi_lifespan_closes_real_asyncpg_pool_and_workflow_executor`: Memastikan shared `httpx.AsyncClient` per-loop, koalesensi login `_CACHED_SYSTEM_TOKEN`, pelacakan `_BACKGROUND_TASKS`, dan penutupan `vector_service.close_pool()`, `aclose_shared_django_client()`, serta `shutdown_workflow_executor()` pada shutdown FastAPI. *(Lifespan Cleanup)*

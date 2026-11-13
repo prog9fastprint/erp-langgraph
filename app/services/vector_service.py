@@ -35,11 +35,20 @@ class VectorService:
         self._genai_client = None
         self._pool: Optional[Any] = None
         self._pool_lock: Optional[asyncio.Lock] = None
+        self._pool_lock_loop: Optional[asyncio.AbstractEventLoop] = None
 
     def _get_pool_lock(self) -> asyncio.Lock:
-        """Lazily initialize pool lock within the running event loop."""
-        if self._pool_lock is None:
+        """Lazily initialize pool lock bound to the currently running event loop."""
+        try:
+            running_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            running_loop = None
+
+        if self._pool_lock is None or (
+            running_loop is not None and self._pool_lock_loop is not running_loop
+        ):
             self._pool_lock = asyncio.Lock()
+            self._pool_lock_loop = running_loop
         return self._pool_lock
 
     async def get_pool(self) -> Optional[Any]:

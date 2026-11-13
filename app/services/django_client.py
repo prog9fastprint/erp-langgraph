@@ -7,8 +7,10 @@ import asyncio
 import hashlib
 import logging
 import re
+import threading
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
+import weakref
 import httpx
 
 from app.core.config import settings
@@ -97,6 +99,92 @@ def _clean_params(params: Any) -> Dict[str, Any]:
     return {k: v for k, v in raw.items() if v is not None}
 
 
+_SHARED_CLIENT_LOCK = threading.Lock()
+_SHARED_HTTPX_CLIENTS: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, httpx.AsyncClient]" = (
+    weakref.WeakKeyDictionary()
+)
+
+_CACHED_SYSTEM_TOKEN: Optional[str] = None
+_TOKEN_LOCK: Optional[asyncio.Lock] = None
+_TOKEN_LOCK_LOOP: Optional[asyncio.AbstractEventLoop] = None
+
+
+def _get_token_lock() -> asyncio.Lock:
+    """Lazily initialize module-level token lock bound to the active event loop."""
+    global _TOKEN_LOCK, _TOKEN_LOCK_LOOP
+    try:
+        running_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        running_loop = None
+
+    if _TOKEN_LOCK is None or (running_loop is not None and _TOKEN_LOCK_LOOP is not running_loop):
+        _TOKEN_LOCK = asyncio.Lock()
+        _TOKEN_LOCK_LOOP = running_loop
+    return _TOKEN_LOCK
+
+
+async def _invalidate_cached_system_token(expected_token: Optional[str]) -> None:
+    """Clear module-level cached system token only if it still matches expected_token."""
+    global _CACHED_SYSTEM_TOKEN
+    async with _get_token_lock():
+        if _CACHED_SYSTEM_TOKEN == expected_token:
+            _CACHED_SYSTEM_TOKEN = None
+
+
+def _get_shared_httpx_client(timeout: Optional[float] = None) -> Tuple[httpx.AsyncClient, bool]:
+    """
+    Acquire or create a module-level shared httpx.AsyncClient bound to the running event loop.
+    Falls back to a standalone unshared client when called without a running event loop.
+    """
+    effective_timeout = timeout if timeout is not None else settings.REQUEST_TIMEOUT_SEC
+    try:
+        running_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return httpx.AsyncClient(timeout=effective_timeout), False
+
+    with _SHARED_CLIENT_LOCK:
+        for loop_key in list(_SHARED_HTTPX_CLIENTS.keys()):
+            if loop_key.is_closed():
+                _SHARED_HTTPX_CLIENTS.pop(loop_key, None)
+
+        shared_client = _SHARED_HTTPX_CLIENTS.get(running_loop)
+        if shared_client is None or shared_client.is_closed:
+            shared_client = httpx.AsyncClient(timeout=effective_timeout)
+            _SHARED_HTTPX_CLIENTS[running_loop] = shared_client
+        return shared_client, True
+
+
+async def aclose_shared_django_client() -> None:
+    """
+    Close shared module-level httpx.AsyncClient pool(s) for the current event loop
+    and clear the cached system JWT token. Called during FastAPI lifespan shutdown.
+    """
+    global _CACHED_SYSTEM_TOKEN
+    try:
+        running_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        running_loop = None
+
+    clients_to_close: List[httpx.AsyncClient] = []
+    with _SHARED_CLIENT_LOCK:
+        for loop_key in list(_SHARED_HTTPX_CLIENTS.keys()):
+            if loop_key.is_closed():
+                _SHARED_HTTPX_CLIENTS.pop(loop_key, None)
+            elif running_loop is None or loop_key is running_loop:
+                shared_client = _SHARED_HTTPX_CLIENTS.pop(loop_key, None)
+                if shared_client is not None:
+                    clients_to_close.append(shared_client)
+
+    for client in clients_to_close:
+        try:
+            if not client.is_closed:
+                await client.aclose()
+        except Exception as exc:
+            logger.warning("Error closing shared httpx.AsyncClient pool: %s", exc)
+
+    _CACHED_SYSTEM_TOKEN = None
+
+
 class DjangoCoreClient:
     """
     Asynchronous client for interacting with FastPrint ERP Django Core API via HTTPX.
@@ -116,14 +204,26 @@ class DjangoCoreClient:
         require_user_token: bool = False,
     ):
         self.base_url = (base_url or settings.ERP_BASE_URL).rstrip("/")
-        self.token = (token or settings.ERP_API_TOKEN or "").strip() or None
+        self._external_client = client is not None
+        explicit_token = (token or settings.ERP_API_TOKEN or "").strip() or None
+        if explicit_token is None and not self._external_client and _CACHED_SYSTEM_TOKEN:
+            explicit_token = _CACHED_SYSTEM_TOKEN
+        self.token = explicit_token
         self.username = (username or settings.ERP_USERNAME or "").strip() or None
         self.password = (password or settings.ERP_PASSWORD or "").strip() or None
         self.default_company_id = default_company_id or settings.DEFAULT_COMPANY_ID
         self.timeout = timeout if timeout is not None else settings.REQUEST_TIMEOUT_SEC
         self.service_key = service_key or settings.ERP_API_TOKEN
-        self._external_client = client is not None
-        self.client = client or httpx.AsyncClient(timeout=self.timeout)
+        self._shared_client_ref: Optional[httpx.AsyncClient] = None
+        if client is not None:
+            self.client = client
+            self._uses_shared_client = False
+        else:
+            shared_client, uses_shared = _get_shared_httpx_client(timeout=self.timeout)
+            self.client = shared_client
+            self._uses_shared_client = uses_shared
+            if uses_shared:
+                self._shared_client_ref = shared_client
         self.require_user_token = bool(require_user_token)
 
     async def __aenter__(self) -> "DjangoCoreClient":
@@ -133,8 +233,15 @@ class DjangoCoreClient:
         await self.aclose()
 
     async def aclose(self) -> None:
-        """Close underlying httpx.AsyncClient if managed internally."""
-        if not self._external_client and not self.client.is_closed:
+        """
+        Close underlying httpx.AsyncClient if owned exclusively by this instance.
+        Shared module-level pooled clients stay open until aclose_shared_django_client().
+        """
+        if self._external_client:
+            return
+        if self._uses_shared_client and self.client is self._shared_client_ref:
+            return
+        if self.client is not None and not self.client.is_closed:
             await self.client.aclose()
 
     def _generate_secret_key(self) -> str:
@@ -143,10 +250,8 @@ class DjangoCoreClient:
         raw_string = f"erp_master_nexus-{now}"
         return hashlib.md5(raw_string.encode()).hexdigest()
 
-    async def login(self) -> str:
-        """
-        Authenticate against ERP external_api/get_token/ to obtain JWT access token.
-        """
+    async def _perform_login(self) -> str:
+        """Execute POST /external_api/get_token/ to acquire a fresh JWT access token."""
         if not self.username or not self.password:
             raise DjangoAuthError(
                 "ERP credentials missing. Provide valid user_token, ERP_API_TOKEN, or ERP_USERNAME and ERP_PASSWORD."
@@ -162,10 +267,14 @@ class DjangoCoreClient:
             "password": self.password,
         }
 
+        post_kwargs: Dict[str, Any] = {"json": payload, "headers": headers}
+        if self._uses_shared_client and self.client is self._shared_client_ref and self.timeout != settings.REQUEST_TIMEOUT_SEC:
+            post_kwargs["timeout"] = self.timeout
+
         last_exc: Optional[Exception] = None
         for attempt in range(2):
             try:
-                resp = await self.client.post(url, json=payload, headers=headers)
+                resp = await self.client.post(url, **post_kwargs)
             except httpx.RequestError as exc:
                 last_exc = DjangoCoreClientError(f"Network error during login to ERP: {exc}")
                 if attempt == 0:
@@ -206,6 +315,24 @@ class DjangoCoreClient:
             logger.info("Successfully acquired new JWT token from ERP via async login.")
             return token
 
+    async def login(self) -> str:
+        """
+        Authenticate against ERP external_api/get_token/ to obtain JWT access token.
+        Uses a lock-guarded module cache for managed internal clients so concurrent
+        requests share one login call.
+        """
+        global _CACHED_SYSTEM_TOKEN
+        if self._external_client:
+            return await self._perform_login()
+
+        async with _get_token_lock():
+            if _CACHED_SYSTEM_TOKEN:
+                self.token = _CACHED_SYSTEM_TOKEN
+                return _CACHED_SYSTEM_TOKEN
+            token = await self._perform_login()
+            _CACHED_SYSTEM_TOKEN = token
+            return token
+
     async def _request(
         self,
         method: str,
@@ -243,13 +370,16 @@ class DjangoCoreClient:
             req_headers.update(headers)
 
         try:
-            resp = await self.client.request(
-                method=method,
-                url=url,
-                params=params,
-                json=json,
-                headers=req_headers,
-            )
+            req_kwargs: Dict[str, Any] = {
+                "method": method,
+                "url": url,
+                "params": params,
+                "json": json,
+                "headers": req_headers,
+            }
+            if self._uses_shared_client and self.client is self._shared_client_ref and self.timeout != settings.REQUEST_TIMEOUT_SEC:
+                req_kwargs["timeout"] = self.timeout
+            resp = await self.client.request(**req_kwargs)
         except httpx.RequestError as exc:
             raise DjangoCoreClientError(f"Network error calling Django Core endpoint {endpoint}: {exc}")
 
@@ -273,6 +403,8 @@ class DjangoCoreClient:
         if resp.status_code == 401:
             if not clean_user_token and not self.require_user_token and retries > 0:
                 logger.warning("System JWT token expired (401). Attempting re-login...")
+                if not self._external_client:
+                    await _invalidate_cached_system_token(active_token)
                 await self.login()
                 return await self._request(
                     method=method,
