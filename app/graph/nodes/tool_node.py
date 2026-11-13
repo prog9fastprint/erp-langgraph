@@ -10,7 +10,13 @@ import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.core.config import settings
-from app.core.context import sanitize_erp_payload, clean_product_identifier
+from app.core.context import (
+    clean_product_identifier,
+    compute_multi_tool_counts,
+    get_multi_tool_key,
+    sanitize_erp_payload,
+    should_preserve_plan_on_retry,
+)
 from app.graph.state import AgentState
 from app.services.django_client import (
     DjangoCoreClient,
@@ -224,19 +230,37 @@ async def tool_node(
         # Path A: Multi-Tool Execution via asyncio.gather (Milestone 3)
         # ------------------------------------------------------------------
         if is_multi_tool and active_tools:
-            tasks = [
-                _execute_single_tool(
-                    tool_name=plan.get("tool", "fetch_vendor_invoices"),
-                    params=plan.get("params") or {},
-                    erp_client=erp_client,
-                    user_token=user_token,
-                    default_company_id=state.get("company_id"),
-                    dispatch_map=dispatch_map,
-                    user_query=plan.get("sub_query") or state.get("user_query") or "",
-                    allow_empty_stock_params=not bool(plan.get("sub_query")),
-                )
-                for plan in active_tools
-            ]
+            tool_counts = compute_multi_tool_counts(active_tools)
+            retry_count = int(state.get("retry_count") or 0)
+            prev_multi_status = state.get("multi_verification_status") or {}
+
+            async def _reuse_cached_result(cached_res: Any) -> Tuple[Any, Optional[str]]:
+                return cached_res, None
+
+            tasks = []
+            for idx, plan in enumerate(active_tools):
+                t_name = plan.get("tool", "unnamed_tool")
+                key = get_multi_tool_key(t_name, idx, tool_counts)
+                if (
+                    retry_count > 0
+                    and plan.get("status") == "success"
+                    and plan.get("result") is not None
+                    and should_preserve_plan_on_retry(plan, key, prev_multi_status)
+                ):
+                    tasks.append(_reuse_cached_result(plan.get("result")))
+                else:
+                    tasks.append(
+                        _execute_single_tool(
+                            tool_name=plan.get("tool", "fetch_vendor_invoices"),
+                            params=plan.get("params") or {},
+                            erp_client=erp_client,
+                            user_token=user_token,
+                            default_company_id=state.get("company_id"),
+                            dispatch_map=dispatch_map,
+                            user_query=plan.get("sub_query") or state.get("user_query") or "",
+                            allow_empty_stock_params=not bool(plan.get("sub_query")),
+                        )
+                    )
             results = await asyncio.gather(*tasks, return_exceptions=True)
 
             multi_tool_results: Dict[str, Any] = {}
@@ -244,16 +268,10 @@ async def tool_node(
             updated_active_tools: List[Dict[str, Any]] = []
             errors: List[str] = []
 
-            # Track tool frequencies to resolve duplicate tool names with composite keys
-            tool_counts: Dict[str, int] = {}
-            for plan in active_tools:
-                tn = plan.get("tool", "unnamed_tool")
-                tool_counts[tn] = tool_counts.get(tn, 0) + 1
-
             for idx, (plan, res) in enumerate(zip(active_tools, results)):
                 p_copy = dict(plan)
                 t_name = p_copy.get("tool", "unnamed_tool")
-                key = f"{t_name}_{idx}" if tool_counts.get(t_name, 0) > 1 else t_name
+                key = get_multi_tool_key(t_name, idx, tool_counts)
 
                 if isinstance(res, Exception):
                     err_msg = str(res)

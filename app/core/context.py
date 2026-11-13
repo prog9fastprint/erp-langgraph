@@ -294,3 +294,44 @@ def format_deterministic_summary(messages: List[BaseMessage]) -> str:
     summary_lines.append(f"- Total Riwayat Giliran: {len(messages)} pesan")
 
     return "\n".join(summary_lines)
+
+
+_STRICT_DOC_ID_RE = re.compile(r"\b(?:[A-Za-z0-9_\-]+/)+\d{4}/\d+\b")
+
+
+def has_strict_document_identifier(params: Optional[Dict[str, Any]]) -> bool:
+    """Return True if params target a specific ERP document number (e.g. JE/2026/001)."""
+    if not isinstance(params, dict):
+        return False
+    if params.get("entry_number"):
+        return True
+    search_val = params.get("search")
+    return bool(search_val and _STRICT_DOC_ID_RE.search(str(search_val)))
+
+
+def compute_multi_tool_counts(active_tools: Optional[List[Dict[str, Any]]]) -> Dict[str, int]:
+    """Count occurrences of each tool name across active_tools to disambiguate duplicate keys."""
+    counts: Dict[str, int] = {}
+    for plan in active_tools or []:
+        t_name = plan.get("tool", "unnamed_tool")
+        counts[t_name] = counts.get(t_name, 0) + 1
+    return counts
+
+
+def get_multi_tool_key(tool_name: str, idx: int, tool_counts: Dict[str, int]) -> str:
+    """Return canonical result/status key for an active_tools entry."""
+    return f"{tool_name}_{idx}" if tool_counts.get(tool_name, 0) > 1 else tool_name
+
+
+def should_preserve_plan_on_retry(
+    plan: Dict[str, Any],
+    key: str,
+    multi_verification_status: Optional[Dict[str, str]],
+) -> bool:
+    """Return True if a multi-tool plan should keep its params/result during retry."""
+    if not isinstance(plan, dict):
+        return False
+    status_val = (multi_verification_status or {}).get(key)
+    if plan.get("status") == "success" and status_val == "VALID":
+        return True
+    return has_strict_document_identifier(plan.get("params"))

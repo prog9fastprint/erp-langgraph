@@ -20,7 +20,10 @@ from app.core.context import (
     trim_conversation_messages,
     build_contextual_prompt,
     clean_product_identifier,
+    compute_multi_tool_counts,
     get_current_erp_date,
+    get_multi_tool_key,
+    should_preserve_plan_on_retry,
 )
 from app.graph.state import AgentState, ToolCallPlan
 from app.schemas.tools import (
@@ -1240,8 +1243,14 @@ def extractor_node(
         except Exception:
             model = None
 
-    # Multi-tool extraction iteration
-    for plan in working_active_tools:
+    # Multi-tool extraction iteration (preserve already-VALID or strict-doc plans on retry)
+    multi_status = state.get("multi_verification_status") or {}
+    tool_counts = compute_multi_tool_counts(working_active_tools)
+    for idx, plan in enumerate(working_active_tools):
+        t_name = plan.get("tool", "unnamed_tool")
+        key = get_multi_tool_key(t_name, idx, tool_counts)
+        if retry_count > 0 and should_preserve_plan_on_retry(plan, key, multi_status):
+            continue
         extracted = _extract_single_tool_params(
             plan=plan,
             all_plans=working_active_tools,
@@ -1267,9 +1276,11 @@ def extractor_node(
     )
     if branch_co_id is not None:
         result_update["company_id"] = branch_co_id
-        if working_active_tools:
-            working_active_tools[0].setdefault("params", {})["company_id"] = branch_co_id
-            primary_params["company_id"] = branch_co_id
+        for plan_item in working_active_tools:
+            plan_params = plan_item.setdefault("params", {})
+            if not plan_params.get("company_id") or plan_params.get("company_id") == state.get("company_id"):
+                plan_params["company_id"] = branch_co_id
+        primary_params["company_id"] = branch_co_id
     elif state.get("company_id") is not None:
         result_update["company_id"] = state.get("company_id")
 

@@ -4,9 +4,13 @@ Evaluates tool execution results, implements an automated retry/correction cycle
 for empty query results (with maximum 2 retries), and provides conditional edge routing.
 """
 import logging
-import re
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+from app.core.context import (
+    compute_multi_tool_counts,
+    get_multi_tool_key,
+    has_strict_document_identifier,
+)
 from app.graph.state import AgentState, VerificationStatus
 
 logger = logging.getLogger("verifier_node")
@@ -180,17 +184,14 @@ def verifier_node(state: AgentState) -> Dict[str, Any]:
     # Path A: Aggregate Verification for Multi-Tool Execution (Milestone 4)
     # ------------------------------------------------------------------
     if is_multi and (multi_results or active_tools):
-        tool_counts: Dict[str, int] = {}
-        for p in active_tools:
-            tn = p.get("tool", "unnamed_tool")
-            tool_counts[tn] = tool_counts.get(tn, 0) + 1
+        tool_counts = compute_multi_tool_counts(active_tools)
 
         items: List[Tuple[str, Any, Optional[str]]] = []
 
         if active_tools:
             for idx, plan in enumerate(active_tools):
                 tn = plan.get("tool", "unnamed_tool")
-                key = f"{tn}_{idx}" if tool_counts.get(tn, 0) > 1 else tn
+                key = get_multi_tool_key(tn, idx, tool_counts)
                 res = plan.get("result")
                 if res is None and key in multi_results:
                     res = multi_results[key]
@@ -208,7 +209,7 @@ def verifier_node(state: AgentState) -> Dict[str, Any]:
         has_error_tool = False
         has_valid_tool = False
 
-        for key, res, st in items:
+        for idx, (key, res, st) in enumerate(items):
             if st in ("error", "ERROR") or (res is None and state.get("error_message")):
                 per_tool_status[key] = "ERROR"
                 has_error_tool = True
@@ -220,7 +221,9 @@ def verifier_node(state: AgentState) -> Dict[str, Any]:
                     has_valid_tool = True
                 else:
                     per_tool_status[key] = "EMPTY"
-                    has_empty_tool = True
+                    plan_params = (active_tools[idx].get("params") or {}) if idx < len(active_tools) else {}
+                    if not has_strict_document_identifier(plan_params):
+                        has_empty_tool = True
 
         current_retry_count = int(state.get("retry_count") or 0)
 
@@ -302,14 +305,7 @@ def verifier_node(state: AgentState) -> Dict[str, Any]:
     # Strict Identifier Guard: If querying a specific document number and 0 records found,
     # terminate immediately with EMPTY to avoid wasting retries on hallucinated relaxations.
     extracted_params = state.get("extracted_params") or {}
-    has_specific_document_identifier = bool(
-        extracted_params.get("entry_number")
-        or (
-            extracted_params.get("search")
-            and re.search(r"\b(?:[A-Za-z0-9_\-]+/)+\d{4}/\d+\b", str(extracted_params["search"]))
-        )
-    )
-    if has_specific_document_identifier:
+    if has_strict_document_identifier(extracted_params):
         logger.info("Specific document identifier search returned 0 records -> EMPTY (Strict Identifier Guard).")
         return {
             "verification_status": "EMPTY",

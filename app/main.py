@@ -9,9 +9,10 @@ import logging
 import re
 import time
 from typing import Annotated, Any, Dict, Optional, Set
+import uuid
 
-from fastapi import FastAPI, Header, HTTPException, status
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, Header, HTTPException, Request, status
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from app.core.config import settings
 from app.graph.workflow import (
@@ -86,12 +87,60 @@ app = FastAPI(
 )
 
 
+@app.middleware("http")
+async def add_observability_headers(request: Request, call_next):
+    """Attach X-Request-ID and X-Process-Time-Ms headers to every HTTP response."""
+    raw_request_id = request.headers.get("X-Request-ID") or ""
+    sanitized_request_id = re.sub(r"[^A-Za-z0-9._-]", "", raw_request_id)[:64]
+    request_id = sanitized_request_id or uuid.uuid4().hex
+    request.state.request_id = request_id
+
+    started_at = time.perf_counter()
+    response = await call_next(request)
+    elapsed_ms = (time.perf_counter() - started_at) * 1000.0
+    response.headers["X-Request-ID"] = request_id
+    response.headers["X-Process-Time-Ms"] = f"{elapsed_ms:.2f}"
+    return response
+
+
 @app.get("/health", summary="Health check", tags=["System"])
 async def health_check():
     """
     Health check endpoint returning system status.
     """
     return {"status": "healthy"}
+
+
+@app.get("/health/ready", summary="Readiness check", tags=["System"])
+async def readiness_check():
+    """
+    Report boolean readiness status for LLM provider, ERP connection config, and Vector DB
+    without exposing URLs, credentials, or internal environment details.
+    """
+    provider = (settings.MODEL_PROVIDER or "openrouter").strip().lower()
+    if provider == "openai":
+        llm_configured = bool((settings.OPENAI_API_KEY or "").strip())
+    else:
+        llm_configured = bool((settings.OPENROUTER_API_KEY or "").strip())
+
+    erp_configured = bool((settings.ERP_BASE_URL or "").strip())
+    vector_db_configured = bool((getattr(vector_service, "db_url", None) or settings.VECTOR_DB_URL or "").strip())
+    is_ready = llm_configured and erp_configured
+
+    payload = {
+        "status": "ready" if is_ready else "degraded",
+        "checks": {
+            "llm_provider": provider,
+            "llm_configured": llm_configured,
+            "erp_configured": erp_configured,
+            "rag_enabled": bool(settings.ENABLE_RAG),
+            "vector_db_configured": vector_db_configured,
+        },
+    }
+    return JSONResponse(
+        content=payload,
+        status_code=status.HTTP_200_OK if is_ready else status.HTTP_503_SERVICE_UNAVAILABLE,
+    )
 
 
 def _extract_bearer_token(authorization: Optional[str]) -> Optional[str]:
@@ -116,7 +165,13 @@ def _resolve_and_validate_auth(
     in production or when REQUIRE_USER_TOKEN is enabled.
     """
     if settings.REQUIRE_SERVICE_KEY:
-        expected_key = (settings.ERP_API_TOKEN or "").strip()
+        dedicated_key = (settings.INTERNAL_SERVICE_KEY or "").strip()
+        fallback_key = (settings.ERP_API_TOKEN or "").strip()
+        if not dedicated_key and fallback_key:
+            logger.warning(
+                "REQUIRE_SERVICE_KEY is using ERP_API_TOKEN fallback; configure INTERNAL_SERVICE_KEY instead."
+            )
+        expected_key = dedicated_key or fallback_key
         provided_key = (x_internal_service_key or "").strip()
         if not expected_key or not hmac.compare_digest(provided_key, expected_key):
             raise HTTPException(

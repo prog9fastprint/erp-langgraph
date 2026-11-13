@@ -1149,5 +1149,235 @@ class TestNonBlockingVectorEmbedding(unittest.TestCase):
         self.assertEqual(concurrent_ticks, 3)
 
 
+class TestDedicatedInternalServiceKeyAndObservability(unittest.TestCase):
+    """Verify INTERNAL_SERVICE_KEY precedence, X-Request-ID/X-Process-Time-Ms headers, and /health/ready."""
+
+    def setUp(self):
+        self.client = TestClient(app)
+
+    @patch("app.main.arun_workflow", new_callable=AsyncMock)
+    def test_internal_service_key_precedence_over_erp_api_token(self, mock_workflow):
+        mock_workflow.return_value = {
+            "final_answer": "OK",
+            "detected_domain": "general",
+            "verification_status": "VALID",
+            "error_message": None,
+        }
+
+        with patch.object(settings, "REQUIRE_SERVICE_KEY", True), \
+             patch.object(settings, "INTERNAL_SERVICE_KEY", "dedicated-service-secret"), \
+             patch.object(settings, "ERP_API_TOKEN", "legacy-jwt-token"):
+            resp_legacy = self.client.post(
+                "/api/v1/chat",
+                json={"query": "Halo"},
+                headers={"X-Internal-Service-Key": "legacy-jwt-token"},
+            )
+            self.assertEqual(resp_legacy.status_code, 403)
+
+            resp_dedicated = self.client.post(
+                "/api/v1/chat",
+                json={"query": "Halo"},
+                headers={"X-Internal-Service-Key": "dedicated-service-secret"},
+            )
+            self.assertEqual(resp_dedicated.status_code, 200)
+
+    def test_request_id_and_process_time_headers(self):
+        resp_auto = self.client.get("/health")
+        self.assertEqual(resp_auto.status_code, 200)
+        self.assertTrue(resp_auto.headers.get("X-Request-ID"))
+        self.assertIsNotNone(resp_auto.headers.get("X-Process-Time-Ms"))
+        self.assertGreaterEqual(float(resp_auto.headers["X-Process-Time-Ms"]), 0.0)
+
+        resp_echo = self.client.get("/health", headers={"X-Request-ID": "req-abc_123"})
+        self.assertEqual(resp_echo.headers.get("X-Request-ID"), "req-abc_123")
+
+    def test_health_ready_boolean_status_without_secret_leakage(self):
+        with patch.object(settings, "MODEL_PROVIDER", "openrouter"), \
+             patch.object(settings, "OPENROUTER_API_KEY", "sk-secret-key"), \
+             patch.object(settings, "ERP_BASE_URL", "http://internal-erp.local:8000"), \
+             patch.object(settings, "VECTOR_DB_URL", "postgresql://postgres:supersecret@db.internal:5432/vec"), \
+             patch.object(main_module.vector_service, "db_url", "postgresql://postgres:supersecret@db.internal:5432/vec"):
+            resp_ready = self.client.get("/health/ready")
+            self.assertEqual(resp_ready.status_code, 200)
+            body = resp_ready.json()
+            self.assertEqual(body["status"], "ready")
+            self.assertTrue(body["checks"]["llm_configured"])
+            self.assertTrue(body["checks"]["erp_configured"])
+            self.assertTrue(body["checks"]["vector_db_configured"])
+            raw_text = resp_ready.text
+            self.assertNotIn("supersecret", raw_text)
+            self.assertNotIn("sk-secret-key", raw_text)
+            self.assertNotIn("internal-erp.local", raw_text)
+            self.assertNotIn("db.internal", raw_text)
+
+        with patch.object(settings, "MODEL_PROVIDER", "openrouter"), \
+             patch.object(settings, "OPENROUTER_API_KEY", ""), \
+             patch.object(settings, "ERP_BASE_URL", "http://internal-erp.local:8000"):
+            resp_degraded = self.client.get("/health/ready")
+            self.assertEqual(resp_degraded.status_code, 503)
+            self.assertEqual(resp_degraded.json()["status"], "degraded")
+
+
+class TestPending4MultiToolSelectiveRetryAndBranchScoping(unittest.IsolatedAsyncioTestCase):
+    """Verify multi-tool selective retry, strict doc identifier guard, and branch_co_id propagation."""
+
+    async def test_multi_tool_selective_retry_skips_already_valid_tool(self):
+        from app.graph.nodes.extractor import extractor_node
+        from app.graph.nodes.tool_node import tool_node
+        from app.graph.nodes.verifier import verifier_node
+
+        valid_stock_payload = {
+            "products": [{"sku": "INK-01", "name": "Tinta", "quantity": 12}],
+            "total_count": 1,
+        }
+        empty_bills_payload = {"bills": [], "total_count": 0}
+        found_bills_payload = {"bills": [{"id": 1, "number": "BILL/2026/001"}], "total_count": 1}
+
+        mock_client = MagicMock()
+        mock_client.fetch_stock_level = AsyncMock(return_value=valid_stock_payload)
+        mock_client.fetch_vendor_bills = AsyncMock(side_effect=[empty_bills_payload, found_bills_payload])
+
+        initial_state = {
+            "user_query": "Cek stok tinta dan tagihan vendor minggu ini",
+            "company_id": 1,
+            "is_multi_tool": True,
+            "retry_count": 0,
+            "active_tools": [
+                {
+                    "tool": "get_stock_level",
+                    "domain": "inventory",
+                    "sub_query": "Cek stok tinta INK-01",
+                    "params": {"code": "INK-01"},
+                    "status": "pending",
+                },
+                {
+                    "tool": "get_vendor_bills",
+                    "domain": "accounting",
+                    "sub_query": "Cek tagihan vendor minggu ini",
+                    "params": {"date_from": "2026-11-09", "date_to": "2026-11-13"},
+                    "status": "pending",
+                },
+            ],
+        }
+
+        with patch("app.graph.nodes.extractor._extract_single_tool_params") as mock_extract:
+            mock_extract.side_effect = [
+                {"code": "INK-01", "company_id": 1},
+                {"date_from": "2026-11-09", "date_to": "2026-11-13", "company_id": 1},
+            ]
+            ext1 = extractor_node(initial_state)
+
+        state_after_ext1 = {**initial_state, **ext1}
+        t1 = await tool_node(state_after_ext1, client=mock_client)
+        state_after_t1 = {**state_after_ext1, **t1}
+        v1 = verifier_node(state_after_t1)
+
+        self.assertEqual(v1["verification_status"], "RETRY")
+        self.assertEqual(v1["multi_verification_status"]["get_stock_level"], "VALID")
+        self.assertEqual(v1["multi_verification_status"]["get_vendor_bills"], "EMPTY")
+
+        # Retry cycle: only get_vendor_bills should be re-extracted and re-executed
+        state_retry = {**state_after_t1, **v1}
+        with patch("app.graph.nodes.extractor._extract_single_tool_params") as mock_extract_retry:
+            mock_extract_retry.return_value = {"company_id": 1}
+            ext2 = extractor_node(state_retry)
+            self.assertEqual(mock_extract_retry.call_count, 1)
+            self.assertEqual(mock_extract_retry.call_args.kwargs["plan"]["tool"], "get_vendor_bills")
+
+        self.assertEqual(ext2["active_tools"][0]["params"], {"code": "INK-01", "company_id": 1})
+        state_after_ext2 = {**state_retry, **ext2}
+        t2 = await tool_node(state_after_ext2, client=mock_client)
+
+        self.assertEqual(mock_client.fetch_stock_level.await_count, 1)
+        self.assertEqual(mock_client.fetch_vendor_bills.await_count, 2)
+        self.assertEqual(t2["multi_tool_results"]["get_stock_level"], valid_stock_payload)
+        self.assertEqual(t2["multi_tool_results"]["get_vendor_bills"]["bills"], found_bills_payload["bills"])
+        self.assertEqual(t2["multi_tool_results"]["get_vendor_bills"]["total_count"], 1)
+
+    async def test_multi_tool_strict_document_guard_skips_retry_and_preserves_params(self):
+        from app.graph.nodes.extractor import extractor_node
+        from app.graph.nodes.tool_node import tool_node
+        from app.graph.nodes.verifier import verifier_node
+
+        # Case 1: Only empty tool has strict document identifier -> verifier must return VALID (no retry)
+        v_no_retry = verifier_node({
+            "is_multi_tool": True,
+            "retry_count": 0,
+            "active_tools": [
+                {"tool": "get_stock_level", "params": {"code": "INK-01"}, "status": "success", "result": {"products": [{"sku": "INK-01"}]}},
+                {"tool": "get_journal_entries", "params": {"entry_number": "JE/2026/999"}, "status": "success", "result": {"entries": [], "total_count": 0}},
+            ],
+            "multi_tool_results": {
+                "get_stock_level": {"products": [{"sku": "INK-01"}]},
+                "get_journal_entries": {"entries": [], "total_count": 0},
+            },
+            "multi_verification_status": {"get_stock_level": "VALID", "get_journal_entries": "EMPTY"},
+        })
+        self.assertEqual(v_no_retry["verification_status"], "VALID")
+
+        # Case 2: Non-strict tool triggers retry, strict-doc tool keeps params & result untouched
+        mock_client = MagicMock()
+        mock_client.fetch_journal_entries = AsyncMock()
+        mock_client.fetch_vendor_bills = AsyncMock(return_value={"bills": [{"id": 1}], "total_count": 1})
+
+        retry_state = {
+            "user_query": "Cek jurnal JE/2026/999 dan tagihan vendor",
+            "company_id": 1,
+            "is_multi_tool": True,
+            "retry_count": 1,
+            "retry_instruction": "Longgarkan filter tanggal",
+            "active_tools": [
+                {
+                    "tool": "get_journal_entries",
+                    "domain": "accounting",
+                    "sub_query": "Cek jurnal JE/2026/999",
+                    "params": {"entry_number": "JE/2026/999", "company_id": 1},
+                    "status": "success",
+                    "result": {"entries": [], "total_count": 0},
+                },
+                {
+                    "tool": "get_vendor_bills",
+                    "domain": "accounting",
+                    "sub_query": "Cek tagihan vendor",
+                    "params": {"date_from": "2026-11-01", "company_id": 1},
+                    "status": "success",
+                    "result": {"bills": [], "total_count": 0},
+                },
+            ],
+            "multi_verification_status": {"get_journal_entries": "EMPTY", "get_vendor_bills": "EMPTY"},
+        }
+        with patch("app.graph.nodes.extractor._extract_single_tool_params") as mock_extract:
+            mock_extract.return_value = {"company_id": 1}
+            ext_out = extractor_node(retry_state)
+            self.assertEqual(mock_extract.call_count, 1)
+            self.assertEqual(mock_extract.call_args.kwargs["plan"]["tool"], "get_vendor_bills")
+        self.assertEqual(ext_out["active_tools"][0]["params"]["entry_number"], "JE/2026/999")
+
+        tool_out = await tool_node({**retry_state, **ext_out}, client=mock_client)
+        self.assertEqual(mock_client.fetch_journal_entries.await_count, 0)
+        self.assertEqual(mock_client.fetch_vendor_bills.await_count, 1)
+        self.assertEqual(tool_out["multi_tool_results"]["get_vendor_bills"]["total_count"], 1)
+
+    async def test_multi_tool_branch_company_id_propagates_to_all_tools(self):
+        from app.graph.nodes.extractor import extractor_node
+
+        state = {
+            "user_query": "Cek stok tinta dan posisi saldo kas di Cabang Bandung",
+            "company_id": 1,
+            "is_multi_tool": True,
+            "retry_count": 0,
+            "active_tools": [
+                {"tool": "get_stock_level", "domain": "inventory", "sub_query": "Cek stok tinta", "params": {}, "status": "pending"},
+                {"tool": "get_account_balance", "domain": "accounting", "sub_query": "Cek saldo kas", "params": {}, "status": "pending"},
+            ],
+        }
+        with patch("app.graph.nodes.extractor._extract_single_tool_params", side_effect=[{"code": "INK-01"}, {"account_code": "1100"}]):
+            ext_out = extractor_node(state)
+
+        self.assertEqual(ext_out["company_id"], 6)
+        self.assertEqual(ext_out["active_tools"][0]["params"]["company_id"], 6)
+        self.assertEqual(ext_out["active_tools"][1]["params"]["company_id"], 6)
+
+
 if __name__ == "__main__":
     unittest.main()
