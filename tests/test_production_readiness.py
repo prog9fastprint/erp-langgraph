@@ -1033,5 +1033,121 @@ class TestLifespanCleanupAndSharedHttpPool(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(workflow_module._WORKFLOW_EXECUTOR)
 
 
+class TestTimezoneWibConsistency(unittest.TestCase):
+    """Timezone Drift UTC vs WIB (Asia/Jakarta) verification."""
+
+    def test_app_timezone_default_config(self):
+        self.assertEqual(settings.APP_TIMEZONE, "Asia/Jakarta")
+
+    def test_get_current_erp_datetime_and_date_across_utc_midnight_boundary(self):
+        from datetime import date, datetime, timezone
+        from zoneinfo import ZoneInfoNotFoundError
+        import app.core.context as context_module
+
+        utc_instant = datetime(2026, 11, 13, 17, 30, 0, tzinfo=timezone.utc)
+
+        class _FrozenDatetime:
+            @classmethod
+            def now(cls, tz=None):
+                return utc_instant.astimezone(tz) if tz is not None else utc_instant.replace(tzinfo=None)
+
+        with patch.object(context_module, "datetime", _FrozenDatetime):
+            # Also verify fixed-offset fallback when ZoneInfo lacks tzdata (e.g. Windows/minimal container)
+            with patch.object(context_module, "ZoneInfo", side_effect=ZoneInfoNotFoundError("no tzdata")):
+                erp_dt = context_module.get_current_erp_datetime()
+                erp_date = context_module.get_current_erp_date()
+
+        self.assertEqual(erp_dt.strftime("%Y-%m-%d-%H:%M"), "2026-11-14-00:30")
+        self.assertEqual(erp_date, date(2026, 11, 14))
+
+    def test_extractor_resolve_relative_dates_uses_wib_date_at_utc_boundary(self):
+        from datetime import datetime, timezone
+        import app.core.context as context_module
+        from app.graph.nodes.extractor import resolve_relative_dates
+
+        # 2026-10-31 18:00 UTC == 2026-11-01 01:00 WIB (month & day boundary)
+        utc_instant = datetime(2026, 10, 31, 18, 0, 0, tzinfo=timezone.utc)
+
+        class _FrozenDatetime:
+            @classmethod
+            def now(cls, tz=None):
+                return utc_instant.astimezone(tz) if tz is not None else utc_instant.replace(tzinfo=None)
+
+        with patch.object(context_module, "datetime", _FrozenDatetime):
+            today_range = resolve_relative_dates("transaksi hari ini")
+            month_range = resolve_relative_dates("laporan bulan ini")
+
+        self.assertEqual(today_range, ("2026-11-01", "2026-11-01"))
+        self.assertEqual(month_range, ("2026-11-01", "2026-11-30"))
+
+    def test_clients_generate_secret_key_uses_wib_timestamp(self):
+        import hashlib
+        from datetime import datetime, timezone
+        import app.core.context as context_module
+        from app.services.django_client import DjangoCoreClient
+        from app.services.erp_client import ERPClient
+
+        utc_instant = datetime(2026, 11, 13, 17, 30, 0, tzinfo=timezone.utc)
+
+        class _FrozenDatetime:
+            @classmethod
+            def now(cls, tz=None):
+                return utc_instant.astimezone(tz) if tz is not None else utc_instant.replace(tzinfo=None)
+
+        expected_hash = hashlib.md5(b"erp_master_nexus-2026-11-14-00:30").hexdigest()
+
+        with patch.object(context_module, "datetime", _FrozenDatetime):
+            django_secret = DjangoCoreClient()._generate_secret_key()
+            erp_secret = ERPClient()._generate_secret_key()
+
+        self.assertEqual(django_secret, expected_hash)
+        self.assertEqual(erp_secret, expected_hash)
+
+
+class TestNonBlockingVectorEmbedding(unittest.TestCase):
+    """Non-blocking Gemini embedding execution via asyncio.to_thread."""
+
+    def test_get_embedding_runs_sync_sdk_in_worker_thread_without_blocking_event_loop(self):
+        import threading
+        import time
+        from types import SimpleNamespace
+        from app.services.vector_service import VectorService
+
+        loop_thread_id = None
+        embed_thread_id = None
+        concurrent_ticks = 0
+
+        def _blocking_embed_content(**kwargs):
+            nonlocal embed_thread_id
+            embed_thread_id = threading.get_ident()
+            time.sleep(0.08)
+            return SimpleNamespace(embeddings=[SimpleNamespace(values=[0.1, 0.2, 0.3])])
+
+        fake_client = SimpleNamespace(
+            models=SimpleNamespace(embed_content=_blocking_embed_content)
+        )
+        svc = VectorService(gemini_api_key="test-key", embedding_model="gemini-embedding-001")
+        svc._genai_client = fake_client
+
+        async def _run():
+            nonlocal loop_thread_id, concurrent_ticks
+            loop_thread_id = threading.get_ident()
+
+            async def _ticker():
+                nonlocal concurrent_ticks
+                for _ in range(3):
+                    await asyncio.sleep(0.01)
+                    concurrent_ticks += 1
+
+            vec, _ = await asyncio.gather(svc.get_embedding("cek stok kertas"), _ticker())
+            return vec
+
+        result = asyncio.run(_run())
+        self.assertEqual(result, [0.1, 0.2, 0.3])
+        self.assertIsNotNone(embed_thread_id)
+        self.assertNotEqual(embed_thread_id, loop_thread_id)
+        self.assertEqual(concurrent_ticks, 3)
+
+
 if __name__ == "__main__":
     unittest.main()

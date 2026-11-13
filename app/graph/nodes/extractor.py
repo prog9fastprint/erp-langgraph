@@ -20,6 +20,7 @@ from app.core.context import (
     trim_conversation_messages,
     build_contextual_prompt,
     clean_product_identifier,
+    get_current_erp_date,
 )
 from app.graph.state import AgentState, ToolCallPlan
 from app.schemas.tools import (
@@ -160,7 +161,7 @@ def resolve_relative_dates(
     - 'N hari terakhir': N days window ending today
     - Explicit dates: YYYY-MM-DD format
     """
-    today = ref_date or date.today()
+    today = ref_date or get_current_erp_date()
     cleaned = text.lower()
 
     # 1. Check for explicit dates (YYYY-MM-DD, YYYY/MM/DD, DD/MM/YYYY, DD-MM-YYYY)
@@ -1183,7 +1184,7 @@ def extractor_node(
     Args:
         state: Current AgentState.
         llm: Optional BaseChatModel instance with structured output capabilities.
-        ref_date: Reference anchor date for relative date resolution (defaults to date.today()).
+        ref_date: Reference anchor date for relative date resolution (defaults to get_current_erp_date()).
 
     Returns:
         Partial AgentState update dictionary with:
@@ -1207,7 +1208,7 @@ def extractor_node(
     detected_domain = state.get("detected_domain")
     retry_count = int(state.get("retry_count") or 0)
     retry_instruction = state.get("retry_instruction")
-    today = ref_date or date.today()
+    today = ref_date or get_current_erp_date()
 
     # Guard: If neither active_tools nor detected_tool was provided, return empty extracted params
     if not raw_active_tools and not detected_tool:

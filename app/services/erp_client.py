@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional
 import httpx
 
 from app.core.config import settings
+from app.core.context import get_current_erp_datetime
 
 logger = logging.getLogger("erp_client")
 
@@ -49,7 +50,7 @@ class ERPClient:
 
     def _generate_secret_key(self) -> str:
         """Generate time-based MD5 secret key for /external_api/get_token/."""
-        now = datetime.now().strftime("%Y-%m-%d-%H:%M")
+        now = get_current_erp_datetime().strftime("%Y-%m-%d-%H:%M")
         raw_string = f"erp_master_nexus-{now}"
         return hashlib.md5(raw_string.encode()).hexdigest()
 

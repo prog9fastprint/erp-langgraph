@@ -24,8 +24,8 @@ Dokumen ini berisi hasil audit teknis menyeluruh dan spesifikasi implementasi de
 3. **[DONE - D5]** **Salah Hitung Total Hutang Vendor (`get_vendor_bills` > 50 baris)** ([context.py](file:///C:/laragon/www/erp-langgraph/app/core/context.py#L75-L212), [synthesizer.py](file:///C:/laragon/www/erp-langgraph/app/graph/nodes/synthesizer.py#L55-L345)): `sanitize_erp_payload` kini menghitung `calculations` penuh dan menyimpan `total_count`/`total_found` sebelum memotong list ke `max_records=50`, dan `synthesizer_node` memakai agregat tersebut beserta catatan kaki paginasi.
 4. **[PENDING]** **Re-eksekusi Tool Valid & Absennya Identifier Guard di Multi-Tool Retry** ([verifier.py](file:///d:/erp-fastprint/erp-langgraph/app/graph/nodes/verifier.py#L236-L255), [extractor.py](file:///d:/erp-fastprint/erp-langgraph/app/graph/nodes/extractor.py#L1235-L1237)): Saat 1 dari 2 tool kosong, tool yang sudah `VALID` ikut dipanggil ulang ke Django, nomor dokumen spesifik tidak di-guard di multi-tool, dan `branch_co_id` hanya masuk ke `active_tools[0]`.
 5. **[DONE - D6]** **Regex Lokasi Satu Kata & Gagal Resolve Stok Cabang** ([extractor.py](file:///C:/laragon/www/erp-langgraph/app/graph/nodes/extractor.py#L341-L407), [tool_node.py](file:///C:/laragon/www/erp-langgraph/app/graph/nodes/tool_node.py#L100-L147)): `_fallback_extract_stock_level` kini mendukung frasa multi-kata dengan pemangkasan awalan cabang/toko/kantor, `_is_pure_branch_token` mencegah token cabang bocor ke `code`/`search`, serta `tool_node` otomatis resolve `warehouse_id` via `fetch_warehouses` untuk cabang eksplisit atau langsung fail-fast `MISSING_PRODUCT_IDENTIFIER` bila query kosong tanpa identifier.
-6. **[PENDING]** **Timezone Drift UTC vs WIB (`Asia/Jakarta`)** ([extractor.py](file:///d:/erp-fastprint/erp-langgraph/app/graph/nodes/extractor.py#L163), [django_client.py](file:///d:/erp-fastprint/erp-langgraph/app/services/django_client.py#L140)): `date.today()` dan `datetime.now()` mengikuti jam OS container (UTC), menyebabkan melesetnya tanggal `"hari ini"` / `"bulan ini"` pada pukul 00:00–07:00 WIB dan gagalnya MD5 key login ke ERP.
-7. **[PARTIAL: Shared httpx Pool & Token Cache DONE, Non-Blocking Embedding PENDING]** **Blocking Event Loop & Per-Request HTTP Client/Login** ([vector_service.py](file:///C:/laragon/www/erp-langgraph/app/services/vector_service.py#L140), [django_client.py](file:///C:/laragon/www/erp-langgraph/app/services/django_client.py#L102-L355)): `DjangoCoreClient` kini berbagi `httpx.AsyncClient` pool per event loop dan cache token sistem `_CACHED_SYSTEM_TOKEN`; `embed_content()` masih berjalan sinkron di dalam `async def`.
+6. **[DONE - Timezone]** **Timezone Drift UTC vs WIB (`Asia/Jakarta`)** ([config.py](file:///C:/laragon/www/erp-langgraph/app/core/config.py#L22), [context.py](file:///C:/laragon/www/erp-langgraph/app/core/context.py#L14-L39), [extractor.py](file:///C:/laragon/www/erp-langgraph/app/graph/nodes/extractor.py#L164), [django_client.py](file:///C:/laragon/www/erp-langgraph/app/services/django_client.py#L248-L252), [erp_client.py](file:///C:/laragon/www/erp-langgraph/app/services/erp_client.py#L51-L55)): `APP_TIMEZONE` (`Asia/Jakarta`), `get_erp_tzinfo()` (dengan fallback offset tetap saat `tzdata` tidak tersedia), `get_current_erp_datetime()`, dan `get_current_erp_date()` kini digunakan pada `resolve_relative_dates`, `extractor_node`, serta `_generate_secret_key()` di kedua ERP client.
+7. **[DONE - Shared httpx Pool, Token Cache, & Non-Blocking Embedding]** **Blocking Event Loop & Per-Request HTTP Client/Login** ([vector_service.py](file:///C:/laragon/www/erp-langgraph/app/services/vector_service.py#L140-L145), [django_client.py](file:///C:/laragon/www/erp-langgraph/app/services/django_client.py#L102-L355)): `DjangoCoreClient` berbagi `httpx.AsyncClient` pool per event loop dan cache token sistem `_CACHED_SYSTEM_TOKEN`, serta `VectorService.get_embedding()` menjalankan `client.models.embed_content` di worker thread via `await asyncio.to_thread(...)`.
 8. **[DONE - D1 & Lifespan Cleanup]** **Unbounded RAM Checkpointer & Lifespan Leak** ([workflow.py](file:///C:/laragon/www/erp-langgraph/app/graph/workflow.py#L285-L329), [main.py](file:///C:/laragon/www/erp-langgraph/app/main.py#L29-L77)): `MemorySaver` dibatasi LRU max `500` threads (plus cleanup ephemeral thread `thread_id=None`), dan shutdown FastAPI (`lifespan`) membatalkan `_BACKGROUND_TASKS` lalu menutup pool `asyncpg` (`vector_service.close_pool()`), shared `httpx.AsyncClient` (`aclose_shared_django_client()`), serta workflow executor (`shutdown_workflow_executor()`).
 
 ---
@@ -72,56 +72,11 @@ flowchart TD
 #### [MODIFY] [config.py](file:///C:/laragon/www/erp-langgraph/app/core/config.py)
 - **[DONE - D1]** `MAX_CHECKPOINT_THREADS: int = Field(default=500, validation_alias="MAX_CHECKPOINT_THREADS")` sudah ditambahkan di [config.py](file:///C:/laragon/www/erp-langgraph/app/core/config.py#L24).
 - **[DONE - D2]** `REQUIRE_USER_TOKEN` dan `REQUIRE_SERVICE_KEY` sudah ditambahkan di [config.py](file:///C:/laragon/www/erp-langgraph/app/core/config.py#L22-L23).
-- **[PENDING - Timezone]** Tambahkan pengaturan zona waktu operasional `APP_TIMEZONE`:
-```python
-<<<<<<< SEARCH
-    # 0. Service Configuration
-    APP_NAME: str = "erp-ai-orchestrator"
-    APP_ENV: str = "development"
-    APP_HOST: str = "0.0.0.0"
-    APP_PORT: int = 8002
-    LOG_LEVEL: str = "info"
-=======
-    # 0. Service Configuration
-    APP_NAME: str = "erp-ai-orchestrator"
-    APP_ENV: str = "development"
-    APP_HOST: str = "0.0.0.0"
-    APP_PORT: int = 8002
-    LOG_LEVEL: str = "info"
-    APP_TIMEZONE: str = Field(default="Asia/Jakarta", validation_alias="APP_TIMEZONE")
-    REQUIRE_USER_TOKEN: bool = Field(default=False, validation_alias="REQUIRE_USER_TOKEN")
-    REQUIRE_SERVICE_KEY: bool = Field(default=False, validation_alias="REQUIRE_SERVICE_KEY")
-    MAX_CHECKPOINT_THREADS: int = Field(default=500, validation_alias="MAX_CHECKPOINT_THREADS")
->>>>>>> REPLACE
-```
+- **[DONE - Timezone]** `APP_TIMEZONE: str = Field(default="Asia/Jakarta", validation_alias="APP_TIMEZONE")` sudah ditambahkan di [config.py](file:///C:/laragon/www/erp-langgraph/app/core/config.py#L22).
 
-#### [MODIFY] [context.py](file:///d:/erp-fastprint/erp-langgraph/app/core/context.py)
-Tambahkan helper `get_current_erp_date()` berbasis `ZoneInfo(settings.APP_TIMEZONE)` dan pre-kalkulasi agregat pada `sanitize_erp_payload()` sebelum memotong list menjadi `max_records=50`:
-```python
-<<<<<<< SEARCH
-from datetime import date
-import re
-from typing import Any, Dict, List, Optional, Set
-from langchain_core.messages import BaseMessage, SystemMessage, HumanMessage, AIMessage
-=======
-from datetime import date, datetime
-import re
-from typing import Any, Dict, List, Optional, Set
-from zoneinfo import ZoneInfo
-from langchain_core.messages import BaseMessage, SystemMessage, HumanMessage, AIMessage
-
-from app.core.config import settings
-
-
-def get_current_erp_date() -> date:
-    """Return current date in configured ERP timezone (default Asia/Jakarta WIB)."""
-    try:
-        return datetime.now(ZoneInfo(settings.APP_TIMEZONE)).date()
-    except Exception:
-        return date.today()
->>>>>>> REPLACE
-```
-Di dalam `sanitize_erp_payload(data: Any, max_records: int = 50)` (**[DONE - D5]** di [context.py](file:///C:/laragon/www/erp-langgraph/app/core/context.py#L100-L212)):
+#### [MODIFY] [context.py](file:///C:/laragon/www/erp-langgraph/app/core/context.py)
+- **[DONE - Timezone]** Helper `get_erp_tzinfo()`, `get_current_erp_datetime()`, dan `get_current_erp_date()` berbasis `ZoneInfo(settings.APP_TIMEZONE)` dengan fallback offset tetap (`_FIXED_TIMEZONE_FALLBACKS`, default `Asia/Jakarta` UTC+7) sudah ditambahkan di [context.py](file:///C:/laragon/www/erp-langgraph/app/core/context.py#L14-L39).
+- **[DONE - D5]** Pre-kalkulasi agregat pada `sanitize_erp_payload(data: Any, max_records: int = 50)` ([context.py](file:///C:/laragon/www/erp-langgraph/app/core/context.py#L130-L242)):
 - Jika `data` adalah `dict` yang memiliki list `"bills"` non-kosong dan belum memiliki `"calculations"`, `_compute_bills_calculations` menghitung `total_amount`, `total_paid`, `total_residual`, dan `overdue_count` dari **seluruh** item di `data["bills"]` sebelum `bills` dipotong ke `max_records`, lalu menyimpannya ke `sanitized_dict["calculations"]`.
 - Jika panjang list pada key koleksi (`"bills"`, `"entries"`, `"accounts"`, `"products"`, `"locations"`, `"history"`, `"transfers"`, `"alerts"`, `"adjustments"`, `"scraps"`) melebihi `max_records`, jumlah asli disimpan di `sanitized_dict["total_count"]` (atau `total_found` untuk `locations`/`alerts`) bila belum ada sehingga `synthesizer_node` mengetahui jumlah total baris sebelum pemotongan.
 
@@ -129,8 +84,8 @@ Di dalam `sanitize_erp_payload(data: Any, max_records: int = 50)` (**[DONE - D5]
 
 ### Phase 2: Perbaikan Hidden Bugs pada Pipeline Nodes (`extractor`, `tool_node`, `verifier`, `synthesizer`)
 
-#### [MODIFY] [extractor.py](file:///d:/erp-fastprint/erp-langgraph/app/graph/nodes/extractor.py)
-1. **Gunakan `get_current_erp_date()`**: Ganti `today = ref_date or date.today()` di `resolve_relative_dates` dan `extractor_node` dengan `today = ref_date or get_current_erp_date()`.
+#### [MODIFY] [extractor.py](file:///C:/laragon/www/erp-langgraph/app/graph/nodes/extractor.py)
+1. **[DONE - Timezone] Gunakan `get_current_erp_date()`**: `today = ref_date or date.today()` di `resolve_relative_dates` ([extractor.py](file:///C:/laragon/www/erp-langgraph/app/graph/nodes/extractor.py#L164)) dan `extractor_node` ([extractor.py](file:///C:/laragon/www/erp-langgraph/app/graph/nodes/extractor.py#L1211)) sudah diganti menjadi `today = ref_date or get_current_erp_date()`.
 2. **[DONE - D6] Perbaikan Regex `location_name` untuk `"Gudang Cabang <Kota>"`**:
    Pada `_fallback_extract_stock_level`:
    ```python
@@ -239,27 +194,11 @@ Tambahkan **Strict Identifier Guard** pada Path A (Multi-Tool) agar tool yang me
    - Token hasil `login()` sistem disimpan di cache modul (`_CACHED_SYSTEM_TOKEN`) dengan proteksi `_get_token_lock()` (`asyncio.Lock`) dan invalidasi otomatis saat HTTP `401`.
 2. **[DONE - D2]** **Strict User Token Guard (`require_user_token`)**:
    - Parameter `require_user_token: bool = False` sudah ditambahkan pada `DjangoCoreClient` ([django_client.py](file:///C:/laragon/www/erp-langgraph/app/services/django_client.py#L116)), memblokir fallback ke `self.token` atau `self.login()` dengan `DjangoAuthError(..., status_code=401)` saat `user_token` kosong, serta diteruskan dari [tool_node.py](file:///C:/laragon/www/erp-langgraph/app/graph/nodes/tool_node.py#L144) dan [rag_node.py](file:///C:/laragon/www/erp-langgraph/app/graph/nodes/rag_node.py#L63).
-3. **[PENDING]** **Timezone-Aware MD5 Secret Key**:
-   - Di `_generate_secret_key()` pada `DjangoCoreClient` dan `ERPClient`, gunakan `datetime.now(ZoneInfo(settings.APP_TIMEZONE)).strftime("%Y-%m-%d-%H:%M")`.
+3. **[DONE - Timezone]** **Timezone-Aware MD5 Secret Key**:
+   - Di `_generate_secret_key()` pada `DjangoCoreClient` ([django_client.py](file:///C:/laragon/www/erp-langgraph/app/services/django_client.py#L248-L252)) dan `ERPClient` ([erp_client.py](file:///C:/laragon/www/erp-langgraph/app/services/erp_client.py#L51-L55)), kini menggunakan `get_current_erp_datetime().strftime("%Y-%m-%d-%H:%M")`.
 
-#### [MODIFY] [vector_service.py](file:///d:/erp-fastprint/erp-langgraph/app/services/vector_service.py)
-Jalankan pemanggilan sinkron Google GenAI SDK `client.models.embed_content` di dalam thread worker menggunakan `await asyncio.to_thread(...)` agar tidak memblokir event loop FastAPI:
-```python
-<<<<<<< SEARCH
-            response = client.models.embed_content(
-                model=self.embedding_model,
-                contents=text.strip(),
-                config=config,
-            )
-=======
-            response = await asyncio.to_thread(
-                client.models.embed_content,
-                model=self.embedding_model,
-                contents=text.strip(),
-                config=config,
-            )
->>>>>>> REPLACE
-```
+#### [MODIFY] [vector_service.py](file:///C:/laragon/www/erp-langgraph/app/services/vector_service.py)
+- **[DONE - Non-Blocking Embedding]** Pemanggilan sinkron Google GenAI SDK `client.models.embed_content` di `VectorService.get_embedding()` ([vector_service.py](file:///C:/laragon/www/erp-langgraph/app/services/vector_service.py#L140-L145)) kini dijalankan di thread worker menggunakan `await asyncio.to_thread(...)` agar tidak memblokir event loop FastAPI.
 
 ---
 
@@ -354,6 +293,8 @@ Jalankan pemanggilan sinkron Google GenAI SDK `client.models.embed_content` di d
    - [x] **[DONE saat D5]** `.\.venv\Scripts\python.exe -m unittest discover tests` $\rightarrow$ **509 tests passed** (`OK` in `18.137s`).
    - [x] **[DONE saat D6]** `.\.venv\Scripts\python.exe -m unittest discover tests` $\rightarrow$ **511 tests passed** (`OK`).
    - [x] **[DONE - Lifespan Cleanup & Shared HTTP Pool]** `.\.venv\Scripts\python.exe -m unittest discover tests` $\rightarrow$ **514 tests passed** (`OK`).
+   - [x] **[DONE - Timezone Drift UTC vs WIB]** `.\.venv\Scripts\python.exe -m unittest discover tests` $\rightarrow$ **518 tests passed** (`OK` in `26.182s`).
+   - [x] **[DONE - Non-Blocking Vector Embedding]** `.\.venv\Scripts\python.exe -m unittest discover tests` $\rightarrow$ **519 tests passed** (`OK` in `21.381s`).
    ```powershell
    .\.venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py" -v
    ```
@@ -376,3 +317,5 @@ Jalankan pemanggilan sinkron Google GenAI SDK `client.models.embed_content` di d
    - [x] `test_chat_stream_sse_endpoint`: Menguji `POST /api/v1/chat/stream` memancarkan event `step` dan `complete` dengan `resolved_company_id` & `execution_time_ms` serta header SSE. *(D4)*
    - [x] `test_chat_stream_enforces_production_auth_401_and_bearer_header` & `test_chat_stream_emits_error_event_on_stream_exception`: Menguji penolakan 401 di mode production, autentikasi `Authorization: Bearer`, dan `event: error` saat exception mid-stream. *(D4)*
    - [x] `test_shared_httpx_pool_system_token_cache_and_shutdown`, `test_fastapi_lifespan_tracks_background_tasks_and_closes_all_resources`, & `test_fastapi_lifespan_closes_real_asyncpg_pool_and_workflow_executor`: Memastikan shared `httpx.AsyncClient` per-loop, koalesensi login `_CACHED_SYSTEM_TOKEN`, pelacakan `_BACKGROUND_TASKS`, dan penutupan `vector_service.close_pool()`, `aclose_shared_django_client()`, serta `shutdown_workflow_executor()` pada shutdown FastAPI. *(Lifespan Cleanup)*
+   - [x] `test_app_timezone_default_config`, `test_get_current_erp_datetime_and_date_across_utc_midnight_boundary`, `test_extractor_resolve_relative_dates_uses_wib_date_at_utc_boundary`, & `test_clients_generate_secret_key_uses_wib_timestamp`: Memastikan `APP_TIMEZONE` default ke `Asia/Jakarta`, fallback offset tetap saat `tzdata` absen, resolusi `"hari ini"` / `"bulan ini"` mengikuti tanggal WIB di batas pergantian hari UTC, dan `_generate_secret_key()` pada `DjangoCoreClient` maupun `ERPClient` memakai timestamp WIB. *(Timezone Drift)*
+   - [x] `test_get_embedding_runs_sync_sdk_in_worker_thread_without_blocking_event_loop`: Memastikan `VectorService.get_embedding()` menjalankan `client.models.embed_content` di worker thread via `asyncio.to_thread(...)` tanpa memblokir event loop FastAPI. *(Non-Blocking Embedding)*

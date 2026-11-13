@@ -3,10 +3,40 @@ Context Window & Payload Sanitization Management for FastPrint ERP (TASK-Context
 Provides centralized sliding window message trimming, Django ERP payload pruning,
 and contextual summary prompt injection.
 """
-from datetime import date
+from datetime import date, datetime, timedelta, timezone, tzinfo
 import re
 from typing import Any, Dict, List, Optional, Set
+from zoneinfo import ZoneInfo
 from langchain_core.messages import BaseMessage, SystemMessage, HumanMessage, AIMessage
+
+from app.core.config import settings
+
+_FIXED_TIMEZONE_FALLBACKS: Dict[str, tzinfo] = {
+    "Asia/Jakarta": timezone(timedelta(hours=7)),
+    "Asia/Pontianak": timezone(timedelta(hours=7)),
+    "Asia/Makassar": timezone(timedelta(hours=8)),
+    "Asia/Jayapura": timezone(timedelta(hours=9)),
+    "UTC": timezone.utc,
+}
+
+
+def get_erp_tzinfo() -> tzinfo:
+    """Resolve the configured ERP operational timezone with fixed-offset fallback."""
+    tz_name = getattr(settings, "APP_TIMEZONE", "Asia/Jakarta") or "Asia/Jakarta"
+    try:
+        return ZoneInfo(tz_name)
+    except Exception:
+        return _FIXED_TIMEZONE_FALLBACKS.get(tz_name, timezone(timedelta(hours=7)))
+
+
+def get_current_erp_datetime() -> datetime:
+    """Return current timezone-aware datetime in the configured ERP operational timezone."""
+    return datetime.now(get_erp_tzinfo())
+
+
+def get_current_erp_date() -> date:
+    """Return current calendar date in the configured ERP operational timezone."""
+    return get_current_erp_datetime().date()
 
 # Internal Django ORM and technical audit fields to strip from ERP payloads
 DJANGO_TECHNICAL_FIELDS: Set[str] = {

@@ -137,7 +137,8 @@ class VectorService:
         try:
             from google.genai import types
             config = types.EmbedContentConfig(output_dimensionality=768)
-            response = client.models.embed_content(
+            response = await asyncio.to_thread(
+                client.models.embed_content,
                 model=self.embedding_model,
                 contents=text.strip(),
                 config=config,
