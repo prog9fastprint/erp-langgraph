@@ -283,3 +283,30 @@ def get_chat_model(
         raise ValueError(
             f"Unsupported MODEL_PROVIDER '{selected_provider}'. Supported values: 'openrouter', 'openai'."
         )
+
+
+def get_default_model_name() -> str:
+    """Return the active configured default model identifier based on settings."""
+    provider = (settings.MODEL_PROVIDER or "openrouter").lower().strip()
+    if provider == "openrouter":
+        return settings.OPENROUTER_MODEL or "openrouter/free"
+    return settings.OPENAI_MODEL or "gpt-4o-mini"
+
+
+def clean_model_display_name(raw_name: Optional[str]) -> str:
+    """
+    Format a model string into a concise human-readable display identifier.
+    Examples:
+        'nvidia/nemotron-3.5-super-vl:free' -> 'nemotron-3.5-super-vl'
+        'openai/gpt-4o-mini' -> 'gpt-4o-mini'
+        'gpt-4o-mini' -> 'gpt-4o-mini'
+    """
+    if not raw_name:
+        return "Unknown"
+    cleaned = str(raw_name).strip()
+    if cleaned.endswith(":free"):
+        cleaned = cleaned[:-5]
+    if "/" in cleaned:
+        cleaned = cleaned.split("/")[-1]
+    return cleaned or "Unknown"
+

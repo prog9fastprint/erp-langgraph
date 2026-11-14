@@ -1163,6 +1163,7 @@ def synthesizer_node(
         else ""
     )
     deterministic_answer = format_deterministic_answer(state)
+    actual_model = state.get("active_model")
 
     # For hybrid inquiries, combine live ERP results with semantic RAG findings
     if query_mode == "hybrid":
@@ -1214,6 +1215,10 @@ def synthesizer_node(
                 SystemMessage(content="Anda adalah Asisten AI FastPrint ERP."),
                 HumanMessage(content=prompt),
             ])
+            resp_meta = getattr(response, "response_metadata", {}) or {}
+            resolved_model = resp_meta.get("model_name") or resp_meta.get("model")
+            if resolved_model:
+                actual_model = str(resolved_model)
             content = getattr(response, "content", None)
             if content and isinstance(content, str) and content.strip():
                 clean_ans, llm_followups = _extract_llm_followups(content.strip())
@@ -1232,8 +1237,11 @@ def synthesizer_node(
     if retry_header and not final_text.startswith("> 🔄"):
         final_text = f"{retry_header}{final_text}"
 
-    return {
+    out_dict: Dict[str, Any] = {
         "final_answer": final_text,
         "suggested_followups": followups,
         "messages": [AIMessage(content=final_text)],
     }
+    if actual_model:
+        out_dict["active_model"] = actual_model
+    return out_dict

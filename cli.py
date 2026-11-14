@@ -12,6 +12,7 @@ from typing import Any, Dict, Optional
 
 from app.core.config import settings
 from app.graph.workflow import run_workflow_sync
+from app.services.llm import clean_model_display_name, get_default_model_name
 
 
 class LiveStepSpinner:
@@ -31,7 +32,11 @@ class LiveStepSpinner:
         "synthesizer": ("Synthesizer", "Menyusun jawaban terstruktur"),
     }
 
-    def __init__(self, initial_msg: str = "Memulai pipeline StateGraph..."):
+    def __init__(
+        self,
+        initial_msg: str = "Memulai pipeline StateGraph...",
+        model_name: Optional[str] = None,
+    ):
         self.msg = initial_msg
         self.running = False
         self.is_tty = hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
@@ -39,6 +44,14 @@ class LiveStepSpinner:
         self.node_start_time = time.time()
         self.lock = threading.Lock()
         self.thread: Optional[threading.Thread] = None
+        self.model_name = model_name or get_default_model_name()
+        self.clean_model = clean_model_display_name(self.model_name)
+
+    def set_model(self, model_name: Optional[str]) -> None:
+        if model_name:
+            with self.lock:
+                self.model_name = model_name
+                self.clean_model = clean_model_display_name(model_name)
 
     def start(self) -> "LiveStepSpinner":
         self.start_time = time.time()
@@ -56,13 +69,17 @@ class LiveStepSpinner:
             with self.lock:
                 elapsed = time.time() - self.node_start_time
                 frame = self.FRAMES[idx % len(self.FRAMES)]
-                text = f"\r\033[K\033[36m{frame}\033[0m {self.msg} \033[90m({elapsed:.1f}s)\033[0m"
+                model_tag = f"\033[35m[{self.clean_model}]\033[0m " if self.clean_model else ""
+                text = f"\r\033[K\033[36m{frame}\033[0m {model_tag}{self.msg} \033[90m({elapsed:.1f}s)\033[0m"
                 sys.stdout.write(text)
                 sys.stdout.flush()
             time.sleep(0.08)
             idx += 1
 
     def step_completed(self, node_name: str, update: Dict[str, Any], acc_state: Dict[str, Any]):
+        new_model = update.get("active_model") or acc_state.get("active_model")
+        if new_model:
+            self.set_model(new_model)
         elapsed = time.time() - self.node_start_time
         meta = self.NODE_METADATA.get(node_name, (node_name.capitalize(), node_name))
         node_title = meta[0]
@@ -198,7 +215,7 @@ def main():
 
             print("\nMemproses alur StateGraph...", flush=True)
 
-            spinner = LiveStepSpinner("Menginisialisasi pipeline StateGraph...").start()
+            spinner = LiveStepSpinner("Menginisialisasi pipeline StateGraph...", model_name=model_name).start()
 
             def on_finish(node_name: str, update: Dict[str, Any], acc_state: Dict[str, Any]):
                 spinner.step_completed(node_name, update, acc_state)
@@ -220,6 +237,8 @@ def main():
             if resolved_co and resolved_co != current_company_id:
                 current_company_id = resolved_co
 
+            active_model = final_state.get("active_model") or model_name
+            clean_model = clean_model_display_name(active_model)
             domain = final_state.get("detected_domain")
             tool = final_state.get("detected_tool")
             status = final_state.get("verification_status")
@@ -233,6 +252,7 @@ def main():
 
             if verbose:
                 print("\n--- [Rincian Eksekusi Pipeline StateGraph] ---")
+                print(f"• Model AI      : {active_model} ({clean_model})")
                 print(f"• Domain        : {domain}")
                 print(f"• Target Tool   : {tool or '(None / Guardrail)'}")
                 print(f"• Filter Params : {params}")
@@ -249,7 +269,7 @@ def main():
                     print(f"• Jumlah Data   : {records}")
                 print("----------------------------------------------\n")
             else:
-                badge = f"[Route: {domain} -> {tool or 'guardrail'} | Status: {status or 'DONE'}]"
+                badge = f"[Model: {clean_model}] [Route: {domain} -> {tool or 'guardrail'} | Status: {status or 'DONE'}]"
                 print(f"  {badge}")
 
             print(f"\nAssistant:\n{answer}\n")

@@ -22,7 +22,7 @@ from app.graph.workflow import (
 )
 from app.schemas.chat import ChatRequest, ChatResponse
 from app.services.django_client import aclose_shared_django_client
-from app.services.llm import afetch_free_models_catalog
+from app.services.llm import afetch_free_models_catalog, get_default_model_name
 from app.services.vector_service import vector_service
 
 logger = logging.getLogger("api_main")
@@ -221,6 +221,7 @@ def _build_chat_response(final_state: Dict[str, Any], started_at: float) -> Chat
     raw_company_id = final_state.get("company_id")
     resolved_company_id = int(raw_company_id) if raw_company_id is not None else None
     execution_time_ms = round((time.perf_counter() - started_at) * 1000.0, 2)
+    model_used = final_state.get("active_model") or get_default_model_name()
 
     return ChatResponse(
         final_answer=final_state.get("final_answer"),
@@ -230,6 +231,7 @@ def _build_chat_response(final_state: Dict[str, Any], started_at: float) -> Chat
         suggested_followups=final_state.get("suggested_followups") or [],
         resolved_company_id=resolved_company_id,
         execution_time_ms=execution_time_ms,
+        model_used=model_used,
     )
 
 
@@ -298,13 +300,16 @@ async def chat_stream_endpoint(
 
     async def _event_generator():
         accumulated_state: Dict[str, Any] = {}
+        active_model = get_default_model_name()
         try:
             async for node_name, _update, acc_state in astream_workflow_steps(**workflow_kwargs):
                 accumulated_state = acc_state
+                curr_model = accumulated_state.get("active_model") or active_model
                 step_payload = {
                     "node": node_name,
                     "status": "completed",
                     "elapsed_ms": round((time.perf_counter() - started_at) * 1000.0, 2),
+                    "model": curr_model,
                 }
                 yield f"event: step\ndata: {json.dumps(step_payload, ensure_ascii=False)}\n\n"
 

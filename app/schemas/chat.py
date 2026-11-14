@@ -74,3 +74,7 @@ class ChatResponse(BaseModel):
         default=None,
         description="End-to-end workflow execution latency in milliseconds"
     )
+    model_used: Optional[str] = Field(
+        default=None,
+        description="Identifier of the LLM model used for workflow execution and synthesis"
+    )

@@ -7,6 +7,7 @@ from langchain_core.messages import BaseMessage, HumanMessage
 from langgraph.graph.message import add_messages
 
 from app.core.config import settings
+from app.services.llm import get_default_model_name
 
 # Structured verification status literal
 VerificationStatus = Literal["VALID", "EMPTY", "RETRY", "ERROR"]
@@ -70,6 +71,7 @@ class AgentState(TypedDict, total=False):
     final_answer: Optional[str]
     error_message: Optional[str]
     suggested_followups: Optional[List[Dict[str, str]]]
+    active_model: Optional[str]
 
     # 7. Context Management & Long-Term Memory
     conversation_summary: Optional[str]
@@ -87,6 +89,7 @@ def create_initial_state(
     company_id: Optional[int] = None,
     messages: Optional[List[BaseMessage]] = None,
     is_multi_tool: Optional[bool] = False,
+    active_model: Optional[str] = None,
 ) -> AgentState:
     """
     Construct a clean initial AgentState dictionary with standard defaults.
@@ -126,6 +129,7 @@ def create_initial_state(
         "rag_sources": None,
         # Multi-tool orchestration state extensions
         "is_multi_tool": is_multi_tool if is_multi_tool is not None else False,
+        "active_model": active_model or get_default_model_name(),
         "detected_domains": [],
         "detected_tools": [],
         "active_tools": [],
