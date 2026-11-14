@@ -24,6 +24,7 @@ class ChatRequest(BaseModel):
 
     query: str = Field(..., min_length=1, description="Natural language query from user")
     company_id: Optional[int] = Field(default=1, description="Target ERP company ID (defaults to 1)")
+    company_ids: Optional[List[int]] = Field(default=None, description="Optional list of target company IDs for multi-company inquiries")
     user_token: Optional[str] = Field(default=None, description="Optional JWT authentication token")
     thread_id: Optional[str] = Field(default=None, description="Session thread ID for conversational memory")
     history: Optional[List[ChatMessageHistoryItem]] = Field(
@@ -69,6 +70,10 @@ class ChatResponse(BaseModel):
     resolved_company_id: Optional[int] = Field(
         default=None,
         description="Effective ERP company ID used for query execution (reflects branch switches)"
+    )
+    resolved_company_ids: Optional[List[int]] = Field(
+        default=None,
+        description="Effective ERP company IDs used for multi-company execution"
     )
     execution_time_ms: Optional[float] = Field(
         default=None,

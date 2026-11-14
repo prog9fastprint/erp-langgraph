@@ -56,6 +56,8 @@ class Settings(BaseSettings):
     # 3. LangGraph & Tools Settings
     USE_DYNAMIC_TOOLS: bool = False
     ENABLE_HITL_INTERRUPT: bool = False
+    ERP_MULTI_COMPANY_CONCURRENCY: int = 5
+    ERP_MULTI_COMPANY_MAX_BRANCHES: int = 20
 
     # 4. Context Window & Memory Management
     MAX_WINDOW_MESSAGES: int = Field(default=10, validation_alias="MAX_WINDOW_MESSAGES")

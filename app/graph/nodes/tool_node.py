@@ -225,6 +225,91 @@ async def tool_node(
 
         active_tools = state.get("active_tools")
         is_multi_tool = state.get("is_multi_tool") or (bool(active_tools) and len(active_tools) > 1)
+        target_company_ids = [int(c) for c in (state.get("company_ids") or [])]
+        is_multi_company = bool(state.get("is_multi_company") or len(target_company_ids) > 1)
+
+        # ------------------------------------------------------------------
+        # Path MC: Multi-Company Parallel Fan-Out (Bounded Concurrency)
+        # ------------------------------------------------------------------
+        if is_multi_company and len(target_company_ids) > 1:
+            tool_name = (
+                state.get("detected_tool")
+                or (active_tools[0].get("tool") if active_tools else None)
+                or "fetch_vendor_invoices"
+            )
+            base_params = dict(
+                (active_tools[0].get("params") if active_tools else None)
+                or state.get("extracted_params")
+                or {}
+            )
+
+            concurrency_limit = getattr(settings, "ERP_MULTI_COMPANY_CONCURRENCY", 5)
+            semaphore = asyncio.Semaphore(concurrency_limit)
+            multi_company_results: Dict[int, Any] = {}
+            unauthorized_companies: List[int] = []
+            errors: List[str] = []
+
+            async def _fetch_company_tool(cid: int):
+                params_for_cid = dict(base_params)
+                params_for_cid["company_id"] = cid
+                async with semaphore:
+                    try:
+                        res, err = await _execute_single_tool(
+                            tool_name=tool_name,
+                            params=params_for_cid,
+                            erp_client=erp_client,
+                            user_token=user_token,
+                            default_company_id=cid,
+                            dispatch_map=dispatch_map,
+                            user_query=state.get("user_query") or "",
+                            allow_empty_stock_params=True,
+                        )
+                        if err:
+                            err_lower = str(err).lower()
+                            if any(k in err_lower for k in ("403", "tidak memiliki akses", "akses ditolak", "permission", "unauthorized")):
+                                unauthorized_companies.append(cid)
+                                multi_company_results[cid] = None
+                            else:
+                                errors.append(f"Company {cid}: {err}")
+                                multi_company_results[cid] = None
+                        else:
+                            multi_company_results[cid] = res
+                    except Exception as exc:
+                        exc_str = str(exc)
+                        exc_lower = exc_str.lower()
+                        if any(k in exc_lower for k in ("403", "tidak memiliki akses", "akses ditolak", "permission", "unauthorized")):
+                            unauthorized_companies.append(cid)
+                        else:
+                            errors.append(f"Company {cid}: {exc_str}")
+                        multi_company_results[cid] = None
+
+            await asyncio.gather(*[_fetch_company_tool(cid) for cid in target_company_ids], return_exceptions=True)
+
+            primary_res = next((r for r in multi_company_results.values() if r is not None), None)
+            valid_companies = [cid for cid, r in multi_company_results.items() if r is not None]
+            has_success = len(valid_companies) > 0
+            all_failed = not has_success and len(target_company_ids) > 0
+
+            multi_tool_results_compat: Dict[str, Any] = {}
+            for cid, r in multi_company_results.items():
+                multi_tool_results_compat[f"{tool_name}_{cid}"] = r
+            if primary_res is not None:
+                multi_tool_results_compat[tool_name] = primary_res
+
+            v_status = "VALID" if has_success else ("ERROR" if errors else "EMPTY")
+            err_msg = "; ".join(errors) if (all_failed and errors) else (errors[0] if (all_failed and errors) else None)
+
+            return {
+                "company_id": state.get("company_id") or target_company_ids[0],
+                "company_ids": target_company_ids,
+                "is_multi_company": True,
+                "tool_result": primary_res,
+                "multi_company_results": multi_company_results,
+                "unauthorized_companies": sorted(unauthorized_companies),
+                "multi_tool_results": multi_tool_results_compat,
+                "verification_status": v_status,
+                "error_message": err_msg,
+            }
 
         # ------------------------------------------------------------------
         # Path A: Multi-Tool Execution via asyncio.gather (Milestone 3)

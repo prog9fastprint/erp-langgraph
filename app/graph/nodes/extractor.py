@@ -111,6 +111,42 @@ BRANCH_COMPANY_MAP: Dict[str, int] = {
     "pusat": 1,
 }
 
+# Canonical human-readable display names for company IDs
+COMPANY_NAME_MAP: Dict[int, str] = {
+    1: "Kantor Pusat",
+    2: "Toko Pusat",
+    3: "Head Office",
+    4: "Main Store",
+    5: "Makassar",
+    6: "Bandung",
+    7: "Surabaya",
+    8: "Jakarta",
+    9: "Toko Fast Print Surabaya",
+    10: "Medan",
+    11: "HR",
+    12: "Sandy",
+    13: "Bekasi",
+    14: "Tangerang",
+    15: "Malang",
+    17: "Fastmart",
+}
+
+ALL_COMPANIES_KEYWORDS = (
+    "semua cabang",
+    "seluruh cabang",
+    "semua perusahaan",
+    "seluruh perusahaan",
+    "semua toko",
+    "seluruh toko",
+    "konsolidasi",
+    "semua branch",
+    "seluruh branch",
+    "all branches",
+    "all branch",
+    "all companies",
+    "total nasional",
+)
+
 TEMPORAL_KEYWORDS = (
     "bulan", "hari", "minggu", "tahun", "kemarin", "today", "yesterday",
     "januari", "februari", "maret", "april", "mei", "juni",
@@ -120,19 +156,51 @@ TEMPORAL_KEYWORDS = (
 )
 
 
+def resolve_all_branch_company_ids(text: Optional[str]) -> Tuple[List[int], bool]:
+    """
+    Resolve multiple branch/city mentions or 'semua cabang' into a list of company_ids.
+
+    Returns:
+        Tuple of (list_of_company_ids, is_all_companies_flag)
+    """
+    if not text:
+        return [], False
+    cleaned = text.lower().strip()
+
+    # Check for all-companies / network-wide rollup keywords
+    if any(re.search(rf"\b{re.escape(kw)}\b", cleaned) for kw in ALL_COMPANIES_KEYWORDS):
+        return sorted(list(COMPANY_NAME_MAP.keys())), True
+
+    matched_spans: List[Tuple[int, int, int]] = []  # (start_idx, end_idx, company_id)
+    for branch_key in sorted(BRANCH_COMPANY_MAP.keys(), key=lambda k: -len(k)):
+        pattern = rf"(?:\b(?:di\s*cabang|dicabang|cabang|di\s*toko|di\s*kantor|kantor|di)\s+)?\b{re.escape(branch_key)}\b"
+        for m in re.finditer(pattern, cleaned):
+            start, end = m.span()
+            if not any(max(start, s) < min(end, e) for s, e, _ in matched_spans):
+                matched_spans.append((start, end, BRANCH_COMPANY_MAP[branch_key]))
+
+    matched_spans.sort(key=lambda x: x[0])
+    seen = set()
+    ordered_ids: List[int] = []
+    for _, _, cid in matched_spans:
+        if cid not in seen:
+            seen.add(cid)
+            ordered_ids.append(cid)
+
+    return ordered_ids, False
+
+
 def resolve_branch_company_id(text: Optional[str]) -> Optional[int]:
     """
-    Resolve Indonesian city or branch mentions into official FastPrint ERP company_id.
+    Resolve single Indonesian city or branch mention into official FastPrint ERP company_id.
     Matches phrases like 'cabang bandung', 'dicabang bandung', 'di bandung', 'kantor pusat', etc.
     """
     if not text:
         return None
-    cleaned = text.lower().strip()
-    for branch_key in sorted(BRANCH_COMPANY_MAP.keys(), key=lambda k: -len(k)):
-        pattern = rf"(?:\b(?:di\s*cabang|dicabang|cabang|di\s*toko|di\s*kantor|kantor|di)\s+)?\b{re.escape(branch_key)}\b"
-        if re.search(pattern, cleaned):
-            return BRANCH_COMPANY_MAP[branch_key]
-    return None
+    ids, is_all = resolve_all_branch_company_ids(text)
+    if is_all:
+        return None
+    return ids[0] if ids else None
 
 
 def has_temporal_expression(text: Optional[str]) -> bool:
@@ -1270,18 +1338,33 @@ def extractor_node(
         "extracted_params": primary_params,
     }
 
-    branch_co_id = (
-        resolve_branch_company_id(user_query)
-        or primary_params.get("company_id")
-    )
-    if branch_co_id is not None:
-        result_update["company_id"] = branch_co_id
-        for plan_item in working_active_tools:
-            plan_params = plan_item.setdefault("params", {})
-            if not plan_params.get("company_id") or plan_params.get("company_id") == state.get("company_id"):
-                plan_params["company_id"] = branch_co_id
-        primary_params["company_id"] = branch_co_id
-    elif state.get("company_id") is not None:
-        result_update["company_id"] = state.get("company_id")
+    multi_cids, is_all = resolve_all_branch_company_ids(user_query)
+    is_multi_co = bool(state.get("is_multi_company") or is_all or (len(multi_cids) > 1))
+
+    if is_multi_co:
+        effective_cids = (
+            state.get("company_ids")
+            if (state.get("company_ids") and len(state.get("company_ids")) > 1 and not is_all and not multi_cids)
+            else (multi_cids if multi_cids else list(COMPANY_NAME_MAP.keys()))
+        )
+        result_update["is_multi_company"] = True
+        result_update["company_ids"] = effective_cids
+        primary_cid = effective_cids[0] if effective_cids else (state.get("company_id") or 1)
+        result_update["company_id"] = primary_cid
+        primary_params["company_id"] = primary_cid
+    else:
+        branch_co_id = (
+            resolve_branch_company_id(user_query)
+            or primary_params.get("company_id")
+        )
+        if branch_co_id is not None:
+            result_update["company_id"] = branch_co_id
+            for plan_item in working_active_tools:
+                plan_params = plan_item.setdefault("params", {})
+                if not plan_params.get("company_id") or plan_params.get("company_id") == state.get("company_id"):
+                    plan_params["company_id"] = branch_co_id
+            primary_params["company_id"] = branch_co_id
+        elif state.get("company_id") is not None:
+            result_update["company_id"] = state.get("company_id")
 
     return result_update

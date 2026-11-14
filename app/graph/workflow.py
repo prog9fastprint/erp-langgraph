@@ -368,10 +368,53 @@ def _resolve_effective_company_id(
     return int(company_id) if company_id is not None else int(settings.DEFAULT_COMPANY_ID)
 
 
+def _resolve_effective_company_ids(
+    user_query: str,
+    company_id: Optional[int],
+    company_ids: Optional[List[int]],
+    company_id_explicit: Optional[bool],
+    checkpoint_values: Optional[Dict[str, Any]],
+) -> Tuple[int, List[int], bool]:
+    """
+    Resolve effective primary company_id and target company_ids list.
+    Returns:
+        Tuple of (primary_company_id, company_ids_list, is_multi_company)
+    """
+    from app.graph.nodes.extractor import resolve_all_branch_company_ids
+
+    # 1. Caller passed explicit company_ids
+    if company_ids and len(company_ids) > 1:
+        cids = [int(c) for c in company_ids]
+        return cids[0], cids, True
+    elif company_ids and len(company_ids) == 1:
+        cid = int(company_ids[0])
+        return cid, [cid], False
+
+    # 2. Text contains 'semua cabang' or multiple branch mentions
+    text_cids, is_all = resolve_all_branch_company_ids(user_query)
+    if is_all:
+        primary = text_cids[0] if text_cids else settings.DEFAULT_COMPANY_ID
+        return primary, text_cids, True
+    if len(text_cids) > 1:
+        return text_cids[0], text_cids, True
+    if len(text_cids) == 1:
+        return text_cids[0], [text_cids[0]], False
+
+    # 3. Fallback to standard single-company resolution
+    single_cid = _resolve_effective_company_id(
+        user_query=user_query,
+        company_id=company_id,
+        company_id_explicit=company_id_explicit,
+        checkpoint_values=checkpoint_values,
+    )
+    return single_cid, [single_cid], False
+
+
 async def _prepare_workflow_execution(
     user_query: str,
     user_token: Optional[str] = None,
     company_id: Optional[int] = None,
+    company_ids: Optional[List[int]] = None,
     thread_id: Optional[str] = None,
     graph: Optional[Any] = None,
     history: Optional[List[Any]] = None,
@@ -396,9 +439,10 @@ async def _prepare_workflow_execution(
         _touch_checkpoint_lru(active_graph, effective_thread_id)
 
     checkpoint_values = checkpoint.values if (checkpoint and checkpoint.values) else None
-    effective_company_id = _resolve_effective_company_id(
+    effective_company_id, effective_company_ids, is_multi_company = _resolve_effective_company_ids(
         user_query=user_query,
         company_id=company_id,
+        company_ids=company_ids,
         company_id_explicit=company_id_explicit,
         checkpoint_values=checkpoint_values,
     )
@@ -413,6 +457,8 @@ async def _prepare_workflow_execution(
         user_query=user_query,
         user_token=user_token,
         company_id=effective_company_id,
+        company_ids=effective_company_ids,
+        is_multi_company=is_multi_company,
         messages=hydrated_messages,
     )
     return active_graph, config, initial_state, is_ephemeral, effective_thread_id
@@ -422,6 +468,7 @@ async def arun_workflow(
     user_query: str,
     user_token: Optional[str] = None,
     company_id: Optional[int] = None,
+    company_ids: Optional[List[int]] = None,
     thread_id: Optional[str] = None,
     graph: Optional[Any] = None,
     history: Optional[List[Any]] = None,
@@ -434,6 +481,7 @@ async def arun_workflow(
         user_query: Incoming natural language query.
         user_token: Optional JWT access token.
         company_id: Optional target company ID.
+        company_ids: Optional target company IDs list for multi-company queries.
         thread_id: Optional conversational session thread ID for MemorySaver.
         graph: Optional compiled StateGraph instance.
         history: Optional list of past conversation messages for stateless memory recovery.
@@ -447,6 +495,7 @@ async def arun_workflow(
             user_query=user_query,
             user_token=user_token,
             company_id=company_id,
+            company_ids=company_ids,
             thread_id=thread_id,
             graph=graph,
             history=history,
@@ -472,6 +521,7 @@ async def astream_workflow_steps(
     user_query: str,
     user_token: Optional[str] = None,
     company_id: Optional[int] = None,
+    company_ids: Optional[List[int]] = None,
     thread_id: Optional[str] = None,
     graph: Optional[Any] = None,
     history: Optional[List[Any]] = None,
@@ -486,6 +536,7 @@ async def astream_workflow_steps(
             user_query=user_query,
             user_token=user_token,
             company_id=company_id,
+            company_ids=company_ids,
             thread_id=thread_id,
             graph=graph,
             history=history,
@@ -549,6 +600,7 @@ def run_workflow_sync(
     user_query: str,
     user_token: Optional[str] = None,
     company_id: Optional[int] = None,
+    company_ids: Optional[List[int]] = None,
     thread_id: Optional[str] = None,
     graph: Optional[Any] = None,
     on_node_finish: Optional[Any] = None,
@@ -573,6 +625,7 @@ def run_workflow_sync(
                 user_query=user_query,
                 user_token=user_token,
                 company_id=company_id,
+                company_ids=company_ids,
                 thread_id=thread_id,
                 graph=graph,
                 history=history,
@@ -587,6 +640,7 @@ def run_workflow_sync(
             user_query=user_query,
             user_token=user_token,
             company_id=company_id,
+            company_ids=company_ids,
             thread_id=thread_id,
             graph=graph,
             history=history,

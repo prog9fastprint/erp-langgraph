@@ -47,6 +47,10 @@ class AgentState(TypedDict, total=False):
     user_query: str
     user_token: Optional[str]
     company_id: Optional[int]
+    company_ids: Optional[List[int]]
+    is_multi_company: Optional[bool]
+    multi_company_results: Optional[Dict[int, Any]]
+    unauthorized_companies: Optional[List[int]]
 
     # 3. Domain & Tool Routing (Single & Multi-Tool)
     detected_domain: Optional[str]        # Legacy/primary domain e.g., "accounting", "inventory"
@@ -87,8 +91,10 @@ def create_initial_state(
     user_query: str,
     user_token: Optional[str] = None,
     company_id: Optional[int] = None,
+    company_ids: Optional[List[int]] = None,
     messages: Optional[List[BaseMessage]] = None,
     is_multi_tool: Optional[bool] = False,
+    is_multi_company: Optional[bool] = False,
     active_model: Optional[str] = None,
 ) -> AgentState:
     """
@@ -98,8 +104,10 @@ def create_initial_state(
         user_query: The incoming natural language query string from the user.
         user_token: Optional user JWT access token.
         company_id: Optional target company ID (defaults to settings.DEFAULT_COMPANY_ID).
+        company_ids: Optional list of target company IDs for multi-company queries.
         messages: Optional pre-existing message list (if None, initializes with HumanMessage).
         is_multi_tool: Flag indicating if the state is initialized for multi-tool workflow.
+        is_multi_company: Flag indicating if query spans multiple companies.
 
     Returns:
         A fully initialized AgentState dictionary.
@@ -108,11 +116,19 @@ def create_initial_state(
         list(messages) if messages is not None else [HumanMessage(content=user_query)]
     )
 
+    primary_cid = company_id if company_id is not None else settings.DEFAULT_COMPANY_ID
+    effective_cids = list(company_ids) if company_ids else ([primary_cid] if primary_cid is not None else [1])
+    is_multi_co = bool(is_multi_company or (company_ids and len(company_ids) > 1))
+
     return {
         "messages": initial_messages,
         "user_query": user_query,
         "user_token": user_token,
-        "company_id": company_id if company_id is not None else settings.DEFAULT_COMPANY_ID,
+        "company_id": primary_cid,
+        "company_ids": effective_cids,
+        "is_multi_company": is_multi_co,
+        "multi_company_results": {},
+        "unauthorized_companies": [],
         "detected_domain": None,
         "detected_tool": None,
         "extracted_params": None,

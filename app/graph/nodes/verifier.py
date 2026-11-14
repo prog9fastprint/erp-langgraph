@@ -175,6 +175,37 @@ def verifier_node(state: AgentState) -> Dict[str, Any]:
     current_instruction = state.get("retry_instruction")
     preserved_replay = current_instruction if current_instruction and current_instruction.startswith("Mengulang permintaan:") else None
 
+    # ------------------------------------------------------------------
+    # Path MC: Verification for Multi-Company Execution
+    # ------------------------------------------------------------------
+    if state.get("is_multi_company") and state.get("multi_company_results"):
+        mc_results = state.get("multi_company_results") or {}
+        total_records = sum(_calculate_records_count(r) for r in mc_results.values() if r)
+        unauth = state.get("unauthorized_companies") or []
+
+        if total_records > 0 or (len(mc_results) > len(unauth) and any(r is not None for r in mc_results.values())):
+            return {
+                "verification_status": "VALID",
+                "retry_instruction": None,
+            }
+        elif len(unauth) == len(mc_results) and len(unauth) > 0:
+            return {
+                "verification_status": "ERROR",
+                "error_message": f"Akses ditolak ke seluruh cabang yang diminta (HTTP 403): {unauth}",
+            }
+        else:
+            current_retry = int(state.get("retry_count") or 0)
+            if current_retry < 2:
+                return {
+                    "verification_status": "RETRY",
+                    "retry_count": current_retry + 1,
+                    "retry_instruction": "Hasil query multi-cabang kosong (0 data). Longgarkan batasan tanggal untuk memperluas pencarian.",
+                }
+            return {
+                "verification_status": "EMPTY",
+                "retry_instruction": None,
+            }
+
     multi_results = state.get("multi_tool_results") or {}
     multi_status = state.get("multi_verification_status") or {}
     active_tools = state.get("active_tools") or []

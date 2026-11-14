@@ -747,6 +747,25 @@ def classify_query_rule_based(query: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _annotate_multi_company(res: Dict[str, Any], state: AgentState, user_query: str) -> Dict[str, Any]:
+    if not isinstance(res, dict):
+        return res
+    from app.graph.nodes.extractor import resolve_all_branch_company_ids, COMPANY_NAME_MAP
+    multi_cids, is_all = resolve_all_branch_company_ids(user_query)
+    is_multi_co = bool(state.get("is_multi_company") or is_all or (len(multi_cids) > 1))
+    if is_multi_co:
+        res["is_multi_company"] = True
+        effective_cids = (
+            state.get("company_ids")
+            if (state.get("company_ids") and len(state.get("company_ids")) > 1 and not is_all and not multi_cids)
+            else (multi_cids if multi_cids else (state.get("company_ids") or list(COMPANY_NAME_MAP.keys())))
+        )
+        if effective_cids:
+            res["company_ids"] = effective_cids
+            res["company_id"] = effective_cids[0]
+    return res
+
+
 def router_node(
     state: AgentState,
     llm: Optional[BaseChatModel] = None,
@@ -761,6 +780,15 @@ def router_node(
         user_query = getattr(last_msg, "content", "") or ""
 
     user_query = (user_query or "").strip()
+    raw_res = _router_node_impl(state=state, llm=llm, user_query=user_query)
+    return _annotate_multi_company(raw_res, state=state, user_query=user_query)
+
+
+def _router_node_impl(
+    state: AgentState,
+    llm: Optional[BaseChatModel] = None,
+    user_query: str = "",
+) -> Dict[str, Any]:
     if not user_query:
         return {
             "detected_domain": "general",

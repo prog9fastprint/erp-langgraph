@@ -205,6 +205,8 @@ def _build_workflow_kwargs(payload: ChatRequest, effective_token: Optional[str])
         "thread_id": payload.thread_id,
         "company_id_explicit": ("company_id" in payload.model_fields_set),
     }
+    if payload.company_ids is not None:
+        kwargs["company_ids"] = payload.company_ids
     if payload.history is not None:
         kwargs["history"] = payload.history
     return kwargs
@@ -220,6 +222,8 @@ def _build_chat_response(final_state: Dict[str, Any], started_at: float) -> Chat
 
     raw_company_id = final_state.get("company_id")
     resolved_company_id = int(raw_company_id) if raw_company_id is not None else None
+    raw_company_ids = final_state.get("company_ids")
+    resolved_company_ids = [int(c) for c in raw_company_ids] if raw_company_ids else None
     execution_time_ms = round((time.perf_counter() - started_at) * 1000.0, 2)
     model_used = final_state.get("active_model") or get_default_model_name()
 
@@ -230,6 +234,7 @@ def _build_chat_response(final_state: Dict[str, Any], started_at: float) -> Chat
         error_message=final_state.get("error_message"),
         suggested_followups=final_state.get("suggested_followups") or [],
         resolved_company_id=resolved_company_id,
+        resolved_company_ids=resolved_company_ids,
         execution_time_ms=execution_time_ms,
         model_used=model_used,
     )

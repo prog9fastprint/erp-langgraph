@@ -648,6 +648,242 @@ def _format_single_tool_presentation(tool: Optional[str], tool_result: Any) -> s
     return f"Hasil eksekusi data ERP: {str(tool_result)}"
 
 
+def _format_multi_company_presentation(state: AgentState) -> str:
+    """
+    Format multi-company comparison and network-wide rollups into structured Markdown.
+    Includes per-company breakdown, grand total rollup summary, and partial permission warnings.
+    """
+    from app.graph.nodes.extractor import COMPANY_NAME_MAP
+
+    tool = state.get("detected_tool") or "get_account_balance"
+    mc_results = state.get("multi_company_results") or {}
+    unauth = state.get("unauthorized_companies") or []
+    lines: List[str] = []
+
+    # 1. Account Balance Multi-Company Presentation
+    if tool == "get_account_balance":
+        lines.append("### Laporan Saldo Akun Multi-Perusahaan (Combined Accounting Balance)\n")
+        lines.append("| No | Perusahaan / Cabang | Saldo Awal | Mutasi Debit | Mutasi Kredit | Saldo Akhir |")
+        lines.append("|:---|:---|:---|:---|:---|:---|")
+        tot_op = 0.0
+        tot_deb = 0.0
+        tot_kred = 0.0
+        tot_end = 0.0
+        row_idx = 1
+
+        for cid in sorted(mc_results.keys()):
+            c_name = COMPANY_NAME_MAP.get(cid, f"Cabang {cid}")
+            res = mc_results.get(cid)
+            if not res:
+                st_text = "Akses Dibatasi (HTTP 403)" if cid in unauth else "Tidak Ada Data"
+                lines.append(f"| {row_idx} | {c_name} | - | - | - | *{st_text}* |")
+                row_idx += 1
+                continue
+
+            totals = res.get("totals") or {}
+            op = float(totals.get("opening_balance", res.get("opening_balance", 0.0)) or 0.0)
+            deb = float(totals.get("period_debit", res.get("total_debit", 0.0)) or 0.0)
+            kred = float(totals.get("period_credit", res.get("total_credit", 0.0)) or 0.0)
+            end = float(totals.get("ending_balance", res.get("net_balance", 0.0)) or 0.0)
+
+            tot_op += op
+            tot_deb += deb
+            tot_kred += kred
+            tot_end += end
+
+            lines.append(
+                f"| {row_idx} | {c_name} | {_format_rupiah(op)} | {_format_rupiah(deb)} | "
+                f"{_format_rupiah(kred)} | **{_format_rupiah(end)}** |"
+            )
+            row_idx += 1
+
+        lines.append(
+            f"| | **TOTAL GABUNGAN** | **{_format_rupiah(tot_op)}** | **{_format_rupiah(tot_deb)}** | "
+            f"**{_format_rupiah(tot_kred)}** | **{_format_rupiah(tot_end)}** |"
+        )
+
+    # 2. Profit & Loss Multi-Company Presentation
+    elif tool == "get_profit_and_loss":
+        lines.append("### Laporan Laba Rugi Multi-Perusahaan (Combined Profit & Loss)\n")
+        lines.append("| No | Perusahaan / Cabang | Pendapatan Usaha | HPP (COGS) | Laba Kotor | Laba / (Rugi) Bersih |")
+        lines.append("|:---|:---|:---|:---|:---|:---|")
+        tot_rev = 0.0
+        tot_cogs = 0.0
+        tot_gross = 0.0
+        tot_net = 0.0
+        row_idx = 1
+
+        for cid in sorted(mc_results.keys()):
+            c_name = COMPANY_NAME_MAP.get(cid, f"Cabang {cid}")
+            res = mc_results.get(cid)
+            if not res:
+                st_text = "Akses Dibatasi (HTTP 403)" if cid in unauth else "Tidak Ada Data"
+                lines.append(f"| {row_idx} | {c_name} | - | - | - | *{st_text}* |")
+                row_idx += 1
+                continue
+
+            summary = res.get("summary") or res
+            rev = float(summary.get("total_revenue", 0.0) or 0.0)
+            cogs = float(summary.get("cogs", 0.0) or 0.0)
+            gross = float(summary.get("gross_profit", 0.0) or 0.0)
+            net = float(summary.get("net_profit", 0.0) or 0.0)
+
+            tot_rev += rev
+            tot_cogs += cogs
+            tot_gross += gross
+            tot_net += net
+
+            lines.append(
+                f"| {row_idx} | {c_name} | {_format_rupiah(rev)} | {_format_rupiah(cogs)} | "
+                f"{_format_rupiah(gross)} | **{_format_rupiah(net)}** |"
+            )
+            row_idx += 1
+
+        lines.append(
+            f"| | **TOTAL GABUNGAN** | **{_format_rupiah(tot_rev)}** | **{_format_rupiah(tot_cogs)}** | "
+            f"**{_format_rupiah(tot_gross)}** | **{_format_rupiah(tot_net)}** |"
+        )
+
+    # 3. Balance Sheet Multi-Company Presentation
+    elif tool == "get_balance_sheet":
+        lines.append("### Laporan Neraca Multi-Perusahaan (Combined Balance Sheet)\n")
+        lines.append("| No | Perusahaan / Cabang | Total Aset | Total Liabilitas | Total Ekuitas |")
+        lines.append("|:---|:---|:---|:---|:---|")
+        tot_ast = 0.0
+        tot_lia = 0.0
+        tot_equ = 0.0
+        row_idx = 1
+
+        for cid in sorted(mc_results.keys()):
+            c_name = COMPANY_NAME_MAP.get(cid, f"Cabang {cid}")
+            res = mc_results.get(cid)
+            if not res:
+                st_text = "Akses Dibatasi (HTTP 403)" if cid in unauth else "Tidak Ada Data"
+                lines.append(f"| {row_idx} | {c_name} | - | - | *{st_text}* |")
+                row_idx += 1
+                continue
+
+            summary = res.get("summary") or res
+            ast = float(summary.get("total_assets", 0.0) or 0.0)
+            lia = float(summary.get("total_liabilities", 0.0) or 0.0)
+            equ = float(summary.get("total_equity", 0.0) or 0.0)
+
+            tot_ast += ast
+            tot_lia += lia
+            tot_equ += equ
+
+            lines.append(
+                f"| {row_idx} | {c_name} | {_format_rupiah(ast)} | {_format_rupiah(lia)} | "
+                f"**{_format_rupiah(equ)}** |"
+            )
+            row_idx += 1
+
+        lines.append(
+            f"| | **TOTAL GABUNGAN** | **{_format_rupiah(tot_ast)}** | **{_format_rupiah(tot_lia)}** | "
+            f"**{_format_rupiah(tot_equ)}** |"
+        )
+
+    # 4. Stock Level Multi-Company Presentation
+    elif tool == "get_stock_level":
+        lines.append("### Laporan Ketersediaan Stok Multi-Cabang (Combined Stock Level)\n")
+        lines.append("| No | Perusahaan / Cabang | SKU / Kode | Nama Produk | Kuantitas Fisik | Kuantitas Tersedia |")
+        lines.append("|:---|:---|:---|:---|:---|:---|")
+        tot_qty = 0.0
+        tot_avail = 0.0
+        row_idx = 1
+
+        for cid in sorted(mc_results.keys()):
+            c_name = COMPANY_NAME_MAP.get(cid, f"Cabang {cid}")
+            res = mc_results.get(cid)
+            if not res:
+                st_text = "Akses Dibatasi (HTTP 403)" if cid in unauth else "Tidak Ada Data"
+                lines.append(f"| {row_idx} | {c_name} | - | - | - | *{st_text}* |")
+                row_idx += 1
+                continue
+
+            items = res.get("stocks") or res.get("items") or [res]
+            for it in items:
+                sku = it.get("code") or it.get("sku") or "-"
+                p_name = it.get("product_name") or it.get("name") or "-"
+                qty = float(it.get("quantity", it.get("qty_on_hand", 0.0)) or 0.0)
+                avail = float(it.get("available_quantity", qty) or 0.0)
+
+                tot_qty += qty
+                tot_avail += avail
+
+                lines.append(
+                    f"| {row_idx} | {c_name} | `{sku}` | {p_name} | {qty:g} | **{avail:g}** |"
+                )
+                row_idx += 1
+
+        lines.append(
+            f"| | **TOTAL NASIONAL** | | | **{tot_qty:g}** | **{tot_avail:g}** |"
+        )
+
+    # 5. Vendor Invoices / Vendor Bills Multi-Company Presentation
+    elif tool in ("fetch_vendor_invoices", "get_vendor_bills"):
+        lines.append("### Ringkasan Tagihan Vendor Multi-Perusahaan\n")
+        lines.append("| No | Perusahaan / Cabang | Total Tagihan | Belum Dibayar | Sudah Dibayar | Status |")
+        lines.append("|:---|:---|:---|:---|:---|:---|")
+        tot_amt = 0.0
+        tot_unp = 0.0
+        tot_paid = 0.0
+        row_idx = 1
+
+        for cid in sorted(mc_results.keys()):
+            c_name = COMPANY_NAME_MAP.get(cid, f"Cabang {cid}")
+            res = mc_results.get(cid)
+            if not res:
+                st_text = "Akses Dibatasi (HTTP 403)" if cid in unauth else "Tidak Ada Data"
+                lines.append(f"| {row_idx} | {c_name} | - | - | - | *{st_text}* |")
+                row_idx += 1
+                continue
+
+            calc = res.get("calculations") or res.get("summary") or res
+            amt = float(calc.get("total_amount", calc.get("total_bill_amount", 0.0)) or 0.0)
+            unp = float(calc.get("total_unpaid", 0.0) or 0.0)
+            paid = float(calc.get("total_paid", 0.0) or 0.0)
+
+            tot_amt += amt
+            tot_unp += unp
+            tot_paid += paid
+
+            lines.append(
+                f"| {row_idx} | {c_name} | {_format_rupiah(amt)} | {_format_rupiah(unp)} | "
+                f"{_format_rupiah(paid)} | Selesai |"
+            )
+            row_idx += 1
+
+        lines.append(
+            f"| | **TOTAL GABUNGAN** | **{_format_rupiah(tot_amt)}** | **{_format_rupiah(tot_unp)}** | "
+            f"**{_format_rupiah(tot_paid)}** | |"
+        )
+
+    # Generic Fallback for other tools
+    else:
+        lines.append(f"### Laporan Multi-Perusahaan (`{tool}`)\n")
+        for cid in sorted(mc_results.keys()):
+            c_name = COMPANY_NAME_MAP.get(cid, f"Cabang {cid}")
+            res = mc_results.get(cid)
+            if not res:
+                st_text = "Akses Dibatasi (HTTP 403)" if cid in unauth else "Tidak Ada Data"
+                lines.append(f"- **{c_name}**: *{st_text}*")
+            else:
+                cnt = _extract_total_count(res, 1)
+                lines.append(f"- **{c_name}**: Ditemukan {cnt} data transaksi.")
+
+    # Partial Permission Alert if unauthorized companies exist
+    if unauth:
+        unauth_names = [COMPANY_NAME_MAP.get(c, f"Cabang {c}") for c in unauth]
+        lines.append(
+            f"\n> [!WARNING]\n"
+            f"> **Akses Dibatasi**: Data tidak mencakup entitas **{', '.join(unauth_names)}** "
+            f"karena akun Anda belum memiliki izin akses untuk entitas tersebut (HTTP 403 Forbidden)."
+        )
+
+    return "\n".join(lines)
+
+
 def format_deterministic_answer(state: AgentState) -> str:
     """
     Deterministic template formatter for ERP results when offline or LLM is unavailable.
@@ -661,6 +897,10 @@ def format_deterministic_answer(state: AgentState) -> str:
     error_message = state.get("error_message")
     multi_results = state.get("multi_tool_results") or {}
     is_multi = state.get("is_multi_tool") or (len(multi_results) > 1)
+
+    # 0. Multi-Company Execution Unified Formatting
+    if state.get("is_multi_company") and state.get("multi_company_results"):
+        return _format_multi_company_presentation(state)
 
     # 0. Empty History Retry Handling
     if error_message == "NO_PREVIOUS_QUERY_TO_RETRY":
