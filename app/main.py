@@ -117,9 +117,11 @@ async def readiness_check():
     Report boolean readiness status for LLM provider, ERP connection config, and Vector DB
     without exposing URLs, credentials, or internal environment details.
     """
-    provider = (settings.MODEL_PROVIDER or "openrouter").strip().lower()
+    provider = (settings.MODEL_PROVIDER or "openai").strip().lower()
     if provider == "openai":
         llm_configured = bool((settings.OPENAI_API_KEY or "").strip())
+    elif provider == "gemini":
+        llm_configured = bool(settings.get_gemini_api_keys())
     else:
         llm_configured = bool((settings.OPENROUTER_API_KEY or "").strip())
 

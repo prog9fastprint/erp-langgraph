@@ -28,7 +28,7 @@ class TestCentralizedConfig(unittest.TestCase):
         self.assertEqual(default_settings.APP_PORT, 8002)
         self.assertIsInstance(settings.DEFAULT_COMPANY_ID, int)
         self.assertEqual(settings.REQUEST_TIMEOUT_SEC, 15)
-        self.assertIn(settings.MODEL_PROVIDER, ["openrouter", "openai"])
+        self.assertIn(settings.MODEL_PROVIDER, ["openrouter", "openai", "gemini"])
 
     def test_settings_aliases_resolution(self):
         """Verify DJANGO_INTERNAL_* aliases and timeout resolution."""
@@ -92,17 +92,45 @@ class TestLLMClientFactory(unittest.TestCase):
             self.assertTrue(hasattr(model, "bind_tools"))
             self.assertTrue(hasattr(model, "with_structured_output"))
 
+    def test_gemini_model_initialization(self):
+        """Test ChatOpenAI instantiation targeting Gemini OpenAI compatibility."""
+        with patch.object(settings, "GOOGLE_AI_API_KEY", "mock-gemini-key"), \
+             patch.object(settings, "GOOGLE_AI_API_KEY_2", None), \
+             patch.object(settings, "GOOGLE_AI_API_KEY_3", None):
+            model = get_chat_model(provider="gemini", model_name="gemini-2.5-flash")
+            self.assertEqual(model.model_name, "gemini-2.5-flash")
+            self.assertEqual(str(model.openai_api_base).rstrip("/"), "https://generativelanguage.googleapis.com/v1beta/openai")
+            self.assertEqual(model.request_timeout, float(settings.REQUEST_TIMEOUT_SEC))
+
+            # Verify Tool Calling and Structured Output support
+            self.assertTrue(hasattr(model, "bind_tools"))
+            self.assertTrue(hasattr(model, "with_structured_output"))
+            structured_model = model.with_structured_output(DummyOutputSchema)
+            self.assertIsNotNone(structured_model)
+
     def test_missing_api_key_raises_error(self):
         """Factory should raise ValueError if required API key is missing."""
         with patch.object(settings, "OPENROUTER_API_KEY", None), patch.object(settings, "OPENAI_API_KEY", None):
             with self.assertRaises(ValueError):
                 get_chat_model(provider="openrouter")
 
+        with patch.object(settings, "OPENAI_API_KEY", None):
+            with self.assertRaises(ValueError):
+                get_chat_model(provider="openai", enable_fallback=False)
+
+        with patch.object(settings, "GOOGLE_AI_API_KEY", None), \
+             patch.object(settings, "GOOGLE_AI_API_KEY_2", None), \
+             patch.object(settings, "GOOGLE_AI_API_KEY_3", None), \
+             patch.object(settings, "GEMINI_API_KEY", None):
+            with self.assertRaises(ValueError):
+                get_chat_model(provider="gemini", enable_fallback=False)
+
     def test_unsupported_provider_raises_error(self):
         """Factory should raise ValueError for unsupported provider (e.g. legacy 'ollama')."""
         with self.assertRaises(ValueError) as ctx:
             get_chat_model(provider="ollama")
         self.assertIn("Unsupported MODEL_PROVIDER", str(ctx.exception))
+        self.assertIn("gemini", str(ctx.exception))
 
 
 if __name__ == "__main__":

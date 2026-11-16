@@ -136,8 +136,12 @@ class TestAutoFallbackModelFactory(unittest.TestCase):
             self.assertIsNone(model.extra_body)
 
     def test_openai_model_has_openrouter_fallback(self):
-        """When provider='openai' and enable_fallback=True, model should have openrouter fallback configured."""
+        """When provider='openai' and only openrouter is available, model should have openrouter fallback configured."""
         with patch.object(settings, "OPENAI_API_KEY", "mock-openai-key"), \
+             patch.object(settings, "GOOGLE_AI_API_KEY", None), \
+             patch.object(settings, "GOOGLE_AI_API_KEY_2", None), \
+             patch.object(settings, "GOOGLE_AI_API_KEY_3", None), \
+             patch.object(settings, "GEMINI_API_KEY", None), \
              patch.object(settings, "OPENROUTER_API_KEY", "mock-openrouter-key"):
             model = get_chat_model(
                 provider="openai",
@@ -146,10 +150,69 @@ class TestAutoFallbackModelFactory(unittest.TestCase):
             )
             self.assertEqual(model.model_name, "gpt-4o-mini")
             self.assertTrue(hasattr(model, "fallbacks"))
-            self.assertGreaterEqual(len(model.fallbacks), 1)
-            # Verify the fallback model has OpenRouter configuration
+            self.assertEqual(len(model.fallbacks), 1)
             fb_model = model.fallbacks[0]
             self.assertIn("openrouter.ai", str(fb_model.openai_api_base))
+
+    def test_openai_model_has_prioritized_gemini_and_openrouter_fallbacks(self):
+        """When provider='openai' with all providers available, fallbacks should be 1. Gemini, 2. OpenRouter."""
+        with patch.object(settings, "OPENAI_API_KEY", "mock-openai-key"), \
+             patch.object(settings, "GOOGLE_AI_API_KEY", "mock-gemini-key"), \
+             patch.object(settings, "GOOGLE_AI_API_KEY_2", None), \
+             patch.object(settings, "GOOGLE_AI_API_KEY_3", None), \
+             patch.object(settings, "OPENROUTER_API_KEY", "mock-openrouter-key"):
+            model = get_chat_model(
+                provider="openai",
+                model_name="gpt-4o-mini",
+                enable_fallback=True,
+            )
+            self.assertEqual(model.model_name, "gpt-4o-mini")
+            self.assertTrue(hasattr(model, "fallbacks"))
+            self.assertEqual(len(model.fallbacks), 2)
+            # Tier 2: Gemini
+            self.assertIn("generativelanguage.googleapis.com", str(model.fallbacks[0].openai_api_base))
+            # Tier 3: OpenRouter
+            self.assertIn("openrouter.ai", str(model.fallbacks[1].openai_api_base))
+
+    def test_gemini_model_multi_key_fallback(self):
+        """When multiple Gemini keys are configured, keys 2 and 3 should be attached as fallbacks."""
+        with patch.object(settings, "GOOGLE_AI_API_KEY", "mock-key-1"), \
+             patch.object(settings, "GOOGLE_AI_API_KEY_2", "mock-key-2"), \
+             patch.object(settings, "GOOGLE_AI_API_KEY_3", "mock-key-3"), \
+             patch.object(settings, "OPENROUTER_API_KEY", None):
+            model = get_chat_model(
+                provider="gemini",
+                model_name="gemini-2.5-flash",
+                enable_fallback=True,
+            )
+            self.assertEqual(model.model_name, "gemini-2.5-flash")
+            self.assertTrue(hasattr(model, "fallbacks"))
+            self.assertEqual(len(model.fallbacks), 2)
+            # Verify secondary keys are wrapped in fallbacks
+            self.assertEqual(model.fallbacks[0].openai_api_key.get_secret_value(), "mock-key-2")
+            self.assertEqual(model.fallbacks[1].openai_api_key.get_secret_value(), "mock-key-3")
+
+    def test_circuit_breaker_bypasses_unhealthy_openai_to_gemini(self):
+        """When provider 'openai' is marked unhealthy, factory should bypass directly to Gemini."""
+        from app.services.llm import mark_provider_unhealthy, reset_provider_health
+        reset_provider_health()
+        try:
+            mark_provider_unhealthy("openai", duration_sec=300.0)
+            with patch.object(settings, "OPENAI_API_KEY", "mock-openai-key"), \
+                 patch.object(settings, "GOOGLE_AI_API_KEY", "mock-gemini-key"), \
+                 patch.object(settings, "GOOGLE_AI_API_KEY_2", None), \
+                 patch.object(settings, "GOOGLE_AI_API_KEY_3", None), \
+                 patch.object(settings, "OPENROUTER_API_KEY", "mock-openrouter-key"):
+                model = get_chat_model(
+                    provider="openai",
+                    model_name="gpt-4o-mini",
+                    enable_fallback=True,
+                )
+                # Primary model should be Gemini, not OpenAI
+                self.assertIn("generativelanguage.googleapis.com", str(model.openai_api_base))
+                self.assertEqual(model.model_name, settings.GEMINI_MODEL)
+        finally:
+            reset_provider_health()
 
     def test_openai_model_disable_fallback(self):
         """When provider='openai' and enable_fallback=False, model should not have fallbacks."""

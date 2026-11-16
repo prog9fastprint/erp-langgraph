@@ -27,6 +27,10 @@ class TestModelIndicator(unittest.TestCase):
             with patch.object(settings, "OPENAI_MODEL", "gpt-4o-mini"):
                 self.assertEqual(get_default_model_name(), "gpt-4o-mini")
 
+        with patch.object(settings, "MODEL_PROVIDER", "gemini"):
+            with patch.object(settings, "GEMINI_MODEL", "gemini-2.5-flash"):
+                self.assertEqual(get_default_model_name(), "gemini-2.5-flash")
+
     def test_clean_model_display_name(self):
         """Verify model display name cleaning extracts readable identifier."""
         # Free-tier suffix stripping
@@ -43,6 +47,10 @@ class TestModelIndicator(unittest.TestCase):
         self.assertEqual(
             clean_model_display_name("gpt-4o-mini"),
             "gpt-4o-mini",
+        )
+        self.assertEqual(
+            clean_model_display_name("gemini-2.5-flash"),
+            "gemini-2.5-flash",
         )
         # None and empty inputs
         self.assertEqual(clean_model_display_name(None), "Unknown")

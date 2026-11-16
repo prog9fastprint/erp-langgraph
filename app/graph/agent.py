@@ -48,7 +48,7 @@ def create_erp_graph(
         client: ERPClient instance. If None, initialized from settings.
         use_dynamic_tools: If True, fetches tools dynamically from ERP via GET /ai/tools/.
                            If False, uses static typed wrappers.
-        model_provider: LLM provider override ('openrouter', 'openai').
+        model_provider: LLM provider override ('openai', 'gemini', 'openrouter').
         checkpointer: LangGraph checkpointer for state persistence. Defaults to MemorySaver().
     """
     warnings.warn(

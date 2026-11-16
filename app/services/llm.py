@@ -60,26 +60,38 @@ def reset_provider_health(provider: Optional[str] = None) -> None:
 
 
 class CircuitBreakerChatOpenAI(ChatOpenAI):
-    """ChatOpenAI wrapper that flags the 'openai' provider as unhealthy upon auth/quota failures."""
+    """ChatOpenAI wrapper that flags a provider/key as unhealthy upon auth/quota failures."""
+    provider_name: str = "openai"
+
+    def _handle_failure(self, exc: Exception) -> None:
+        err_str = str(exc).lower()
+        if (
+            "expired" in err_str
+            or "401" in err_str
+            or "authenticationerror" in err_str
+            or "invalid api key" in err_str
+            or "quota" in err_str
+            or "insufficient_quota" in err_str
+            or "429" in err_str
+            or "resource_exhausted" in err_str
+        ):
+            mark_provider_unhealthy(self.provider_name, duration_sec=900.0)
+            logger.warning(
+                f"Provider/key failure detected for '{self.provider_name}'. Marked unhealthy for 15m: {exc}"
+            )
 
     def invoke(self, *args, **kwargs):
         try:
             return super().invoke(*args, **kwargs)
         except Exception as exc:
-            err_str = str(exc).lower()
-            if "expired" in err_str or "401" in err_str or "authenticationerror" in err_str or "invalid api key" in err_str:
-                mark_provider_unhealthy("openai", duration_sec=900.0)
-                logger.warning(f"OpenAI authentication failure detected. Marked provider 'openai' unhealthy for 15m: {exc}")
+            self._handle_failure(exc)
             raise
 
     async def ainvoke(self, *args, **kwargs):
         try:
             return await super().ainvoke(*args, **kwargs)
         except Exception as exc:
-            err_str = str(exc).lower()
-            if "expired" in err_str or "401" in err_str or "authenticationerror" in err_str or "invalid api key" in err_str:
-                mark_provider_unhealthy("openai", duration_sec=900.0)
-                logger.warning(f"OpenAI authentication failure detected. Marked provider 'openai' unhealthy for 15m: {exc}")
+            self._handle_failure(exc)
             raise
 
 
@@ -241,6 +253,62 @@ def fetch_free_models_catalog(
     )
 
 
+def is_gemini_unhealthy() -> bool:
+    """Check if all configured Gemini keys are marked unhealthy in the circuit-breaker cache."""
+    keys = settings.get_gemini_api_keys()
+    if not keys:
+        return True
+    return all(is_provider_unhealthy(f"gemini:{k[-6:]}") for k in keys)
+
+
+def _build_gemini_model(
+    model_name: Optional[str] = None,
+    temperature: float = 0.0,
+    enable_key_fallback: bool = True,
+) -> BaseChatModel:
+    """
+    Construct ChatOpenAI instance targeting Google Gemini's OpenAI-compatible endpoint.
+    Configures multi-key failover across GOOGLE_AI_API_KEY, GOOGLE_AI_API_KEY_2, and GOOGLE_AI_API_KEY_3.
+    """
+    keys = settings.get_gemini_api_keys()
+    if not keys:
+        raise ValueError(
+            "GOOGLE_AI_API_KEY (or GEMINI_API_KEY) environment variable is required when MODEL_PROVIDER=gemini"
+        )
+
+    target_model = model_name or settings.GEMINI_MODEL
+
+    # Filter out keys that are currently marked unhealthy by circuit-breaker
+    healthy_keys = [k for k in keys if not is_provider_unhealthy(f"gemini:{k[-6:]}")]
+    effective_keys = healthy_keys if healthy_keys else keys
+
+    primary_key = effective_keys[0]
+    primary_model = CircuitBreakerChatOpenAI(
+        model=target_model,
+        api_key=primary_key,
+        base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+        temperature=temperature,
+        request_timeout=settings.REQUEST_TIMEOUT_SEC,
+        provider_name=f"gemini:{primary_key[-6:]}",
+    )
+
+    if enable_key_fallback and len(effective_keys) > 1:
+        fallbacks: List[BaseChatModel] = [
+            CircuitBreakerChatOpenAI(
+                model=target_model,
+                api_key=k,
+                base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+                temperature=temperature,
+                request_timeout=settings.REQUEST_TIMEOUT_SEC,
+                provider_name=f"gemini:{k[-6:]}",
+            )
+            for k in effective_keys[1:]
+        ]
+        return primary_model.with_fallbacks(fallbacks)
+
+    return primary_model
+
+
 def get_chat_model(
     provider: Optional[str] = None,
     model_name: Optional[str] = None,
@@ -249,18 +317,19 @@ def get_chat_model(
     enable_fallback: bool = True,
 ) -> BaseChatModel:
     """
-    Instantiate and return a ChatModel based on provider.
+    Instantiate and return a ChatModel based on provider priority.
 
     Supported providers:
-    - 'openrouter': OpenRouter OpenAI-compatible API with automatic free-model fallback.
-    - 'openai': Official OpenAI API.
+    - 'openai': Official OpenAI API (Priority 1).
+    - 'gemini': Google Gemini API via OpenAI-compatible endpoint with multi-key failover (Priority 2).
+    - 'openrouter': OpenRouter API with automatic free-model catalog fallback (Priority 3).
 
     Args:
-        provider: 'openrouter' or 'openai' (defaults to settings.MODEL_PROVIDER).
+        provider: 'openai', 'gemini', or 'openrouter' (defaults to settings.MODEL_PROVIDER).
         model_name: Target model identifier.
         temperature: Sampling temperature (default 0.0 for deterministic output).
         fallback_models: Explicit list of fallback model IDs for OpenRouter.
-        enable_fallback: If True, attaches dynamic fallback models array for OpenRouter.
+        enable_fallback: If True, attaches dynamic fallback models chain.
 
     Returns:
         Configured BaseChatModel instance.
@@ -301,10 +370,10 @@ def get_chat_model(
             extra_body=extra_body if extra_body else None,
         )
 
-    elif selected_provider == "openai":
-        # Circuit-breaker fast-path: if OpenAI is known unhealthy and fallback is enabled, directly return OpenRouter model
-        if enable_fallback and settings.OPENROUTER_API_KEY and is_provider_unhealthy("openai"):
-            logger.info("Provider 'openai' is currently marked unhealthy in circuit-breaker cache. Bypassing directly to OpenRouter.")
+    elif selected_provider == "gemini":
+        # Fast circuit-breaker: if all Gemini keys are unhealthy and OpenRouter key is available, bypass directly to OpenRouter
+        if enable_fallback and settings.OPENROUTER_API_KEY and is_gemini_unhealthy():
+            logger.info("Provider 'gemini' is currently marked unhealthy in circuit-breaker cache. Bypassing directly to OpenRouter.")
             return get_chat_model(
                 provider="openrouter",
                 fallback_models=fallback_models,
@@ -312,16 +381,10 @@ def get_chat_model(
                 temperature=temperature,
             )
 
-        api_key = settings.OPENAI_API_KEY
-        if not api_key:
-            raise ValueError("OPENAI_API_KEY environment variable is required when MODEL_PROVIDER=openai")
-
-        target_model = model_name or settings.OPENAI_MODEL
-        primary_model = CircuitBreakerChatOpenAI(
-            model=target_model,
-            api_key=api_key,
+        primary_model = _build_gemini_model(
+            model_name=model_name,
             temperature=temperature,
-            request_timeout=settings.REQUEST_TIMEOUT_SEC,
+            enable_key_fallback=enable_fallback,
         )
 
         if enable_fallback and settings.OPENROUTER_API_KEY:
@@ -334,20 +397,88 @@ def get_chat_model(
                 )
                 return primary_model.with_fallbacks([or_model])
             except Exception as exc:
-                logger.warning(f"Could not configure OpenRouter fallback for OpenAI model: {exc}")
+                logger.warning(f"Could not configure OpenRouter fallback for Gemini model: {exc}")
+
+        return primary_model
+
+    elif selected_provider == "openai":
+        # Fast circuit-breaker: if OpenAI is unhealthy, bypass directly to next healthy tier
+        if enable_fallback and is_provider_unhealthy("openai"):
+            if settings.get_gemini_api_keys() and not is_gemini_unhealthy():
+                logger.info("Provider 'openai' is currently marked unhealthy in circuit-breaker cache. Bypassing directly to Gemini.")
+                return get_chat_model(
+                    provider="gemini",
+                    enable_fallback=True,
+                    temperature=temperature,
+                )
+            elif settings.OPENROUTER_API_KEY:
+                logger.info("Providers 'openai' and 'gemini' are marked unhealthy. Bypassing directly to OpenRouter.")
+                return get_chat_model(
+                    provider="openrouter",
+                    fallback_models=fallback_models,
+                    enable_fallback=True,
+                    temperature=temperature,
+                )
+
+        api_key = settings.OPENAI_API_KEY
+        if not api_key:
+            raise ValueError("OPENAI_API_KEY environment variable is required when MODEL_PROVIDER=openai")
+
+        target_model = model_name or settings.OPENAI_MODEL
+        primary_model = CircuitBreakerChatOpenAI(
+            model=target_model,
+            api_key=api_key,
+            temperature=temperature,
+            request_timeout=settings.REQUEST_TIMEOUT_SEC,
+            provider_name="openai",
+        )
+
+        if enable_fallback:
+            tier_fallbacks: List[BaseChatModel] = []
+            # Priority 2: Gemini
+            if settings.get_gemini_api_keys():
+                try:
+                    gemini_model = get_chat_model(
+                        provider="gemini",
+                        enable_fallback=False,
+                        temperature=temperature,
+                    )
+                    tier_fallbacks.append(gemini_model)
+                except Exception as exc:
+                    logger.warning(f"Could not configure Gemini fallback for OpenAI model: {exc}")
+
+            # Priority 3: OpenRouter
+            if settings.OPENROUTER_API_KEY:
+                try:
+                    or_model = get_chat_model(
+                        provider="openrouter",
+                        fallback_models=fallback_models,
+                        enable_fallback=True,
+                        temperature=temperature,
+                    )
+                    tier_fallbacks.append(or_model)
+                except Exception as exc:
+                    logger.warning(f"Could not configure OpenRouter fallback for OpenAI model: {exc}")
+
+            if tier_fallbacks:
+                return primary_model.with_fallbacks(tier_fallbacks)
 
         return primary_model
 
     else:
         raise ValueError(
-            f"Unsupported MODEL_PROVIDER '{selected_provider}'. Supported values: 'openrouter', 'openai'."
+            f"Unsupported MODEL_PROVIDER '{selected_provider}'. Supported values: 'openai', 'gemini', 'openrouter'."
         )
 
 
 def get_default_model_name() -> str:
     """Return the active configured default model identifier based on settings."""
-    provider = (settings.MODEL_PROVIDER or "openrouter").lower().strip()
-    if provider == "openrouter":
+    provider = (settings.MODEL_PROVIDER or "openai").lower().strip()
+    if provider == "openai":
+        return settings.OPENAI_MODEL or "gpt-4o-mini"
+    elif provider == "gemini":
+        return settings.GEMINI_MODEL or "gemini-2.5-flash"
+    elif provider == "openrouter":
         return settings.OPENROUTER_MODEL or "openrouter/free"
     return settings.OPENAI_MODEL or "gpt-4o-mini"
 

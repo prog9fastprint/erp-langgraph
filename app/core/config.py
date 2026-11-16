@@ -1,7 +1,7 @@
 """
 Application Configuration settings loaded from environment variables and .env file.
 """
-from typing import Optional
+from typing import Optional, List
 from pydantic import Field, AliasChoices
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -42,16 +42,40 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("REQUEST_TIMEOUT_SEC", "REQUEST_TIMEOUT"),
     )
 
-    # 2. LLM Provider Selection: 'openrouter' or 'openai'
-    MODEL_PROVIDER: str = "openrouter"
+    # 2. LLM Provider Priority: 1. OpenAI -> 2. Gemini -> 3. OpenRouter
+    MODEL_PROVIDER: str = "openai"
 
-    # OpenRouter Configuration
+    # OpenAI Configuration (Priority 1)
+    OPENAI_API_KEY: Optional[str] = None
+    OPENAI_MODEL: str = "gpt-4o-mini"
+
+    # Google Gemini Configuration (Priority 2)
+    GOOGLE_AI_API_KEY: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("GOOGLE_AI_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY"),
+    )
+    GOOGLE_AI_API_KEY_2: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("GOOGLE_AI_API_KEY_2", "GEMINI_API_KEY_2"),
+    )
+    GOOGLE_AI_API_KEY_3: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("GOOGLE_AI_API_KEY_3", "GEMINI_API_KEY_3"),
+    )
+    GEMINI_MODEL: str = Field(default="gemini-2.5-flash", validation_alias="GEMINI_MODEL")
+    GEMINI_MODEL_OCR_AIR: str = Field(default="gemini-2.5-flash", validation_alias="GEMINI_MODEL_OCR_AIR")
+
+    # OpenRouter Configuration (Priority 3)
     OPENROUTER_API_KEY: Optional[str] = None
     OPENROUTER_MODEL: str = "nvidia/nemotron-3.5-super-vl:free"
 
-    # OpenAI Configuration
-    OPENAI_API_KEY: Optional[str] = None
-    OPENAI_MODEL: str = "gpt-4o-mini"
+    def get_gemini_api_keys(self) -> List[str]:
+        """Return all non-empty configured Google Gemini API keys in priority order."""
+        keys: List[str] = []
+        for k in [self.GOOGLE_AI_API_KEY, self.GOOGLE_AI_API_KEY_2, self.GOOGLE_AI_API_KEY_3]:
+            if k and str(k).strip():
+                keys.append(str(k).strip())
+        return keys
 
     # 3. LangGraph & Tools Settings
     USE_DYNAMIC_TOOLS: bool = False
@@ -75,7 +99,7 @@ class Settings(BaseSettings):
     )
     GEMINI_API_KEY: Optional[str] = Field(
         default=None,
-        validation_alias=AliasChoices("GEMINI_API_KEY", "GOOGLE_API_KEY"),
+        validation_alias=AliasChoices("GEMINI_API_KEY", "GOOGLE_AI_API_KEY", "GOOGLE_API_KEY"),
     )
     GEMINI_EMBEDDING_MODEL: str = Field(default="gemini-embedding-001", validation_alias="GEMINI_EMBEDDING_MODEL")
 
