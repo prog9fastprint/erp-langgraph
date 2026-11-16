@@ -83,30 +83,39 @@ BRANCH_COMPANY_MAP: Dict[str, int] = {
     "ho": 3,
     "main store": 4,
     "mainstore": 4,
+    "ms": 4,
     "makasar": 5,
     "makassar": 5,
     "fp makasar": 5,
     "fp makassar": 5,
+    "mks": 5,
     "bandung": 6,
     "fp bandung": 6,
+    "bdg": 6,
     "surabaya": 7,
     "fp surabaya": 7,
     "surabaya mt": 7,
     "surabaya mth": 7,
+    "sby": 7,
     "jakarta": 8,
     "fp jakarta": 8,
+    "jkt": 8,
     "toko fast print surabaya": 9,
     "toko surabaya": 9,
     "medan": 10,
     "fp medan": 10,
+    "mdn": 10,
     "hr": 11,
     "sandy": 12,
     "bekasi": 13,
     "fp bekasi": 13,
+    "bks": 13,
     "tangerang": 14,
     "fp tangerang": 14,
+    "tgr": 14,
     "malang": 15,
     "fp malang": 15,
+    "mlg": 15,
     "fastmart": 17,
     "pusat": 1,
 }
@@ -145,7 +154,19 @@ ALL_COMPANIES_KEYWORDS = (
     "all branch",
     "all companies",
     "total nasional",
+    "semua lokasi",
+    "setiap lokasi",
+    "semua gudang",
+    "seluruh gudang",
+    "setiap gudang",
+    "distribusi stok",
+    "semua rak",
+    "setiap rak",
 )
+
+LOCATION_STOP_WORDS = {
+    "setiap", "semua", "seluruh", "tiap", "masing-masing", "all", "every", "each", "gudang", "rak",
+}
 
 TEMPORAL_KEYWORDS = (
     "bulan", "hari", "minggu", "tahun", "kemarin", "today", "yesterday",
@@ -869,6 +890,51 @@ def _fallback_extract_bank_reconciliation(query: str, ref_date: Optional[date] =
     return params
 
 
+def try_fast_path_stock_extraction(
+    sub_query: str,
+    user_query: str,
+    company_id: Optional[int] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    Fast-path (< 5ms) deterministic parameter extractor for single product stock level inquiries.
+    Matches explicit SKU/code patterns (e.g. 'SKU 91010600', 'kode 91010600', '91010600', 'FP-KARET-42').
+    Bypasses expensive LLM calls when query is simple and unambiguous.
+    """
+    target_text = sub_query if sub_query else user_query
+    if not target_text:
+        return None
+    cleaned = target_text.strip()
+
+    # If query mentions temporal filters (date ranges, history), let LLM extract
+    temporal_check = cleaned.lower()
+    if any(re.search(rf"\b{kw}\b", temporal_check) for kw in ("tanggal", "bulan", "tahun", "riwayat", "history", "mutasi")):
+        return None
+
+    # Check for explicit SKU pattern:
+    # 1. 'SKU [code]' or 'kode [code]' or 'item [code]'
+    m = re.search(r"\b(?:sku|kode(?:\s+produk|\s+barang)?|item)\s*[:#]?\s*([A-Za-z0-9._\-\/]{4,35})\b", cleaned, re.IGNORECASE)
+    # 2. Or pure 7-14 digit numeric SKU / barcode (e.g. 91010600)
+    if not m:
+        m = re.search(r"\b([0-9]{7,14})\b", cleaned)
+
+    if m:
+        raw_code = m.group(1).strip()
+        code_val = clean_product_identifier(raw_code)
+        # Avoid matching numbers that are common years or non-product tokens
+        invalid_tokens = {"setiap", "gudang", "lokasi", "distribusi", "semua", "cabang", "2024", "2025", "2026", "2027"}
+        if code_val and code_val.lower() not in invalid_tokens:
+            params: Dict[str, Any] = {
+                "code": code_val,
+                "include_breakdown": True,
+                "limit": 100,
+                "offset": 0,
+            }
+            if company_id:
+                params["company_id"] = company_id
+            return params
+    return None
+
+
 def _extract_single_tool_params(
     plan: Dict[str, Any],
     all_plans: List[Dict[str, Any]],
@@ -900,8 +966,14 @@ def _extract_single_tool_params(
 
     extracted_dict: Optional[Dict[str, Any]] = None
 
+    # 0. Fast-Path Deterministic Extraction (Tier 1)
+    if tool_name == "get_stock_level" and retry_count == 0:
+        fast_params = try_fast_path_stock_extraction(sub_query, user_query, state.get("company_id"))
+        if fast_params:
+            extracted_dict = dict(fast_params)
+
     # 1. LLM Structured Output Attempt
-    if model is not None:
+    if extracted_dict is None and model is not None:
         try:
             _, last_day_num = calendar.monthrange(today.year, today.month)
             month_start = today.replace(day=1).strftime("%Y-%m-%d")
@@ -1169,8 +1241,14 @@ def _extract_single_tool_params(
     detected_branch = resolve_branch_company_id(sub_query) or resolve_branch_company_id(user_query)
     if detected_branch:
         extracted_dict["company_id"] = detected_branch
-    elif not extracted_dict.get("company_id") and state.get("company_id"):
+    elif state.get("company_id"):
         extracted_dict["company_id"] = state.get("company_id")
+
+    # Clean location_name stop-words (e.g. 'setiap', 'semua', 'gudang', 'rak')
+    if "location_name" in extracted_dict and extracted_dict["location_name"]:
+        loc_val = str(extracted_dict["location_name"]).lower().strip()
+        if loc_val in LOCATION_STOP_WORDS:
+            extracted_dict.pop("location_name", None)
 
     # For get_stock_level: prevent LLM from setting product_id to SKU or internal code when code/name is present
     if tool_name == "get_stock_level" and extracted_dict.get("product_id") and extracted_dict.get("code"):
@@ -1314,11 +1392,37 @@ def extractor_node(
     # Multi-tool extraction iteration (preserve already-VALID or strict-doc plans on retry)
     multi_status = state.get("multi_verification_status") or {}
     tool_counts = compute_multi_tool_counts(working_active_tools)
+
+    plans_to_extract = []
     for idx, plan in enumerate(working_active_tools):
         t_name = plan.get("tool", "unnamed_tool")
         key = get_multi_tool_key(t_name, idx, tool_counts)
         if retry_count > 0 and should_preserve_plan_on_retry(plan, key, multi_status):
             continue
+        plans_to_extract.append((idx, plan))
+
+    if len(plans_to_extract) > 1:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=min(len(plans_to_extract), 4)) as executor:
+            futures = [
+                executor.submit(
+                    _extract_single_tool_params,
+                    plan,
+                    working_active_tools,
+                    user_query,
+                    state,
+                    model,
+                    today,
+                    retry_count,
+                    retry_instruction,
+                )
+                for _, plan in plans_to_extract
+            ]
+            extracted_results = [f.result() for f in futures]
+        for (_, plan), extracted in zip(plans_to_extract, extracted_results):
+            plan["params"] = extracted
+    elif len(plans_to_extract) == 1:
+        _, plan = plans_to_extract[0]
         extracted = _extract_single_tool_params(
             plan=plan,
             all_plans=working_active_tools,
@@ -1353,18 +1457,25 @@ def extractor_node(
         result_update["company_id"] = primary_cid
         primary_params["company_id"] = primary_cid
     else:
-        branch_co_id = (
-            resolve_branch_company_id(user_query)
-            or primary_params.get("company_id")
-        )
-        if branch_co_id is not None:
-            result_update["company_id"] = branch_co_id
+        explicit_branch = resolve_branch_company_id(user_query)
+        if explicit_branch is not None:
+            result_update["company_id"] = explicit_branch
             for plan_item in working_active_tools:
                 plan_params = plan_item.setdefault("params", {})
-                if not plan_params.get("company_id") or plan_params.get("company_id") == state.get("company_id"):
-                    plan_params["company_id"] = branch_co_id
-            primary_params["company_id"] = branch_co_id
+                if plan_params:
+                    plan_params["company_id"] = explicit_branch
+            if primary_params:
+                primary_params["company_id"] = explicit_branch
         elif state.get("company_id") is not None:
-            result_update["company_id"] = state.get("company_id")
+            session_cid = state.get("company_id")
+            result_update["company_id"] = session_cid
+            for plan_item in working_active_tools:
+                plan_params = plan_item.get("params")
+                if isinstance(plan_params, dict) and "company_id" in plan_params:
+                    plan_params["company_id"] = session_cid
+            if "company_id" in primary_params:
+                primary_params["company_id"] = session_cid
+        elif primary_params.get("company_id") is not None:
+            result_update["company_id"] = primary_params["company_id"]
 
     return result_update

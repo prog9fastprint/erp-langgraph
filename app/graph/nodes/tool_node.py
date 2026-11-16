@@ -76,7 +76,12 @@ async def _execute_single_tool(
         ]
 
     # Pre-lookup for stock location_name -> location_id or warehouse_id
-    if tool_name == "get_stock_level" and clean_params.get("location_name") and not clean_params.get("location_id") and not clean_params.get("warehouse_id"):
+    from app.graph.nodes.extractor import LOCATION_STOP_WORDS
+    loc_cand = str(clean_params.get("location_name") or "").strip().lower()
+    if loc_cand in LOCATION_STOP_WORDS:
+        clean_params.pop("location_name", None)
+        loc_cand = ""
+    if tool_name == "get_stock_level" and loc_cand and not clean_params.get("location_id") and not clean_params.get("warehouse_id"):
         try:
             loc_res = await erp_client.fetch_locations(
                 params={"search": clean_params["location_name"]},

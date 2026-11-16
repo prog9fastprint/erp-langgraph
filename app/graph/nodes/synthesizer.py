@@ -786,8 +786,8 @@ def _format_multi_company_presentation(state: AgentState) -> str:
     # 4. Stock Level Multi-Company Presentation
     elif tool == "get_stock_level":
         lines.append("### Laporan Ketersediaan Stok Multi-Cabang (Combined Stock Level)\n")
-        lines.append("| No | Perusahaan / Cabang | SKU / Kode | Nama Produk | Kuantitas Fisik | Kuantitas Tersedia |")
-        lines.append("|:---|:---|:---|:---|:---|:---|")
+        lines.append("| No | Perusahaan / Cabang | SKU / Kode | Nama Produk | Gudang | Lokasi / Rak | Qty Fisik | Qty Siap Jual |")
+        lines.append("|:---|:---|:---|:---|:---|:---|:---|:---|")
         tot_qty = 0.0
         tot_avail = 0.0
         row_idx = 1
@@ -797,7 +797,7 @@ def _format_multi_company_presentation(state: AgentState) -> str:
             res = mc_results.get(cid)
             if not res:
                 st_text = "Akses Dibatasi (HTTP 403)" if cid in unauth else "Tidak Ada Data"
-                lines.append(f"| {row_idx} | {c_name} | - | - | - | *{st_text}* |")
+                lines.append(f"| {row_idx} | {c_name} | - | - | - | - | - | *{st_text}* |")
                 row_idx += 1
                 continue
 
@@ -807,17 +807,30 @@ def _format_multi_company_presentation(state: AgentState) -> str:
                 p_name = it.get("product_name") or it.get("name") or "-"
                 qty = float(it.get("quantity", it.get("qty_on_hand", 0.0)) or 0.0)
                 avail = float(it.get("available_quantity", qty) or 0.0)
+                breakdown = it.get("breakdown") or []
 
                 tot_qty += qty
                 tot_avail += avail
 
+                if breakdown:
+                    wh_list = [bd.get("warehouse_name") or f"WH #{bd.get('warehouse_id')}" for bd in breakdown if bd.get("warehouse_name") or bd.get("warehouse_id")]
+                    loc_list = [bd.get("location_name") or f"Rak #{bd.get('location_id')}" for bd in breakdown if bd.get("location_name") or bd.get("location_id")]
+                    wh_str = ", ".join(dict.fromkeys(wh_list)) if wh_list else "-"
+                    loc_str = ", ".join(dict.fromkeys(loc_list)) if loc_list else "-"
+                else:
+                    wh_str = it.get("warehouse_name") or "-"
+                    loc_str = it.get("location_name") or "-"
+
+                avail_str = f"**{avail:g} unit**" if avail > 0 else "0 unit"
+                qty_str = f"{qty:g} unit" if qty > 0 else "0 unit"
+
                 lines.append(
-                    f"| {row_idx} | {c_name} | `{sku}` | {p_name} | {qty:g} | **{avail:g}** |"
+                    f"| {row_idx} | {c_name} | `{sku}` | {p_name} | {wh_str} | {loc_str} | {qty_str} | {avail_str} |"
                 )
                 row_idx += 1
 
         lines.append(
-            f"| | **TOTAL NASIONAL** | | | **{tot_qty:g}** | **{tot_avail:g}** |"
+            f"| | **TOTAL NASIONAL** | | | | | **{tot_qty:g} unit** | **{tot_avail:g} unit** |"
         )
 
     # 5. Vendor Invoices / Vendor Bills Multi-Company Presentation
@@ -1464,7 +1477,8 @@ def synthesizer_node(
                 "1. Wajib hanya menyarankan pertanyaan penelusuran data (READ-ONLY) pada modul FastPrint ERP. DILARANG menyarankan aksi membuat/mengubah transaksi.\n"
                 "2. Wajib menggunakan entitas riil (kode SKU, nama vendor, kode akun, nama gudang) yang terdapat pada data di atas.\n"
                 "3. DILARANG KERAS menggunakan karakter emoji pada label, query, maupun icon.\n"
-                "4. Formatkan rekomendasi di akhir respons dalam blok JSON khusus berikut:\n"
+                "4. Panjang teks query rekomendasi WAJIB SINGKAT dan FOKUS SATU INTENSI (maksimal 10-12 kata, contoh: 'Cek mutasi kartu stok SKU ...', 'Cek stok SKU ... di semua cabang'). DILARANG membuat kalimat majemuk bertingkat yang berbelit-belit.\n"
+                "5. Formatkan rekomendasi di akhir respons dalam blok JSON khusus berikut:\n"
                 "```json:followups\n"
                 "[\n"
                 '  {"label": "Label Singkat (1-3 kata)", "query": "Prompt lengkap yang akan dieksekusi", "icon": "fa-arrow-right"}\n'

@@ -601,27 +601,40 @@ def classify_query_rule_based(query: str) -> Optional[Dict[str, Any]]:
         candidates.append(("get_stock_level", "inventory", m_stock.start()))
 
     # Inventory: Locations (Rak / Lokasi Penyimpanan)
+    # When stock inquiry is matched, stock breakdown already reports locations/racks;
+    # only add get_locations if explicit listing terms like 'daftar gudang' / 'gudang aktif' appear
     m_loc = _find_first_match(INVENTORY_LOCATION_PATTERNS, cleaned)
     if m_loc and not m_warehouses:
-        candidates.append(("get_locations", "inventory", m_loc.start()))
+        if m_stock:
+            explicit_location_listing = [
+                r"\b(daftar|list)\s+(gudang|lokasi|rak)\b",
+                r"\b(gudang|lokasi|rak)\s+(apa\s+saja|aktif|tersedia)\b",
+                r"\bada\s+(gudang|lokasi|rak)\b",
+            ]
+            if _find_first_match(explicit_location_listing, cleaned):
+                candidates.append(("get_locations", "inventory", m_loc.start()))
+        else:
+            candidates.append(("get_locations", "inventory", m_loc.start()))
 
     # Inventory: Product info
     if not is_rag:
-        # If stock level pattern matched, only add product_info if explicit product detail terms are present
-        # (avoid treating "stok produk ..." or "produk ... berapa stoknya" as a separate product_info tool call)
-        explicit_product_patterns = [
-            r"\bharga(nya)?\b",
-            r"\bharga\s+(barang|jual|beli)?(nya)?\b",
-            r"\bharga barang\b",
-            r"\bharga jual\b",
-            r"\bharga beli\b",
-            r"\bdetail barang\b",
-            r"\bsku\b",
-            r"\bbarcode\b",
-            r"\bvarian\b",
-        ]
+        # If stock level pattern matched, only add product_info if explicit product catalog detail terms are present
+        # (avoid treating "stok produk ...", "sku ...", or "barcode ..." as a separate product_info tool call)
         if m_stock:
-            m_prod = _find_first_match(explicit_product_patterns, cleaned)
+            explicit_catalog_patterns = [
+                r"\bharga(nya)?\b",
+                r"\bharga\s+(barang|jual|beli)?(nya)?\b",
+                r"\bharga barang\b",
+                r"\bharga jual\b",
+                r"\bharga beli\b",
+                r"\bdetail barang\b",
+                r"\bvarian\b",
+                r"\bkategori\b",
+                r"\bsatuan\b",
+                r"\buom\b",
+                r"\bpricelist\b",
+            ]
+            m_prod = _find_first_match(explicit_catalog_patterns, cleaned)
         else:
             m_prod = _find_first_match(INVENTORY_PRODUCT_PATTERNS, cleaned)
 

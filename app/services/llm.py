@@ -33,6 +33,55 @@ DEFAULT_CURATED_FREE_MODELS = [
     "recursive/flint-v1.0:free",
 ]
 
+# Provider outage tracker for fast circuit-breaker failover
+_PROVIDER_OUTAGE_LOCK = threading.Lock()
+_PROVIDER_OUTAGE_UNTIL: Dict[str, float] = {}
+
+
+def is_provider_unhealthy(provider: str) -> bool:
+    """Check if the specified provider is temporarily marked unhealthy (outage cache)."""
+    with _PROVIDER_OUTAGE_LOCK:
+        return time.time() < _PROVIDER_OUTAGE_UNTIL.get(provider.lower().strip(), 0.0)
+
+
+def mark_provider_unhealthy(provider: str, duration_sec: float = 900.0) -> None:
+    """Temporarily mark a provider as unhealthy to bypass futile network calls."""
+    with _PROVIDER_OUTAGE_LOCK:
+        _PROVIDER_OUTAGE_UNTIL[provider.lower().strip()] = time.time() + duration_sec
+
+
+def reset_provider_health(provider: Optional[str] = None) -> None:
+    """Reset unhealthy status for a specific provider or all providers."""
+    with _PROVIDER_OUTAGE_LOCK:
+        if provider:
+            _PROVIDER_OUTAGE_UNTIL.pop(provider.lower().strip(), None)
+        else:
+            _PROVIDER_OUTAGE_UNTIL.clear()
+
+
+class CircuitBreakerChatOpenAI(ChatOpenAI):
+    """ChatOpenAI wrapper that flags the 'openai' provider as unhealthy upon auth/quota failures."""
+
+    def invoke(self, *args, **kwargs):
+        try:
+            return super().invoke(*args, **kwargs)
+        except Exception as exc:
+            err_str = str(exc).lower()
+            if "expired" in err_str or "401" in err_str or "authenticationerror" in err_str or "invalid api key" in err_str:
+                mark_provider_unhealthy("openai", duration_sec=900.0)
+                logger.warning(f"OpenAI authentication failure detected. Marked provider 'openai' unhealthy for 15m: {exc}")
+            raise
+
+    async def ainvoke(self, *args, **kwargs):
+        try:
+            return await super().ainvoke(*args, **kwargs)
+        except Exception as exc:
+            err_str = str(exc).lower()
+            if "expired" in err_str or "401" in err_str or "authenticationerror" in err_str or "invalid api key" in err_str:
+                mark_provider_unhealthy("openai", duration_sec=900.0)
+                logger.warning(f"OpenAI authentication failure detected. Marked provider 'openai' unhealthy for 15m: {exc}")
+            raise
+
 
 def _sync_fetch_free_models_catalog(
     api_key: Optional[str] = None,
@@ -253,12 +302,22 @@ def get_chat_model(
         )
 
     elif selected_provider == "openai":
+        # Circuit-breaker fast-path: if OpenAI is known unhealthy and fallback is enabled, directly return OpenRouter model
+        if enable_fallback and settings.OPENROUTER_API_KEY and is_provider_unhealthy("openai"):
+            logger.info("Provider 'openai' is currently marked unhealthy in circuit-breaker cache. Bypassing directly to OpenRouter.")
+            return get_chat_model(
+                provider="openrouter",
+                fallback_models=fallback_models,
+                enable_fallback=True,
+                temperature=temperature,
+            )
+
         api_key = settings.OPENAI_API_KEY
         if not api_key:
             raise ValueError("OPENAI_API_KEY environment variable is required when MODEL_PROVIDER=openai")
 
         target_model = model_name or settings.OPENAI_MODEL
-        primary_model = ChatOpenAI(
+        primary_model = CircuitBreakerChatOpenAI(
             model=target_model,
             api_key=api_key,
             temperature=temperature,
