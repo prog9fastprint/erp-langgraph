@@ -295,6 +295,55 @@ class TestSynthesizerNodeExecution(unittest.TestCase):
         self.assertEqual(update["suggested_followups"][0]["query"], "Cek riwayat kartu stok HVS A4")
         self.assertEqual(update["suggested_followups"][1]["label"], "Stok Cabang Lain")
 
+    def test_synthesizer_extracts_llm_followups_from_object_block_with_header(self):
+        """Synthesizer extracts raw JSON object followups with 'Rekomendasi lanjutan' header and cleans markdown."""
+        mock_llm = MagicMock()
+        mock_response = MagicMock()
+        mock_response.content = (
+            "Berikut ringkasan stok produk FP KARET STEMPEL FLASH BULAT 42 (SKU 91010600):\n"
+            "- Total Stok: 1.500 pcs\n\n"
+            "Rekomendasi lanjutan (READ-ONLY)\n"
+            "{\n"
+            '  "followups": [\n'
+            '    {\n'
+            '      "label": "📦 Distribusi Stok",\n'
+            '      "query": "Apakah distribusi stok SKU 91010600 di setiap gudang/rak?",\n'
+            '      "icon": "📦"\n'
+            '    },\n'
+            '    {\n'
+            '      "label": "⏰ Tagihan Overdue",\n'
+            '      "query": "Apakah ada tagihan overdue untuk produk SKU 91010600?",\n'
+            '      "icon": "⏰"\n'
+            '    },\n'
+            '    {\n'
+            '      "label": "🏦 Rekonsiliasi Bank",\n'
+            '      "query": "Apakah ada selisih rekonsiliasi rekening bank terkait SKU 91010600?",\n'
+            '      "icon": "🏦"\n'
+            '    }\n'
+            '  ]\n'
+            "}"
+        )
+        mock_llm.invoke.return_value = mock_response
+
+        state = create_initial_state(user_query="Cek stok SKU 91010600")
+        state["detected_domain"] = "inventory"
+        state["detected_tool"] = "get_stock_level"
+        state["verification_status"] = "VALID"
+        state["extracted_params"] = {"code": "91010600"}
+
+        update = synthesizer_node(state, llm=mock_llm)
+        self.assertNotIn("Rekomendasi lanjutan", update["final_answer"])
+        self.assertNotIn('"followups"', update["final_answer"])
+        self.assertIn("Berikut ringkasan stok produk FP KARET STEMPEL FLASH BULAT 42 (SKU 91010600):", update["final_answer"])
+        self.assertIn("suggested_followups", update)
+        self.assertEqual(len(update["suggested_followups"]), 3)
+        self.assertEqual(update["suggested_followups"][0]["label"], "Distribusi Stok")
+        self.assertEqual(update["suggested_followups"][0]["icon"], "fa-arrow-right")
+        self.assertEqual(update["suggested_followups"][1]["label"], "Tagihan Overdue")
+        self.assertEqual(update["suggested_followups"][1]["icon"], "fa-arrow-right")
+        self.assertEqual(update["suggested_followups"][2]["label"], "Rekonsiliasi Bank")
+        self.assertEqual(update["suggested_followups"][2]["icon"], "fa-arrow-right")
+
     def test_deterministic_followups_inventory_with_sku(self):
         """Deterministic followups generate SKU-specific queries when product code exists."""
         state = create_initial_state(user_query="Cek stok PRN-L3110")

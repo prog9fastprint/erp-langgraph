@@ -1116,10 +1116,30 @@ def format_deterministic_answer(state: AgentState) -> str:
     return _format_single_tool_presentation(tool, tool_result)
 
 
+def _clean_label_emojis(label: str) -> str:
+    """Strip emojis and decorative symbols from follow-up chip label."""
+    if not label:
+        return ""
+    cleaned = re.sub(r"[\U00010000-\U0010ffff\u2600-\u27bf\u2300-\u23ff\u2b50-\u2b55\u200d\ufe0f]", "", label)
+    cleaned = re.sub(r"^[\s\-_:•>→↪]+", "", cleaned)
+    return cleaned.strip()[:35]
+
+
+def _clean_trailing_followup_headers(text: str) -> str:
+    """Strip preceding headers like 'Rekomendasi lanjutan (READ-ONLY)' from markdown answer."""
+    header_pat = re.compile(
+        r"(?:\n\s*)*\n\s*(?:#{1,4}\s*)?(?:\*\*|__)?\s*Rekomendasi\s+(?:Lanjutan|Tindak\s+Lanjut)[^\n]*?(?:\*\*|__)?[:\s]*\s*$",
+        re.IGNORECASE,
+    )
+    return header_pat.sub("", text).strip()
+
+
 def _extract_llm_followups(llm_output: str) -> Tuple[str, List[Dict[str, str]]]:
     """
     Extract structured follow-up recommendations from LLM output block.
-    Supports ```json:followups ... ```, ```json ... ```, or [FOLLOWUPS] ... [/FOLLOWUPS].
+    Supports ```json:followups ... ```, ```json ... ```, [FOLLOWUPS] ... [/FOLLOWUPS],
+    or raw trailing JSON objects containing 'followups'.
+    Normalizes icons to clean monochrome 'fa-arrow-right' and strips emoji residue.
 
     Returns:
         Tuple of (clean_markdown_answer, list_of_followup_dicts)
@@ -1131,52 +1151,49 @@ def _extract_llm_followups(llm_output: str) -> Tuple[str, List[Dict[str, str]]]:
     followups: List[Dict[str, str]] = []
     clean_text = raw
 
-    # 1. Match codeblock pattern: ```(?:json:followups|json)?\s*(\[\s*\{.*?\}\s*\])\s*```
-    codeblock_pat = re.compile(
-        r"```(?:json:followups|json)?\s*(\[\s*\{.*?\}\s*\])\s*```",
-        re.DOTALL | re.IGNORECASE,
-    )
-    match = codeblock_pat.search(raw)
+    # Candidate extraction patterns:
+    # 1. Codeblocks: ```(?:json:followups|json)?\s*(\{[\s\S]*?\}|\[[\s\S]*?\])\s*```
+    # 2. Tagged: \[(?:FOLLOWUPS|SUGGESTED_FOLLOWUPS)\]\s*(\{[\s\S]*?\}|\[[\s\S]*?\])\s*\[/(?:FOLLOWUPS|SUGGESTED_FOLLOWUPS)\]
+    # 3. Trailing raw JSON object or array starting with { "followups" ... } or [ { "label" ... } ]
+    patterns = [
+        re.compile(r"```(?:json:followups|json)?\s*(\{[\s\S]*?\}|\[[\s\S]*?\])\s*```", re.IGNORECASE),
+        re.compile(r"\[(?:FOLLOWUPS|SUGGESTED_FOLLOWUPS)\]\s*(\{[\s\S]*?\}|\[[\s\S]*?\])\s*\[/(?:FOLLOWUPS|SUGGESTED_FOLLOWUPS)\]", re.IGNORECASE),
+        re.compile(r"(\{\s*\"(?:followups|suggested_followups|recommendations)\"\s*:\s*\[[\s\S]*?\]\s*\})", re.IGNORECASE),
+    ]
 
-    if match:
-        json_str = match.group(1).strip()
-        try:
-            parsed = json.loads(json_str)
-            if isinstance(parsed, list):
-                for item in parsed:
-                    if isinstance(item, dict) and item.get("label") and item.get("query"):
-                        followups.append({
-                            "label": str(item["label"]).strip()[:30],
-                            "query": str(item["query"]).strip(),
-                            "icon": str(item.get("icon", "fa-arrow-right")).strip() or "fa-arrow-right",
-                        })
-                if followups:
-                    clean_text = (raw[:match.start()] + raw[match.end():]).strip()
-        except Exception as exc:
-            logger.debug("Failed parsing LLM followups JSON block: %s", exc)
-
-    # 2. Tagged bracket pattern fallback: [FOLLOWUPS] ... [/FOLLOWUPS]
-    if not followups:
-        tagged_pat = re.compile(
-            r"\[FOLLOWUPS\]\s*(\[\s*\{.*?\}\s*\])\s*\[/FOLLOWUPS\]",
-            re.DOTALL | re.IGNORECASE,
-        )
-        t_match = tagged_pat.search(raw)
-        if t_match:
+    for pat in patterns:
+        match = pat.search(raw)
+        if match:
+            json_str = match.group(1).strip()
             try:
-                parsed = json.loads(t_match.group(1).strip())
+                parsed = json.loads(json_str)
+                items_list = []
                 if isinstance(parsed, list):
-                    for item in parsed:
-                        if isinstance(item, dict) and item.get("label") and item.get("query"):
-                            followups.append({
-                                "label": str(item["label"]).strip()[:30],
-                                "query": str(item["query"]).strip(),
-                                "icon": str(item.get("icon", "fa-arrow-right")).strip() or "fa-arrow-right",
-                            })
-                    if followups:
-                        clean_text = (raw[:t_match.start()] + raw[t_match.end():]).strip()
+                    items_list = parsed
+                elif isinstance(parsed, dict):
+                    for k in ("followups", "suggested_followups", "recommendations", "items"):
+                        if isinstance(parsed.get(k), list):
+                            items_list = parsed[k]
+                            break
+
+                for item in items_list:
+                    if isinstance(item, dict) and item.get("label") and item.get("query"):
+                        raw_label = str(item["label"]).strip()
+                        clean_label = _clean_label_emojis(raw_label) or raw_label[:35]
+                        followups.append({
+                            "label": clean_label,
+                            "query": str(item["query"]).strip(),
+                            "icon": "fa-arrow-right",
+                        })
+
+                if followups:
+                    prefix = raw[:match.start()]
+                    suffix = raw[match.end():]
+                    clean_prefix = _clean_trailing_followup_headers(prefix)
+                    clean_text = f"{clean_prefix}\n\n{suffix}".strip() if suffix.strip() else clean_prefix.strip()
+                    break
             except Exception as exc:
-                logger.debug("Failed parsing LLM tagged followups: %s", exc)
+                logger.debug("Failed parsing LLM followups pattern: %s", exc)
 
     return (clean_text, followups[:3])
 
@@ -1226,6 +1243,8 @@ def generate_deterministic_followups(state: AgentState) -> List[Dict[str, str]]:
                 "query": "/scope",
                 "icon": "fa-compass",
             })
+        for s in suggestions:
+            s["icon"] = "fa-arrow-right"
         return suggestions[:3]
 
     # 2. Inventory Domain
@@ -1373,6 +1392,8 @@ def generate_deterministic_followups(state: AgentState) -> List[Dict[str, str]]:
             "icon": "fa-compass",
         })
 
+    for s in suggestions:
+        s["icon"] = "fa-arrow-right"
     return suggestions[:3]
 
 
@@ -1442,12 +1463,14 @@ def synthesizer_node(
                 "ATURAN KETAT REKOMENDASI:\n"
                 "1. Wajib hanya menyarankan pertanyaan penelusuran data (READ-ONLY) pada modul FastPrint ERP. DILARANG menyarankan aksi membuat/mengubah transaksi.\n"
                 "2. Wajib menggunakan entitas riil (kode SKU, nama vendor, kode akun, nama gudang) yang terdapat pada data di atas.\n"
-                "3. Formatkan rekomendasi di akhir respons dalam blok JSON khusus berikut:\n"
+                "3. DILARANG KERAS menggunakan karakter emoji pada label, query, maupun icon.\n"
+                "4. Formatkan rekomendasi di akhir respons dalam blok JSON khusus berikut:\n"
                 "```json:followups\n"
                 "[\n"
-                '  {"label": "Label Singkat (1-3 kata)", "query": "Prompt lengkap yang akan dieksekusi", "icon": "fa-icon-name"}\n'
+                '  {"label": "Label Singkat (1-3 kata)", "query": "Prompt lengkap yang akan dieksekusi", "icon": "fa-arrow-right"}\n'
                 "]\n"
-                "```\n\n"
+                "```\n"
+                "DILARANG menuliskan judul pengantar seperti 'Rekomendasi lanjutan' atau teks apapun di luar blok kode json:followups.\n\n"
                 f"Pertanyaan Pengguna: {user_query}\n"
                 f"Data Laporan Terstruktur:\n{deterministic_answer}"
             )
