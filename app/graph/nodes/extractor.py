@@ -568,6 +568,8 @@ PRODUCT_STOPWORDS = {
     "detail", "spesifikasi", "stok", "stoknya", "produk", "product", "barang", "item", "sku", "kode", "ada",
     "dan", "serta", "di", "ke", "dari", "pada", "untuk", "ini", "itu",
     "nya", "semua", "daftar", "list",
+    # Anaphoric reference tokens
+    "tersebut", "tadi", "terkait", "dimaksud", "dia", "tersebutnya",
 }
 
 
@@ -614,11 +616,36 @@ def _fallback_extract_product_info(
         prior_msgs = history[:-1] if (history and cleaned and cleaned.lower() in str(getattr(history[-1], "content", "") or "").lower()) else history
         for prev_msg in reversed(prior_msgs):
             content = getattr(prev_msg, "content", "") or ""
-            prev_tokens = re.findall(r"\b([A-Z0-9]+(?:-[A-Z0-9]+)+|\d{4,8})\b", content)
+            is_human = isinstance(prev_msg, HumanMessage) or getattr(prev_msg, "type", "") == "human"
+
+            # 1. Check for explicit SKU pattern (e.g. SKU: 91030300) in AI or Human message
+            sku_m = re.search(r"\b(?:SKU|kode)\s*[:\-]?\s*([A-Za-z0-9\-]+|\d{3,14})\b", content, re.IGNORECASE)
+            if sku_m:
+                cand = clean_product_identifier(sku_m.group(1).rstrip("."))
+                if cand and not is_accounting_term(cand) and not is_account_code_or_name(cand):
+                    params["code"] = cand
+                    break
+
+            # 2. Check for alphanumeric SKU / code tokens (excluding pure 4-digit years like 2024..2030)
+            prev_tokens = re.findall(r"\b([A-Z0-9]+(?:-[A-Z0-9]+)+|\d{5,14})\b", content)
             if prev_tokens:
-                params["code"] = prev_tokens[0].rstrip(".")
-                break
+                token = prev_tokens[0].rstrip(".")
+                if not is_account_code_or_name(token) and not is_vendor_name(token):
+                    params["code"] = token
+                    break
+
+            # 3. For Human message: extract product from stock or product query
+            if is_human:
+                prev_stock = _fallback_extract_stock_level(content)
+                if prev_stock.get("code"):
+                    params["search"] = prev_stock["code"] if " " in str(prev_stock["code"]) else prev_stock["code"]
+                    break
+
+            # 4. Check product info heuristic extraction
             prev_info = _fallback_extract_product_info(content)
+            if prev_info.get("code") and not is_vendor_name(prev_info["code"]) and not is_account_code_or_name(prev_info["code"]) and not is_accounting_term(prev_info["code"]):
+                params["code"] = prev_info["code"]
+                break
             if prev_info.get("search") and not is_vendor_name(prev_info["search"]) and not is_account_code_or_name(prev_info["search"]) and not is_accounting_term(prev_info["search"]):
                 params["search"] = prev_info["search"]
                 break
@@ -1178,6 +1205,37 @@ def _extract_single_tool_params(
                 elif u_ext.get("search") and not is_vendor_name(u_ext["search"]) and not is_account_code_or_name(u_ext["search"]) and not is_accounting_term(u_ext["search"]):
                     extracted_dict["search"] = u_ext["search"]
 
+        # Tier 3: Conversation history entity resolution & previous turn inheritance
+        is_ref_inquiry = has_anaphoric_reference(sub_query) or has_anaphoric_reference(user_query)
+        needs_resolution = (not extracted_dict.get("code") and not extracted_dict.get("search") and not extracted_dict.get("product_id"))
+
+        # A. If referential query and exact SKU code is missing, prioritize exact SKU from prior tool_result
+        if (needs_resolution or is_ref_inquiry) and not extracted_dict.get("code"):
+            prior_tool_result = state.get("tool_result") or {}
+            if isinstance(prior_tool_result, dict):
+                res_prods = prior_tool_result.get("products")
+                if isinstance(res_prods, list) and res_prods and isinstance(res_prods[0], dict):
+                    first_prod = res_prods[0]
+                    prod_code = first_prod.get("code") or first_prod.get("default_code") or first_prod.get("sku")
+                    prod_name = first_prod.get("name")
+                    if prod_code and not is_accounting_term(str(prod_code)):
+                        extracted_dict["code"] = str(prod_code).strip()
+                        extracted_dict.pop("search", None)
+                    elif prod_name and not extracted_dict.get("search"):
+                        extracted_dict["search"] = str(prod_name).strip()
+
+        # B. Inspect previous turn's extracted_params if still unresolved
+        if not extracted_dict.get("code") and not extracted_dict.get("search") and not extracted_dict.get("product_id"):
+            prior_extracted = state.get("extracted_params") or {}
+            if prior_extracted.get("code"):
+                p_code = prior_extracted["code"]
+                if " " in str(p_code):
+                    extracted_dict["search"] = str(p_code).strip()
+                else:
+                    extracted_dict["code"] = str(p_code).strip()
+            elif prior_extracted.get("search"):
+                extracted_dict["search"] = prior_extracted["search"]
+
     elif tool_name == "fetch_vendor_invoices":
         if not extracted_dict.get("vendor_name") and not extracted_dict.get("vendor_id"):
             # Tier 1: Peer harvesting (Accounting domain)
@@ -1250,10 +1308,26 @@ def _extract_single_tool_params(
         if loc_val in LOCATION_STOP_WORDS:
             extracted_dict.pop("location_name", None)
 
-    # For get_stock_level: prevent LLM from setting product_id to SKU or internal code when code/name is present
-    if tool_name == "get_stock_level" and extracted_dict.get("product_id") and extracted_dict.get("code"):
+    # For get_stock_level & get_product_info: prevent LLM from setting product_id to SKU or internal code
+    if tool_name in ("get_stock_level", "get_product_info") and extracted_dict.get("product_id"):
+        raw_pid = extracted_dict["product_id"]
+        # If product_id looks like a SKU (>= 100000 or string >= 5 digits) and user didn't ask for "id: ..."
         if not re.search(r"\b(?:id|product_id)\s*[:=]?\s*\d+\b", user_query, re.IGNORECASE):
-            extracted_dict.pop("product_id", None)
+            if isinstance(raw_pid, (int, str)) and len(str(raw_pid)) >= 5:
+                if not extracted_dict.get("code") and not extracted_dict.get("search"):
+                    extracted_dict["code"] = str(raw_pid).strip()
+                extracted_dict.pop("product_id", None)
+            elif extracted_dict.get("code") or extracted_dict.get("search"):
+                extracted_dict.pop("product_id", None)
+
+    # For get_product_info: if code contains whitespace, it is a multi-word product name, NOT an exact SKU!
+    # Django get_product_info requires exact default_code for 'code', but matches names via 'search'.
+    if tool_name == "get_product_info" and extracted_dict.get("code"):
+        code_str = str(extracted_dict["code"]).strip()
+        if " " in code_str:
+            if not extracted_dict.get("search"):
+                extracted_dict["search"] = code_str
+            extracted_dict.pop("code", None)
 
     # Clean branch name noise from vendor_name if accidentally included
     if extracted_dict.get("vendor_name"):

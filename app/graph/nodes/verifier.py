@@ -333,11 +333,20 @@ def verifier_node(state: AgentState) -> Dict[str, Any]:
             "retry_instruction": preserved_replay,
         }
 
-    # Strict Identifier Guard: If querying a specific document number and 0 records found,
-    # terminate immediately with EMPTY to avoid wasting retries on hallucinated relaxations.
+    # Strict Identifier Guard: If querying a specific document number or specific product catalog item
+    # and 0 records found, terminate immediately with EMPTY to avoid wasting retries on hallucinated relaxations
+    # or dumping random generic catalog products.
     extracted_params = state.get("extracted_params") or {}
-    if has_strict_document_identifier(extracted_params):
-        logger.info("Specific document identifier search returned 0 records -> EMPTY (Strict Identifier Guard).")
+    tool = state.get("detected_tool")
+    is_strict_product_search = (
+        tool == "get_product_info"
+        and isinstance(extracted_params, dict)
+        and bool(extracted_params.get("code") or extracted_params.get("search") or extracted_params.get("product_id"))
+    )
+
+    if has_strict_document_identifier(extracted_params) or is_strict_product_search:
+        guard_type = "Strict Product Guard" if is_strict_product_search else "Strict Identifier Guard"
+        logger.info(f"Specific query returned 0 records -> EMPTY ({guard_type}).")
         return {
             "verification_status": "EMPTY",
             "retry_instruction": preserved_replay,

@@ -157,6 +157,20 @@ async def _execute_single_tool(
                     "MISSING_PRODUCT_IDENTIFIER: Mohon sertakan kode SKU, nama produk, atau nama gudang/cabang.",
                 )
 
+    # Defensive parameter mapping for get_product_info
+    if tool_name == "get_product_info":
+        raw_pid = clean_params.get("product_id")
+        if raw_pid and isinstance(raw_pid, (int, str)) and len(str(raw_pid)) >= 5:
+            if not clean_params.get("code") and not clean_params.get("search"):
+                clean_params["code"] = str(raw_pid).strip()
+            clean_params.pop("product_id", None)
+
+        raw_code = clean_params.get("code")
+        if raw_code and isinstance(raw_code, str) and " " in raw_code.strip():
+            if not clean_params.get("search"):
+                clean_params["search"] = raw_code.strip()
+            clean_params.pop("code", None)
+
     handler = dispatch_map.get(tool_name)
     if not handler:
         return None, f"Tool '{tool_name}' not registered in dispatch map"

@@ -71,7 +71,11 @@ def _append_pagination_footer(lines: List[str], displayed_count: int, total_coun
         )
 
 
-def _format_single_tool_presentation(tool: Optional[str], tool_result: Any) -> str:
+def _format_single_tool_presentation(
+    tool: Optional[str],
+    tool_result: Any,
+    user_query: Optional[str] = None,
+) -> str:
     """Format an individual tool's response payload into Markdown."""
     if not tool or not tool_result:
         return ""
@@ -427,31 +431,72 @@ def _format_single_tool_presentation(tool: Optional[str], tool_result: Any) -> s
 
     # 4. Product Info
     if tool == "get_product_info":
-        lines.append("### Informasi Master Produk (Catalog)\n")
         products = tool_result.get("products") if isinstance(tool_result, dict) else (
             tool_result if isinstance(tool_result, list) else [tool_result]
         )
         total_count = _extract_total_count(tool_result, len(products))
+        q_lower = (user_query or "").lower()
+        is_price_query = any(k in q_lower for k in ("harga", "harganya", "pricelist", "biaya", "tarip", "tarif", "berapa"))
+
         if products:
-            for p in products:
-                lines.append(f"- **Nama Produk**: {p.get('name', '-')}")
-                lines.append(f"  - Kode / SKU: `{p.get('code') or p.get('sku', '-')}`")
-                cat = p.get("category")
-                if isinstance(cat, dict):
-                    lines.append(f"  - Kategori: {cat.get('name', '-')}")
-                elif cat:
-                    lines.append(f"  - Kategori: {cat}")
-                uom = p.get("uom")
-                if isinstance(uom, dict):
-                    lines.append(f"  - Satuan (UoM): {uom.get('name', '-')}")
-                elif uom:
-                    lines.append(f"  - Satuan (UoM): {uom}")
-                if "last_unit_price" in p or "price" in p or "sales_price" in p:
-                    price_val = p.get("last_unit_price") or p.get("price") or p.get("sales_price", 0.0)
-                    lines.append(f"  - Harga Jual: {_format_rupiah(price_val)}")
-                if p.get("default_cost") is not None:
-                    lines.append(f"  - Estimasi HPP: {_format_rupiah(p.get('default_cost'))}")
-            _append_pagination_footer(lines, len(products), total_count)
+            if is_price_query:
+                # Opsi 1: Kartu/Tabel Ringkas Khusus Harga (Disepakati di /grill-me)
+                if len(products) == 1:
+                    p = products[0]
+                    p_name = p.get("name") or p.get("display_name") or "-"
+                    sku = p.get("code") or p.get("sku") or p.get("default_code") or "-"
+                    cat = p.get("category")
+                    cat_name = cat.get("name", "-") if isinstance(cat, dict) else (cat or "-")
+                    uom = p.get("uom")
+                    uom_name = uom.get("name", "Unit") if isinstance(uom, dict) else (uom or "Unit")
+                    price_val = p.get("last_unit_price") or p.get("price") or p.get("sales_price") or p.get("list_price", 0.0)
+                    cost_val = p.get("default_cost") or p.get("cost")
+
+                    lines.append("### Informasi Harga Produk\n")
+                    lines.append("| Atribut | Rincian |")
+                    lines.append("|:---|:---|")
+                    lines.append(f"| **Nama Produk** | {p_name} |")
+                    lines.append(f"| **Kode / SKU** | `{sku}` |")
+                    lines.append(f"| **Harga Jual** | **{_format_rupiah(price_val)}** / {uom_name} |")
+                    if cost_val is not None:
+                        lines.append(f"| **Estimasi HPP** | {_format_rupiah(cost_val)} |")
+                    lines.append(f"| **Kategori** | {cat_name} |")
+                    lines.append(f"\nHarga jual resmi untuk produk **{p_name}** (SKU `{sku}`) tercatat sebesar **{_format_rupiah(price_val)}** per {uom_name}.")
+                else:
+                    lines.append("### Informasi Perbandingan Harga Produk\n")
+                    lines.append("| No | Nama Produk | Kode / SKU | Satuan (UoM) | Harga Jual | Estimasi HPP |")
+                    lines.append("|:---:|:---|:---|:---:|:---:|:---:|")
+                    for idx, p in enumerate(products, 1):
+                        p_name = p.get("name") or p.get("display_name") or "-"
+                        sku = p.get("code") or p.get("sku") or p.get("default_code") or "-"
+                        uom = p.get("uom")
+                        uom_name = uom.get("name", "Unit") if isinstance(uom, dict) else (uom or "Unit")
+                        price_val = p.get("last_unit_price") or p.get("price") or p.get("sales_price") or p.get("list_price", 0.0)
+                        cost_val = p.get("default_cost") or p.get("cost")
+                        cost_str = _format_rupiah(cost_val) if cost_val is not None else "-"
+                        lines.append(f"| {idx} | {p_name} | `{sku}` | {uom_name} | **{_format_rupiah(price_val)}** | {cost_str} |")
+                    _append_pagination_footer(lines, len(products), total_count)
+            else:
+                lines.append("### Informasi Master Produk (Catalog)\n")
+                for p in products:
+                    lines.append(f"- **Nama Produk**: {p.get('name', '-')}")
+                    lines.append(f"  - Kode / SKU: `{p.get('code') or p.get('sku', '-')}`")
+                    cat = p.get("category")
+                    if isinstance(cat, dict):
+                        lines.append(f"  - Kategori: {cat.get('name', '-')}")
+                    elif cat:
+                        lines.append(f"  - Kategori: {cat}")
+                    uom = p.get("uom")
+                    if isinstance(uom, dict):
+                        lines.append(f"  - Satuan (UoM): {uom.get('name', '-')}")
+                    elif uom:
+                        lines.append(f"  - Satuan (UoM): {uom}")
+                    if "last_unit_price" in p or "price" in p or "sales_price" in p or "list_price" in p:
+                        price_val = p.get("last_unit_price") or p.get("price") or p.get("sales_price") or p.get("list_price", 0.0)
+                        lines.append(f"  - Harga Jual: {_format_rupiah(price_val)}")
+                    if p.get("default_cost") is not None:
+                        lines.append(f"  - Estimasi HPP: {_format_rupiah(p.get('default_cost'))}")
+                _append_pagination_footer(lines, len(products), total_count)
         return "\n".join(lines)
 
     # 5. Locations
@@ -1091,7 +1136,7 @@ def format_deterministic_answer(state: AgentState) -> str:
                     res = multi_results[t_name]
 
                 if res:
-                    formatted = _format_single_tool_presentation(t_name, res)
+                    formatted = _format_single_tool_presentation(t_name, res, user_query)
                     if formatted:
                         sections.append(formatted)
                 else:
@@ -1108,7 +1153,7 @@ def format_deterministic_answer(state: AgentState) -> str:
             for key, res in multi_results.items():
                 base_tool = key.rsplit("_", 1)[0] if ("_" in key and key.rsplit("_", 1)[1].isdigit()) else key
                 if res:
-                    formatted = _format_single_tool_presentation(base_tool, res)
+                    formatted = _format_single_tool_presentation(base_tool, res, user_query)
                     if formatted:
                         sections.append(formatted)
                 else:
@@ -1126,7 +1171,7 @@ def format_deterministic_answer(state: AgentState) -> str:
             return "\n\n---\n\n".join(sections)
 
     # 5. Single-Tool Valid Data Presentation (Backward Compatibility)
-    return _format_single_tool_presentation(tool, tool_result)
+    return _format_single_tool_presentation(tool, tool_result, user_query)
 
 
 def _clean_label_emojis(label: str) -> str:
