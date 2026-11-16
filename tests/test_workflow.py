@@ -19,6 +19,7 @@ from app.graph.workflow import (
     run_workflow_sync,
     get_workflow_executor,
     shutdown_workflow_executor,
+    undo_workflow_thread,
 )
 import app.graph.workflow as workflow_module
 from app.core.config import settings
@@ -467,6 +468,57 @@ class TestHttpClientLifecycle(unittest.IsolatedAsyncioTestCase):
             res = await rag_node(state, client=mock_instance)
             self.assertEqual(res["verification_status"], "EMPTY")
             mock_instance.aclose.assert_not_called()
+
+
+class TestUndoWorkflowThread(unittest.TestCase):
+    """Test suite validating undo_workflow_thread rollback on StateGraph checkpoints."""
+
+    def test_undo_nonexistent_or_empty_thread(self):
+        success, undone_prompt, remaining = undo_workflow_thread("thread_does_not_exist_xyz")
+        self.assertFalse(success)
+        self.assertIsNone(undone_prompt)
+        self.assertEqual(remaining, 0)
+
+    def test_undo_reverts_last_turn_multi_turn(self):
+        graph = create_workflow_graph(checkpointer=MemorySaver())
+        tid = "test_undo_multi_turn"
+        config = {"configurable": {"thread_id": tid}}
+
+        # Seed 2 full turns
+        m1 = HumanMessage(content="Halo turn 1")
+        m2 = AIMessage(content="Respons turn 1")
+        m3 = HumanMessage(content="Pertanyaan turn 2 yang salah")
+        m4 = AIMessage(content="Respons turn 2")
+        graph.update_state(config, {"messages": [m1, m2, m3, m4]})
+
+        # Invoke undo
+        success, undone_prompt, remaining = undo_workflow_thread(tid, graph=graph)
+        self.assertTrue(success)
+        self.assertEqual(undone_prompt, "Pertanyaan turn 2 yang salah")
+        self.assertEqual(remaining, 2)
+
+        snapshot = graph.get_state(config)
+        remaining_msgs = snapshot.values.get("messages", [])
+        self.assertEqual(len(remaining_msgs), 2)
+        self.assertEqual(remaining_msgs[0].content, "Halo turn 1")
+        self.assertEqual(remaining_msgs[1].content, "Respons turn 1")
+
+    def test_undo_single_turn_cleans_thread_entirely(self):
+        graph = create_workflow_graph(checkpointer=MemorySaver())
+        tid = "test_undo_single_turn"
+        config = {"configurable": {"thread_id": tid}}
+
+        m1 = HumanMessage(content="Pesan tunggal")
+        m2 = AIMessage(content="Jawaban tunggal")
+        graph.update_state(config, {"messages": [m1, m2]})
+
+        success, undone_prompt, remaining = undo_workflow_thread(tid, graph=graph)
+        self.assertTrue(success)
+        self.assertEqual(undone_prompt, "Pesan tunggal")
+        self.assertEqual(remaining, 0)
+
+        snapshot = graph.get_state(config)
+        self.assertEqual(len(snapshot.values.get("messages", [])), 0)
 
 
 if __name__ == "__main__":

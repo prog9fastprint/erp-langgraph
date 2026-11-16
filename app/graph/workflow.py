@@ -653,3 +653,64 @@ def run_workflow_sync(
     else:
         return asyncio.run(coro)
 
+
+def undo_workflow_thread(
+    thread_id: str,
+    graph: Optional[Any] = None,
+) -> Tuple[bool, Optional[str], int]:
+    """
+    Roll back the last conversation turn (HumanMessage + AIMessage) from the graph checkpointer.
+
+    Args:
+        thread_id: Target thread session identifier.
+        graph: Optional compiled StateGraph (defaults to default_workflow_graph).
+
+    Returns:
+        Tuple of (success: bool, undone_prompt: Optional[str], remaining_messages_count: int).
+    """
+    if not thread_id:
+        return False, None, 0
+
+    active_graph = graph or default_workflow_graph
+    config = {"configurable": {"thread_id": thread_id}}
+    try:
+        snapshot = active_graph.get_state(config)
+    except Exception as exc:
+        logger.debug("Failed to retrieve state snapshot for undo on thread '%s': %s", thread_id, exc)
+        return False, None, 0
+
+    if not snapshot or not snapshot.values:
+        return False, None, 0
+
+    messages = list(snapshot.values.get("messages") or [])
+    if not messages:
+        return False, None, 0
+
+    # Locate the last HumanMessage
+    last_human_idx = None
+    for idx in range(len(messages) - 1, -1, -1):
+        if isinstance(messages[idx], HumanMessage):
+            last_human_idx = idx
+            break
+
+    if last_human_idx is None:
+        undone_prompt = getattr(messages[-1], "content", str(messages[-1]))
+        truncated_messages = messages[:-1]
+    else:
+        undone_prompt = getattr(messages[last_human_idx], "content", str(messages[last_human_idx]))
+        truncated_messages = messages[:last_human_idx]
+
+    checkpointer = getattr(active_graph, "checkpointer", None)
+    _delete_thread_from_checkpointer(checkpointer, thread_id)
+
+    if not truncated_messages:
+        with _CHECKPOINT_LRU_LOCK:
+            lru = _get_or_create_lru(checkpointer) if checkpointer else None
+            if lru is not None:
+                lru.pop(thread_id, None)
+        return True, undone_prompt, 0
+
+    active_graph.update_state(config, {"messages": truncated_messages})
+    return True, undone_prompt, len(truncated_messages)
+
+

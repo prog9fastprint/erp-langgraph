@@ -11,7 +11,7 @@ import uuid
 from typing import Any, Dict, Optional
 
 from app.core.config import settings
-from app.graph.workflow import run_workflow_sync
+from app.graph.workflow import run_workflow_sync, undo_workflow_thread
 from app.services.llm import clean_model_display_name, get_default_model_name
 
 
@@ -162,6 +162,7 @@ def main():
     print(f"• Default Co.  : ID {settings.DEFAULT_COMPANY_ID}")
     print("• Perintah     : 'exit', 'quit', 'q'   -> Keluar dari sesi")
     print("                 'new', 'reset'         -> Mulai thread percakapan baru")
+    print("                 'undo', '/undo'        -> Batalkan (revert) pesan/turn terakhir")
     print("                 'co <id>'              -> Ubah Company ID aktif")
     print("                 'token <jwt>'          -> Set user token JWT (atau 'token clear')")
     print("                 'verbose'              -> Toggle rincian eksekusi pipeline")
@@ -187,6 +188,15 @@ def main():
             if cmd_lower in ("new", "reset"):
                 session_id = f"cli_{uuid.uuid4().hex[:8]}"
                 print(f"\n✨ Sesi percakapan di-reset. Thread ID baru: {session_id}")
+                continue
+
+            if cmd_lower in ("undo", "/undo"):
+                success, undone_prompt, remaining_count = undo_workflow_thread(session_id)
+                if success:
+                    snippet = f' ("{undone_prompt[:35]}...")' if undone_prompt and len(undone_prompt) > 35 else (f' ("{undone_prompt}")' if undone_prompt else '')
+                    print(f"\n↩️ Pesan terakhir{snippet} berhasil dibatalkan. (Sisa pesan dalam memori: {remaining_count})")
+                else:
+                    print("\n⚠️ Tidak ada percakapan untuk dibatalkan dalam sesi ini.")
                 continue
 
             if cmd_lower == "verbose":
