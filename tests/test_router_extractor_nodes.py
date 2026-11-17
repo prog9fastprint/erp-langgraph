@@ -16,6 +16,8 @@ from app.graph.nodes.extractor import (
     extractor_node,
     resolve_relative_dates,
     TOOL_SCHEMA_REGISTRY,
+    try_fast_path_stock_extraction,
+    _fallback_extract_stock_level,
 )
 from app.schemas.tools import (
     VendorInvoiceFilterSchema,
@@ -701,6 +703,28 @@ class TestExtractorNode(unittest.TestCase):
             self.assertEqual(params.get("vendor_name"), expected_vendor, f"Failed vendor extraction for '{query}'")
             if expected_status:
                 self.assertEqual(params.get("status"), expected_status, f"Failed status extraction for '{query}'")
+
+    def test_multi_sku_stock_extraction(self):
+        """Multi-SKU stock queries must extract all SKUs into 'codes' list."""
+        query = "Cek ketersediaan stok untuk 91010600 dan 91030300"
+        state = create_initial_state(query)
+        state["detected_domain"] = "inventory"
+        state["detected_tool"] = "get_stock_level"
+
+        res = extractor_node(state)
+        params = res.get("extracted_params", {})
+        self.assertIn("codes", params)
+        self.assertEqual(params["codes"], ["91010600", "91030300"])
+        self.assertNotIn("code", params)
+
+        # Fast path directly
+        fp_res = try_fast_path_stock_extraction(query, query, company_id=1)
+        self.assertIsNotNone(fp_res)
+        self.assertEqual(fp_res.get("codes"), ["91010600", "91030300"])
+
+        # Fallback heuristic directly
+        fb_res = _fallback_extract_stock_level(query)
+        self.assertEqual(fb_res.get("codes"), ["91010600", "91030300"])
 
 
 class TestLangGraphPipelineChain(unittest.TestCase):

@@ -477,6 +477,21 @@ def _fallback_extract_stock_level(
         if loc_words:
             params["location_name"] = " ".join(loc_words)
 
+    invalid_sku_tokens = {
+        "setiap", "gudang", "lokasi", "distribusi", "semua", "cabang",
+        "2024", "2025", "2026", "2027", "2028", "stok", "stock", "barang", "produk", "item",
+    }
+    extracted_multi_skus = [
+        clean_product_identifier(t) for t in re.findall(r"\b([A-Z0-9]+(?:-[A-Z0-9]+)+|\d{4,14})\b", cleaned)
+        if clean_product_identifier(t)
+        and clean_product_identifier(t).lower() not in invalid_sku_tokens
+        and not _is_pure_branch_token(clean_product_identifier(t))
+    ]
+    extracted_multi_skus = list(dict.fromkeys(extracted_multi_skus))
+    if len(extracted_multi_skus) > 1:
+        params["codes"] = extracted_multi_skus
+        return params
+
     pattern = re.compile(
         r"(?:(?:stok|stock|sisa|barang|produk|product|item)\s+)+(?:untuk\s+|terkait\s+|dari\s+|tentang\s+)?"
         r"(?!di\b|pada\b|ke\b|gudang\b|lokasi\b|faktur\b|tagihan\b|saldo\b|jurnal\b|customer\b|pelanggan\b)"
@@ -501,8 +516,19 @@ def _fallback_extract_stock_level(
 
     tokens = re.findall(r"\b([A-Z0-9]+(?:-[A-Z0-9]+)+|\d{3,14})\b", cleaned)
     if tokens:
-        params["code"] = clean_product_identifier(tokens[0])
-        return params
+        clean_tokens = [
+            clean_product_identifier(t) for t in tokens
+            if clean_product_identifier(t)
+            and clean_product_identifier(t).lower() not in invalid_sku_tokens
+            and not _is_pure_branch_token(clean_product_identifier(t))
+        ]
+        clean_tokens = list(dict.fromkeys(clean_tokens))
+        if len(clean_tokens) > 1:
+            params["codes"] = clean_tokens
+            return params
+        elif clean_tokens:
+            params["code"] = clean_tokens[0]
+            return params
 
     is_referential = (
         has_anaphoric_reference(cleaned)
@@ -923,7 +949,7 @@ def try_fast_path_stock_extraction(
     company_id: Optional[int] = None,
 ) -> Optional[Dict[str, Any]]:
     """
-    Fast-path (< 5ms) deterministic parameter extractor for single product stock level inquiries.
+    Fast-path (< 5ms) deterministic parameter extractor for single/batch product stock level inquiries.
     Matches explicit SKU/code patterns (e.g. 'SKU 91010600', 'kode 91010600', '91010600', 'FP-KARET-42').
     Bypasses expensive LLM calls when query is simple and unambiguous.
     """
@@ -937,28 +963,49 @@ def try_fast_path_stock_extraction(
     if any(re.search(rf"\b{kw}\b", temporal_check) for kw in ("tanggal", "bulan", "tahun", "riwayat", "history", "mutasi")):
         return None
 
-    # Check for explicit SKU pattern:
-    # 1. 'SKU [code]' or 'kode [code]' or 'item [code]'
-    m = re.search(r"\b(?:sku|kode(?:\s+produk|\s+barang)?|item)\s*[:#]?\s*([A-Za-z0-9._\-\/]{4,35})\b", cleaned, re.IGNORECASE)
-    # 2. Or pure 7-14 digit numeric SKU / barcode (e.g. 91010600)
-    if not m:
-        m = re.search(r"\b([0-9]{7,14})\b", cleaned)
+    invalid_tokens = {"setiap", "gudang", "lokasi", "distribusi", "semua", "cabang", "2024", "2025", "2026", "2027", "2028"}
+    candidate_codes: List[str] = []
 
-    if m:
-        raw_code = m.group(1).strip()
-        code_val = clean_product_identifier(raw_code)
-        # Avoid matching numbers that are common years or non-product tokens
-        invalid_tokens = {"setiap", "gudang", "lokasi", "distribusi", "semua", "cabang", "2024", "2025", "2026", "2027"}
-        if code_val and code_val.lower() not in invalid_tokens:
-            params: Dict[str, Any] = {
-                "code": code_val,
-                "include_breakdown": True,
-                "limit": 100,
-                "offset": 0,
-            }
-            if company_id:
-                params["company_id"] = company_id
-            return params
+    # 1. Match explicit SKU/kode prefixes first (e.g. 'SKU 91010600', 'kode 91030300')
+    explicit_matches = re.findall(
+        r"\b(?:sku|kode(?:\s+produk|\s+barang)?|item)\s*[:#]?\s*([A-Za-z0-9._\-\/]{4,35})\b",
+        cleaned,
+        re.IGNORECASE,
+    )
+    for raw in explicit_matches:
+        c = clean_product_identifier(raw.strip())
+        if c and c.lower() not in invalid_tokens and c not in candidate_codes and not _is_pure_branch_token(c):
+            candidate_codes.append(c)
+
+    # 2. Match hyphenated SKU codes (e.g. FP-KARET-42, AAEO-NPKG)
+    hyphen_matches = re.findall(r"\b([A-Za-z0-9]+(?:-[A-Za-z0-9]+)+)\b", cleaned)
+    for raw in hyphen_matches:
+        c = clean_product_identifier(raw.strip())
+        if c and c.lower() not in invalid_tokens and c not in candidate_codes and not _is_pure_branch_token(c):
+            candidate_codes.append(c)
+
+    # 3. Match 7-14 digit numeric SKUs / barcodes (e.g. 91010600, 91030300)
+    numeric_matches = re.findall(r"\b([0-9]{7,14})\b", cleaned)
+    for raw in numeric_matches:
+        c = clean_product_identifier(raw.strip())
+        if c and c.lower() not in invalid_tokens and c not in candidate_codes and not _is_pure_branch_token(c):
+            candidate_codes.append(c)
+
+    if candidate_codes:
+        params: Dict[str, Any] = {
+            "include_breakdown": True,
+            "limit": 100,
+            "offset": 0,
+        }
+        if len(candidate_codes) > 1:
+            params["codes"] = candidate_codes
+        else:
+            params["code"] = candidate_codes[0]
+
+        if company_id:
+            params["company_id"] = company_id
+        return params
+
     return None
 
 
@@ -1018,6 +1065,7 @@ def _extract_single_tool_params(
                 f"- For 'vendor_name': Extract only clean vendor / supplier company names (e.g. 'MEGACOM BEC', 'PT Sumber Makmur'). Do NOT append branch or city names into vendor_name.\n"
                 f"- For 'account_code' (in get_account_balance): Only set if user provided an actual account code (e.g. '11285', '111100'). If the user provided a name like 'bank tiktok' or 'marketplace tiktok', do NOT set 'account_code' to the name.\n"
                 f"- For 'code' (in get_stock_level & get_product_info): Extract the product SKU code, barcode, OR product name (e.g. 'AMPLOP BUBBLE 15x18 + 4CM LK', 'Kertas HVS A4', 'Tinta Epson 664', 'HVS-A4-70') into 'code'. If the user mentions a product by name, ALWAYS put that name into 'code'. Strip any leading filler words like 'product', 'produk', 'barang', 'item', 'sku', 'kode' (e.g. for 'product FP BROTHER...' extract 'FP BROTHER...').\n"
+                f"- For 'codes' (in get_stock_level): If the user specifies multiple product SKU codes or barcodes (e.g. '91010600 dan 91030300', 'SKU A, B, dan C'), extract all of them as a list of strings into 'codes' rather than a single 'code'.\n"
                 f"- For 'location_name' (in get_stock_level): Extract warehouse or location names (e.g. 'mainstore', 'gudang surabaya', 'pusat') into 'location_name'.\n"
                 f"- STRICT DATE RULE: Do NOT populate 'date_from' or 'date_to' unless the user explicitly specifies a date, relative date (e.g. 'bulan ini', 'bulan lalu', 'kemarin'), or time window. If no time expression is mentioned, leave both None.\n"
                 f"- STRICT STATUS RULE: Valid status values are only 'draft', 'posted', 'paid', 'unpaid', or 'cancel'. Never extract 'not_found' or conversational terms as status.\n"

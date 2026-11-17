@@ -121,6 +121,44 @@ class TestSynthesizerFormatting(unittest.TestCase):
         self.assertIn("Kertas HVS A4 80gsm", output)
         self.assertIn("250.0 unit", output)
 
+    def test_format_multi_sku_stock_level_with_breakdown_and_missing_sku(self):
+        """Batch multi-SKU stock output formatting with location breakdown and missing SKU alert."""
+        state = create_initial_state(user_query="Cek ketersediaan stok untuk 91010600 dan 91030300")
+        state["detected_domain"] = "inventory"
+        state["detected_tool"] = "get_stock_level"
+        state["verification_status"] = "VALID"
+        state["extracted_params"] = {"codes": ["91010600", "91030300"]}
+        state["tool_result"] = {
+            "mode": "batch",
+            "company_name": "Kantor Pusat",
+            "total_products": 1,
+            "products": [
+                {
+                    "product_id": 101,
+                    "code": "91010600",
+                    "name": "FP KARET STEMPEL FLASH BULAT 42",
+                    "qty_on_hand": 15.0,
+                    "breakdown": [
+                        {
+                            "warehouse_name": "Gudang Utama",
+                            "location_name": "Rak A-01",
+                            "qty": 15.0,
+                        }
+                    ],
+                }
+            ],
+        }
+
+        output = format_deterministic_answer(state)
+        self.assertIn("91010600", output)
+        self.assertIn("FP KARET STEMPEL FLASH BULAT 42", output)
+        self.assertIn("15.0 unit", output)
+        self.assertIn("Gudang Utama", output)
+        self.assertIn("Rak A-01", output)
+        # Verify missing SKU warning callout
+        self.assertIn("91030300", output)
+        self.assertIn("tidak ditemukan pada master data produk FastPrint ERP", output)
+
     def test_format_product_info(self):
         """Product catalog info formatting."""
         state = create_initial_state(user_query="Detail produk printer")

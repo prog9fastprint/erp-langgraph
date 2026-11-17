@@ -75,6 +75,7 @@ def _format_single_tool_presentation(
     tool: Optional[str],
     tool_result: Any,
     user_query: Optional[str] = None,
+    extracted_params: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Format an individual tool's response payload into Markdown."""
     if not tool or not tool_result:
@@ -410,14 +411,22 @@ def _format_single_tool_presentation(
         for st_item in items:
             code = st_item.get("code") or st_item.get("sku") or "-"
             name = st_item.get("name") or st_item.get("product_name") or "-"
-            comp = st_item.get("company_name") or f"Company #{st_item.get('company_id', 1)}"
-            loc = st_item.get("location_name") or (f"Location #{st_item.get('location_id')}" if st_item.get("location_id") else "Semua Lokasi")
+            comp = (
+                st_item.get("company_name")
+                or (tool_result.get("company_name") if isinstance(tool_result, dict) else None)
+                or f"Company #{st_item.get('company_id', tool_result.get('company_id', 1) if isinstance(tool_result, dict) else 1)}"
+            )
+            loc = (
+                st_item.get("location_name")
+                or (tool_result.get("location_name") if isinstance(tool_result, dict) else None)
+                or (f"Location #{st_item.get('location_id')}" if st_item.get("location_id") else "Semua Lokasi")
+            )
             qty = st_item.get("qty_on_hand") or st_item.get("quantity") or 0.0
             lines.append(f"| `{code}` | {name} | {comp} | {loc} | **{qty} unit** |")
 
         _append_pagination_footer(lines, len(items), total_count)
 
-        # Render breakdown if available (e.g. single product multi-location breakdown)
+        # Render breakdown if available (single product multi-location breakdown)
         if isinstance(tool_result, dict) and tool_result.get("breakdown"):
             lines.append("\n#### Rincian Stok per Lokasi / Rak:")
             lines.append("| Gudang | Lokasi / Rak | Kuantitas |")
@@ -427,6 +436,37 @@ def _format_single_tool_presentation(
                 loc_n = bd.get("location_name") or f"Rak #{bd.get('location_id', '-')}"
                 b_qty = bd.get("qty", 0.0)
                 lines.append(f"| {wh} | {loc_n} | **{b_qty:g} unit** |")
+        elif any(isinstance(it, dict) and it.get("breakdown") for it in items):
+            lines.append("\n#### Rincian Stok per Lokasi / Rak:")
+            for it in items:
+                it_bd = it.get("breakdown") if isinstance(it, dict) else None
+                if it_bd:
+                    p_code = it.get("code") or it.get("sku") or "-"
+                    p_name = it.get("name") or "-"
+                    lines.append(f"\n**Produk: `{p_code}` — {p_name}**")
+                    lines.append("| Gudang | Lokasi / Rak | Kuantitas |")
+                    lines.append("|:---|:---|:---|")
+                    for bd in it_bd:
+                        wh = bd.get("warehouse_name") or f"Gudang #{bd.get('warehouse_id', '-')}"
+                        loc_n = bd.get("location_name") or f"Rak #{bd.get('location_id', '-')}"
+                        b_qty = bd.get("qty", 0.0)
+                        lines.append(f"| {wh} | {loc_n} | **{b_qty:g} unit** |")
+
+        # Missing requested SKU warning callout
+        if extracted_params and isinstance(extracted_params, dict):
+            req_codes = extracted_params.get("codes")
+            if req_codes and isinstance(req_codes, list):
+                found_codes = {
+                    str(it.get("code") or it.get("sku") or "").strip().lower()
+                    for it in items
+                    if isinstance(it, dict)
+                }
+                missing_codes = [c for c in req_codes if str(c).strip().lower() not in found_codes]
+                if missing_codes:
+                    lines.append("")
+                    for mc in missing_codes:
+                        lines.append(f"> ⚠️ **Catatan:** Kode SKU `{mc}` tidak ditemukan pada master data produk FastPrint ERP.")
+
         return "\n".join(lines)
 
     # 4. Product Info
@@ -1136,7 +1176,7 @@ def format_deterministic_answer(state: AgentState) -> str:
                     res = multi_results[t_name]
 
                 if res:
-                    formatted = _format_single_tool_presentation(t_name, res, user_query)
+                    formatted = _format_single_tool_presentation(t_name, res, user_query, plan.get("params"))
                     if formatted:
                         sections.append(formatted)
                 else:
@@ -1153,7 +1193,7 @@ def format_deterministic_answer(state: AgentState) -> str:
             for key, res in multi_results.items():
                 base_tool = key.rsplit("_", 1)[0] if ("_" in key and key.rsplit("_", 1)[1].isdigit()) else key
                 if res:
-                    formatted = _format_single_tool_presentation(base_tool, res, user_query)
+                    formatted = _format_single_tool_presentation(base_tool, res, user_query, state.get("extracted_params"))
                     if formatted:
                         sections.append(formatted)
                 else:
@@ -1171,7 +1211,7 @@ def format_deterministic_answer(state: AgentState) -> str:
             return "\n\n---\n\n".join(sections)
 
     # 5. Single-Tool Valid Data Presentation (Backward Compatibility)
-    return _format_single_tool_presentation(tool, tool_result, user_query)
+    return _format_single_tool_presentation(tool, tool_result, user_query, state.get("extracted_params"))
 
 
 def _clean_label_emojis(label: str) -> str:
@@ -1307,7 +1347,8 @@ def generate_deterministic_followups(state: AgentState) -> List[Dict[str, str]]:
 
     # 2. Inventory Domain
     if domain == "inventory" or any(k in tool for k in ("stock", "product", "location", "warehouse", "scrap", "transfer")):
-        code = params.get("code") or params.get("product_id")
+        codes = params.get("codes") or []
+        code = params.get("code") or (codes[0] if codes and isinstance(codes, list) else None) or params.get("product_id")
         if not code and isinstance(state.get("tool_result"), dict):
             products = state["tool_result"].get("products")
             if isinstance(products, list) and len(products) > 0 and isinstance(products[0], dict):
