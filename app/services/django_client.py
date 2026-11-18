@@ -33,6 +33,7 @@ from app.schemas.tools import (
     ScrapRecordsFilterSchema,
     WarehousesFilterSchema,
     ProductCategoriesFilterSchema,
+    TopSellingProductsFilterSchema,
 )
 
 logger = logging.getLogger("django_client")
@@ -775,6 +776,21 @@ class DjangoCoreClient:
         return await self.execute_tool(
             domain="inventory",
             tool_name="get_product_categories",
+            params=_clean_params(params),
+            company_id=company_id,
+            user_token=user_token,
+        )
+
+    async def fetch_top_selling_products(
+        self,
+        params: Optional[Union[TopSellingProductsFilterSchema, Dict[str, Any]]] = None,
+        user_token: Optional[str] = None,
+        company_id: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Call sales.get_top_selling_products tool."""
+        return await self.execute_tool(
+            domain="sales",
+            tool_name="get_top_selling_products",
             params=_clean_params(params),
             company_id=company_id,
             user_token=user_token,

@@ -344,6 +344,25 @@ class ProductCategoriesFilterSchema(BaseModel):
     search: Optional[str] = Field(None, description="Pencarian nama kategori produk")
 
 
+class TopSellingProductsFilterSchema(BaseModel):
+    """Input filter schema for sales.get_top_selling_products."""
+    company_id: Optional[int] = Field(None, description="Company ID")
+    date_from: Optional[str] = Field(None, description="Tanggal awal transaksi (YYYY-MM-DD)")
+    date_to: Optional[str] = Field(None, description="Tanggal akhir transaksi (YYYY-MM-DD)")
+    limit: int = Field(10, ge=1, le=100, description="Jumlah produk teratas yang ditampilkan (1-100)")
+    search: Optional[str] = Field(None, description="Pencarian bebas nama produk atau SKU")
+
+    @field_validator("date_from")
+    @classmethod
+    def validate_date_from(cls, v: Optional[str]) -> Optional[str]:
+        return _validate_date_str(v, "date_from")
+
+    @field_validator("date_to")
+    @classmethod
+    def validate_date_to(cls, v: Optional[str]) -> Optional[str]:
+        return _validate_date_str(v, "date_to")
+
+
 class VendorInvoiceFilterSchema(BaseModel):
     """Input filter schema for vendor bills & invoices (TASK-4.2)."""
     vendor_name: Optional[str] = Field(None, description="Nama lengkap atau alias vendor / supplier (e.g. 'PT Sumber Makmur')")
@@ -903,5 +922,6 @@ TOOL_DOMAIN_MAP: Dict[str, str] = {
     "get_scrap_records": "inventory",
     "get_warehouses": "inventory",
     "get_product_categories": "inventory",
+    "get_top_selling_products": "sales",
 }
 

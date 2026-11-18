@@ -729,6 +729,37 @@ def _format_single_tool_presentation(
             _append_pagination_footer(lines, len(cats), total_found)
         return "\n".join(lines)
 
+    # 13. Sales: Top Selling Products
+    if tool == "get_top_selling_products":
+        products = tool_result.get("products") if isinstance(tool_result, dict) else (
+            tool_result if isinstance(tool_result, list) else []
+        )
+        summary = tool_result.get("summary") or {}
+        period = tool_result.get("period") or {}
+        period_str = ""
+        if period.get("date_from") or period.get("date_to"):
+            df = period.get("date_from") or ""
+            dt = period.get("date_to") or ""
+            period_str = f" (Periode {df} s/d {dt})".strip()
+
+        lines.append(f"### Laporan Produk Penjualan Tertinggi ({len(products)} Produk Ditemukan{period_str})\n")
+        if products:
+            lines.append("| No | Kode / SKU | Nama Produk | Kategori | Kuantitas Terjual | Total Pendapatan |")
+            lines.append("|:---:|:---|:---|:---|:---:|:---|")
+            for p in products:
+                idx = p.get("rank") or "-"
+                sku = p.get("code") or "-"
+                p_name = p.get("name") or "-"
+                cat = p.get("category") or "-"
+                qty = float(p.get("total_qty") or 0)
+                rev = float(p.get("total_revenue") or 0.0)
+                lines.append(f"| {idx} | `{sku}` | {p_name} | {cat} | {qty:g} unit | **{_format_rupiah(rev)}** |")
+
+            tot_rev = float(summary.get("total_revenue") or sum(float(p.get("total_revenue") or 0.0) for p in products))
+            tot_qty = float(summary.get("total_qty") or sum(float(p.get("total_qty") or 0) for p in products))
+            lines.append(f"| | **TOTAL** | | | **{tot_qty:g} unit** | **{_format_rupiah(tot_rev)}** |")
+        return "\n".join(lines)
+
     # Default fallback
     return f"Hasil eksekusi data ERP: {str(tool_result)}"
 
@@ -988,6 +1019,67 @@ def _format_multi_company_presentation(state: AgentState) -> str:
             f"**{_format_rupiah(tot_paid)}** | |"
         )
 
+    # 6. Top Selling Products Multi-Company Presentation (Consolidated National Ranking)
+    elif tool == "get_top_selling_products":
+        # Merge products across branches
+        merged: Dict[str, Dict[str, Any]] = {}
+        for cid, res in mc_results.items():
+            if not res or not isinstance(res, dict):
+                continue
+            p_list = res.get("products") or []
+            for p in p_list:
+                key = p.get("code") or str(p.get("product_id") or p.get("name"))
+                if key not in merged:
+                    merged[key] = {
+                        "code": p.get("code") or "-",
+                        "name": p.get("name") or "-",
+                        "category": p.get("category") or "-",
+                        "branch_rev": {},
+                        "branch_qty": {},
+                        "total_rev": 0.0,
+                        "total_qty": 0.0,
+                    }
+                rev = float(p.get("total_revenue") or 0.0)
+                qty = float(p.get("total_qty") or 0.0)
+                merged[key]["branch_rev"][cid] = rev
+                merged[key]["branch_qty"][cid] = qty
+                merged[key]["total_rev"] += rev
+                merged[key]["total_qty"] += qty
+
+        sorted_merged = sorted(merged.values(), key=lambda x: x["total_rev"], reverse=True)
+        params = state.get("extracted_params") or {}
+        limit = int(params.get("limit") or 10)
+        top_list = sorted_merged[:limit]
+
+        lines.append(f"### Laporan Produk Pendapatan Tertinggi Multi-Cabang (Top {len(top_list)} Nasional)\n")
+        headers = ["No", "Kode / SKU", "Nama Produk"]
+        for cid in sorted(mc_results.keys()):
+            c_name = COMPANY_NAME_MAP.get(cid, f"Cabang {cid}")
+            headers.append(f"Omzet {c_name}")
+        headers.append("Total Omzet Gabungan")
+
+        lines.append("| " + " | ".join(headers) + " |")
+        lines.append("|:" + ":|:".join(["---"] * len(headers)) + ":|")
+
+        branch_totals = {cid: 0.0 for cid in sorted(mc_results.keys())}
+        grand_total = 0.0
+
+        for idx, p in enumerate(top_list, start=1):
+            row = [str(idx), f"`{p['code']}`", p["name"]]
+            for cid in sorted(mc_results.keys()):
+                b_rev = p["branch_rev"].get(cid, 0.0)
+                branch_totals[cid] += b_rev
+                row.append(_format_rupiah(b_rev) if b_rev > 0 else "-")
+            grand_total += p["total_rev"]
+            row.append(f"**{_format_rupiah(p['total_rev'])}**")
+            lines.append("| " + " | ".join(row) + " |")
+
+        tot_row = ["", "**TOTAL GABUNGAN**", ""]
+        for cid in sorted(mc_results.keys()):
+            tot_row.append(f"**{_format_rupiah(branch_totals[cid])}**")
+        tot_row.append(f"**{_format_rupiah(grand_total)}**")
+        lines.append("| " + " | ".join(tot_row) + " |")
+
     # Generic Fallback for other tools
     else:
         lines.append(f"### Laporan Multi-Perusahaan (`{tool}`)\n")
@@ -999,7 +1091,7 @@ def _format_multi_company_presentation(state: AgentState) -> str:
                 lines.append(f"- **{c_name}**: *{st_text}*")
             else:
                 cnt = _extract_total_count(res, 1)
-                lines.append(f"- **{c_name}**: Ditemukan {cnt} data transaksi.")
+                lines.append(f"- **{c_name}**: Ditemukan {cnt} data master / catatan.")
 
     # Partial Permission Alert if unauthorized companies exist
     if unauth:
@@ -1504,7 +1596,29 @@ def generate_deterministic_followups(state: AgentState) -> List[Dict[str, str]]:
                 "icon": "fa-scale-balanced",
             })
 
-    # 4. General / Knowledge / Guardrail Fallback
+    # 4. Sales Domain
+    elif domain == "sales" or "selling" in tool or "sales" in tool:
+        res = state.get("tool_result") or {}
+        p_list = res.get("products") or []
+        first_sku = p_list[0].get("code") if p_list and isinstance(p_list[0], dict) else None
+        if first_sku:
+            suggestions.append({
+                "label": f"Cek Stok {str(first_sku)[:12]}",
+                "query": f"Cek ketersediaan stok produk {first_sku} di semua cabang",
+                "icon": "fa-boxes-stacked",
+            })
+            suggestions.append({
+                "label": f"Mutasi {str(first_sku)[:12]}",
+                "query": f"Cek riwayat kartu stok barang untuk SKU {first_sku}",
+                "icon": "fa-clock-rotate-left",
+            })
+        suggestions.append({
+            "label": "Laba Rugi Cabang",
+            "query": "Tampilkan laporan laba rugi cabang untuk melihat perbandingan total pendapatan",
+            "icon": "fa-chart-line",
+        })
+
+    # 5. General / Knowledge / Guardrail Fallback
     if not suggestions:
         suggestions.append({
             "label": "Cek Stok Barang",
@@ -1595,7 +1709,7 @@ def synthesizer_node(
                     "Anda adalah Asisten AI FastPrint ERP.\n"
                     "Berdasarkan laporan di bawah ini, susunlah 2 hingga 3 rekomendasi pertanyaan/prompt lanjutan (READ-ONLY) yang paling logis dan relevan untuk diajukan pengguna berikutnya.\n\n"
                     "ATURAN KETAT REKOMENDASI:\n"
-                    "1. Wajib hanya menyarankan pertanyaan penelusuran data (READ-ONLY) pada modul FastPrint ERP. DILARANG menyarankan aksi membuat/mengubah transaksi.\n"
+                    "1. Wajib hanya menyarankan pertanyaan penelusuran data (READ-ONLY) pada modul FastPrint ERP yang didukung: Akuntansi (Saldo Akun, Jurnal, Buku Besar, Laba Rugi, Neraca, Tagihan Vendor, Rekonsiliasi Bank), Inventaris (Stok Fisik Gudang, Master Katalog & Harga, Kartu Stok, Mutasi Transfer, Alert Stok Rendah), dan Penjualan (Peringkat Produk Terlaris & Pendapatan Tertinggi). DILARANG menyarankan aksi membuat/mengubah transaksi atau modul di luar daftar ini.\n"
                     "2. DILARANG KERAS menggunakan karakter emoji pada label, query, maupun icon.\n"
                     "3. Formatkan rekomendasi HANYA dalam blok JSON berikut tanpa teks lain di luar blok kode:\n"
                     "```json:followups\n"
@@ -1627,7 +1741,7 @@ def synthesizer_node(
                     "DILARANG KERAS menghitung ulang atau mengestimasi angka nominal keuangan (omzet, HPP, laba kotor, laba bersih, selisih rekonsiliasi, saldo neraca). Seluruh angka wajib dikutip persis dari data laporan terstruktur.\n\n"
                     "Selain menyajikan data laporan di atas, susunlah 2 hingga 3 rekomendasi pertanyaan/prompt lanjutan yang paling logis, relevan, dan kontekstual untuk diajukan pengguna berikutnya berdasarkan data riil yang ditemukan di atas (misal: rincian transaksi terkait, mutasi kartu stok produk ini, cek tagihan overdue, atau rekonsiliasi bank).\n\n"
                     "ATURAN KETAT REKOMENDASI:\n"
-                    "1. Wajib hanya menyarankan pertanyaan penelusuran data (READ-ONLY) pada modul FastPrint ERP. DILARANG menyarankan aksi membuat/mengubah transaksi.\n"
+                    "1. Wajib hanya menyarankan pertanyaan penelusuran data (READ-ONLY) pada modul FastPrint ERP yang didukung: Akuntansi (Saldo Akun, Jurnal, Buku Besar, Laba Rugi, Neraca, Tagihan Vendor, Rekonsiliasi Bank), Inventaris (Stok Fisik Gudang, Master Katalog & Harga, Kartu Stok, Mutasi Transfer, Alert Stok Rendah), dan Penjualan (Peringkat Produk Terlaris & Pendapatan Tertinggi). DILARANG menyarankan aksi membuat/mengubah transaksi atau modul di luar daftar ini.\n"
                     "2. Wajib menggunakan entitas riil (kode SKU, nama vendor, kode akun, nama gudang) yang terdapat pada data di atas.\n"
                     "3. DILARANG KERAS menggunakan karakter emoji pada label, query, maupun icon.\n"
                     "4. Panjang teks query rekomendasi WAJIB SINGKAT dan FOKUS SATU INTENSI (maksimal 10-12 kata, contoh: 'Cek mutasi kartu stok SKU ...', 'Cek stok SKU ... di semua cabang'). DILARANG membuat kalimat majemuk bertingkat yang berbelit-belit.\n"

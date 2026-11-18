@@ -43,10 +43,11 @@ class PlannedToolCall(BaseModel):
         "get_scrap_records",
         "get_warehouses",
         "get_product_categories",
+        "get_top_selling_products",
     ] = Field(..., description="Target ERP tool name.")
-    domain: Literal["accounting", "inventory"] = Field(
+    domain: Literal["accounting", "inventory", "sales"] = Field(
         ...,
-        description="Target ERP domain: 'accounting' or 'inventory'."
+        description="Target ERP domain: 'accounting', 'inventory', or 'sales'."
     )
     sub_query: Optional[str] = Field(
         None,
@@ -64,9 +65,9 @@ class PlannedToolCall(BaseModel):
 
 class RouterDecision(BaseModel):
     """Structured output schema for LLM router fallback."""
-    domain: Literal["accounting", "inventory", "knowledge", "general", "out_of_scope"] = Field(
+    domain: Literal["accounting", "inventory", "sales", "knowledge", "general", "out_of_scope"] = Field(
         ...,
-        description="Target ERP module domain: 'accounting', 'inventory', 'knowledge' (SOPs, specs, policies), 'general' (greetings/help), or 'out_of_scope' (unrelated queries outside ERP)."
+        description="Target ERP module domain: 'accounting', 'inventory', 'sales', 'knowledge' (SOPs, specs, policies), 'general' (greetings/help), or 'out_of_scope' (unrelated queries outside ERP)."
     )
     query_mode: Literal["live_erp", "vector_rag", "hybrid", "general", "out_of_scope"] = Field(
         "live_erp",
@@ -91,6 +92,7 @@ class RouterDecision(BaseModel):
         "get_scrap_records",
         "get_warehouses",
         "get_product_categories",
+        "get_top_selling_products",
     ]] = Field(
         None,
         description="Target tool name to invoke in ERP backend, or null if knowledge / general / out_of_scope."
@@ -114,9 +116,9 @@ class RouterDecision(BaseModel):
 
 class MultiRouterDecision(BaseModel):
     """Structured output schema for LLM router supporting multi-intent planning."""
-    domain: Literal["accounting", "inventory", "knowledge", "general", "out_of_scope"] = Field(
+    domain: Literal["accounting", "inventory", "sales", "knowledge", "general", "out_of_scope"] = Field(
         ...,
-        description="Primary target ERP module domain: 'accounting', 'inventory', 'knowledge', 'general', or 'out_of_scope'."
+        description="Primary target ERP module domain: 'accounting', 'inventory', 'sales', 'knowledge', 'general', or 'out_of_scope'."
     )
     query_mode: Literal["live_erp", "vector_rag", "hybrid", "general", "out_of_scope"] = Field(
         "live_erp",
@@ -141,6 +143,7 @@ class MultiRouterDecision(BaseModel):
         "get_scrap_records",
         "get_warehouses",
         "get_product_categories",
+        "get_top_selling_products",
     ]] = Field(
         None,
         description="Primary target tool name (for backward compatibility), or null if general/out_of_scope/knowledge."
@@ -317,6 +320,14 @@ INVENTORY_LOCATION_PATTERNS = [
     r"\bada\s+(gudang|lokasi|warehouse)\b",
     r"\b(gudang|lokasi|warehouse)\s+(apa\s+saja|tersedia|aktif)\b",
     r"^(gudang|lokasi|warehouse)\b",
+]
+
+SALES_TOP_PRODUCTS_PATTERNS = [
+    r"\b(?:produk|barang|item)\s+(?:dengan\s+)?(?:pendapatan|omset|omzet|penjualan|laba)\s+(?:tertinggi|terbanyak|terbesar|terlaris|teratas|top)\b",
+    r"\b(?:top|peringkat|daftar)\s+\d*\s*(?:produk|barang|item)\s+(?:terlaris|terbanyak|terbesar|omset|pendapatan)\b",
+    r"\b(?:pendapatan|omset|omzet|penjualan)\s+(?:tertinggi|terbesar)\s+(?:per\s+|tiap\s+)?(?:produk|barang|sku)\b",
+    r"\bproduk\s+terlaris\b",
+    r"\bproduk\s+paling\s+laku\b",
 ]
 
 INVENTORY_PRODUCT_PATTERNS = [
@@ -616,8 +627,13 @@ def classify_query_rule_based(query: str) -> Optional[Dict[str, Any]]:
         else:
             candidates.append(("get_locations", "inventory", m_loc.start()))
 
+    # Sales: Top selling products by revenue
+    m_top_sales = _find_first_match(SALES_TOP_PRODUCTS_PATTERNS, cleaned)
+    if m_top_sales:
+        candidates.append(("get_top_selling_products", "sales", m_top_sales.start()))
+
     # Inventory: Product info
-    if not is_rag:
+    if not is_rag and not m_top_sales:
         # If stock level pattern matched, only add product_info if explicit product catalog detail terms are present
         # (avoid treating "stok produk ...", "sku ...", or "barcode ..." as a separate product_info tool call)
         if m_stock:

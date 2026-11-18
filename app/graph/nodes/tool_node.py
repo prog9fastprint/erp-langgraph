@@ -240,6 +240,7 @@ async def tool_node(
             "get_scrap_records": erp_client.fetch_scrap_records,
             "get_warehouses": erp_client.fetch_warehouses,
             "get_product_categories": erp_client.fetch_product_categories,
+            "get_top_selling_products": erp_client.fetch_top_selling_products,
         }
 
         active_tools = state.get("active_tools")

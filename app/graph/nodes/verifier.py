@@ -53,6 +53,9 @@ def _calculate_records_count(tool_result: Any) -> int:
         if "count" in tool_result and isinstance(tool_result["count"], (int, float)):
             return int(tool_result["count"])
 
+        if "total_products" in tool_result and isinstance(tool_result["total_products"], (int, float)):
+            return int(tool_result["total_products"])
+
         # Check common collection list keys
         for list_key in (
             "entries", "accounts", "products", "items", "records", "lines", "locations",

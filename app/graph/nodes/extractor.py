@@ -45,6 +45,7 @@ from app.schemas.tools import (
     ScrapRecordsFilterSchema,
     WarehousesFilterSchema,
     ProductCategoriesFilterSchema,
+    TopSellingProductsFilterSchema,
     TOOL_DOMAIN_MAP,
 )
 from app.services.llm import get_chat_model
@@ -69,6 +70,7 @@ TOOL_SCHEMA_REGISTRY: Dict[str, Type[BaseModel]] = {
     "get_scrap_records": ScrapRecordsFilterSchema,
     "get_warehouses": WarehousesFilterSchema,
     "get_product_categories": ProductCategoriesFilterSchema,
+    "get_top_selling_products": TopSellingProductsFilterSchema,
 }
 
 # Whitelist of valid accounting/journal/vendor bill statuses
@@ -1024,6 +1026,41 @@ def try_fast_path_stock_extraction(
     return None
 
 
+def _fallback_extract_top_selling_products(query: str, ref_date: Optional[date] = None) -> Dict[str, Any]:
+    """Deterministic heuristic extraction for sales.get_top_selling_products."""
+    today = ref_date or get_current_erp_date()
+    params: Dict[str, Any] = {"limit": 10}
+
+    # Extract limit (e.g. "10 produk", "top 5")
+    m_limit = re.search(r"\b(?:top|peringkat|daftar)?\s*(\d+)\s*(?:produk|barang|item)?\b", query, re.IGNORECASE)
+    if m_limit:
+        try:
+            val = int(m_limit.group(1))
+            if 1 <= val <= 100:
+                params["limit"] = val
+        except ValueError:
+            pass
+
+    # Extract explicit 4-digit year (e.g. 2026)
+    m_year = re.search(r"\b(20\d\d)\b", query)
+    if m_year:
+        yr = int(m_year.group(1))
+        params["date_from"] = f"{yr}-01-01"
+        params["date_to"] = f"{yr}-12-31"
+    else:
+        df, dt = resolve_relative_dates(query, today)
+        if df or dt:
+            if df:
+                params["date_from"] = df
+            if dt:
+                params["date_to"] = dt
+        else:
+            params["date_from"] = f"{today.year}-01-01"
+            params["date_to"] = f"{today.year}-12-31"
+
+    return params
+
+
 def _extract_single_tool_params(
     plan: Dict[str, Any],
     all_plans: List[Dict[str, Any]],
@@ -1067,6 +1104,10 @@ def _extract_single_tool_params(
     elif tool_name == "get_balance_sheet" and retry_count == 0:
         fast_params = _fallback_extract_balance_sheet(sub_query, today)
         if fast_params.get("as_of_date") or fast_params.get("include_breakdown"):
+            extracted_dict = dict(fast_params)
+    elif tool_name == "get_top_selling_products" and retry_count == 0:
+        fast_params = _fallback_extract_top_selling_products(sub_query, today)
+        if fast_params:
             extracted_dict = dict(fast_params)
 
     # 1. LLM Structured Output Attempt
@@ -1178,6 +1219,8 @@ def _extract_single_tool_params(
             extracted_dict = _fallback_extract_warehouses(sub_query)
         elif tool_name == "get_product_categories":
             extracted_dict = _fallback_extract_product_categories(sub_query)
+        elif tool_name == "get_top_selling_products":
+            extracted_dict = _fallback_extract_top_selling_products(sub_query, today)
         else:
             extracted_dict = {}
             if supports_dates and retry_count == 0:
