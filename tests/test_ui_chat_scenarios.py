@@ -156,6 +156,95 @@ class TestUIChatScenarios(unittest.TestCase):
         self.assertEqual(req.company_ids, [1, 2, 3, 7, 8])
         self.assertEqual(req.company_id, 1)
 
+    def test_tc_pl_03_all_companies_pnl_with_account_breakdown(self):
+        """Verifies multi-company P&L renders active accounts breakdown per branch."""
+        mc_results = {
+            1: {
+                "summary": {"total_revenue": 0.0, "cogs": 0.0, "gross_profit": 0.0, "net_profit": -155000.0},
+                "breakdown": [
+                    {
+                        "group_name": "Expense",
+                        "types": [
+                            {
+                                "type_name": "Operating Expenses",
+                                "accounts": [
+                                    {"account_code": "61100", "account_name": "Beban Operasional", "balance": 155000.0}
+                                ],
+                            }
+                        ],
+                    }
+                ],
+            },
+            3: {
+                "summary": {"total_revenue": 10000000.0, "cogs": 6000000.0, "gross_profit": 4000000.0, "net_profit": 2000000.0},
+                "breakdown": [
+                    {
+                        "group_name": "Revenue",
+                        "types": [
+                            {
+                                "type_name": "Sales Income",
+                                "accounts": [
+                                    {"account_code": "41100", "account_name": "Penjualan Toko", "balance": 10000000.0}
+                                ],
+                            }
+                        ],
+                    }
+                ],
+            },
+        }
+
+        state: AgentState = {
+            "detected_domain": "accounting",
+            "detected_tool": "get_profit_and_loss",
+            "is_multi_company": True,
+            "company_ids": [1, 3],
+            "multi_company_results": mc_results,
+        }
+        output = _format_multi_company_presentation(state)
+        self.assertIn("Laporan Laba Rugi Multi-Perusahaan (Combined Profit & Loss)", output)
+        self.assertIn("Rincian Akun Laba Rugi per Cabang / Perusahaan:", output)
+        self.assertIn("Kantor Pusat", output)
+        self.assertIn("`61100`", output)
+        self.assertIn("Beban Operasional", output)
+        self.assertIn("Head Office", output)
+        self.assertIn("`41100`", output)
+        self.assertIn("Penjualan Toko", output)
+
+    def test_tc_pl_04_primary_company_preservation_for_all_branches(self):
+        """Verifies _resolve_effective_company_ids preserves caller's active company_id when is_all=True."""
+        from app.graph.workflow import _resolve_effective_company_ids
+        query = "Tampilkan laba rugi tahun 2026 dengan rincian akun untuk semua cabang"
+        primary_cid, cids, is_multi = _resolve_effective_company_ids(
+            user_query=query,
+            company_id=3,
+            company_ids=None,
+            company_id_explicit=True,
+            checkpoint_values=None,
+        )
+        self.assertTrue(is_multi)
+        self.assertEqual(primary_cid, 3)
+        self.assertIn(3, cids)
+        self.assertIn(1, cids)
+        self.assertIn(8, cids)
+
+    def test_tc_pl_05_fast_path_extraction_pnl_with_breakdown(self):
+        """Verifies Fast-Path extractor for P&L extracts include_breakdown and dates without LLM."""
+        from app.graph.nodes.extractor import extractor_node
+        from datetime import date
+        state: AgentState = {
+            "user_query": "Tampilkan laba rugi tahun 2026 dengan rincian akun untuk semua cabang",
+            "detected_domain": "accounting",
+            "detected_tool": "get_profit_and_loss",
+            "active_tools": [{"tool": "get_profit_and_loss", "domain": "accounting", "params": {}}],
+            "retry_count": 0,
+        }
+        res = extractor_node(state, llm=None, ref_date=date(2026, 11, 18))
+        plan = res["active_tools"][0]
+        params = plan["params"]
+        self.assertTrue(params.get("include_breakdown"))
+        self.assertEqual(params.get("date_from"), "2026-01-01")
+        self.assertEqual(params.get("date_to"), "2026-12-31")
+
 
 if __name__ == "__main__":
     unittest.main()

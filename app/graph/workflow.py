@@ -393,10 +393,11 @@ def _resolve_effective_company_ids(
     # 2. Text contains 'semua cabang' or multiple branch mentions
     text_cids, is_all = resolve_all_branch_company_ids(user_query)
     if is_all:
-        primary = text_cids[0] if text_cids else settings.DEFAULT_COMPANY_ID
+        primary = company_id if (company_id and company_id in text_cids) else (text_cids[0] if text_cids else settings.DEFAULT_COMPANY_ID)
         return primary, text_cids, True
     if len(text_cids) > 1:
-        return text_cids[0], text_cids, True
+        primary = company_id if (company_id and company_id in text_cids) else text_cids[0]
+        return primary, text_cids, True
     if len(text_cids) == 1:
         return text_cids[0], [text_cids[0]], False
 

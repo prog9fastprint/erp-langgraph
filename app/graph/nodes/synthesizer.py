@@ -829,6 +829,37 @@ def _format_multi_company_presentation(state: AgentState) -> str:
             f"**{_format_rupiah(tot_gross)}** | **{_format_rupiah(tot_net)}** |"
         )
 
+        # Rincian akun per cabang jika terdapat breakdown aktif
+        has_breakdown = any(
+            bool(res and isinstance(res, dict) and res.get("breakdown"))
+            for res in mc_results.values()
+        )
+        if has_breakdown:
+            lines.append("\n#### Rincian Akun Laba Rugi per Cabang / Perusahaan:\n")
+            for cid in sorted(mc_results.keys()):
+                c_name = COMPANY_NAME_MAP.get(cid, f"Cabang {cid}")
+                res = mc_results.get(cid)
+                if not res or not isinstance(res, dict):
+                    continue
+                breakdown = res.get("breakdown") or []
+                active_accounts = []
+                for grp in breakdown:
+                    grp_name = grp.get("group_name") or grp.get("name") or "-"
+                    for tp in grp.get("types", []):
+                        tp_name = tp.get("type_name") or tp.get("name") or "-"
+                        for acc in tp.get("accounts", []):
+                            bal = float(acc.get("balance", 0.0) or 0.0)
+                            if abs(bal) > 0.01:
+                                active_accounts.append((grp_name, tp_name, acc.get("account_code", "-"), acc.get("account_name", "-"), bal))
+
+                if active_accounts:
+                    lines.append(f"**{c_name}**:")
+                    lines.append("| Grup | Tipe Akun | Kode | Nama Akun | Saldo |")
+                    lines.append("|:---|:---|:---|:---|:---|")
+                    for g_n, t_n, a_c, a_n, bal in active_accounts:
+                        lines.append(f"| {g_n} | {t_n} | `{a_c}` | {a_n} | {_format_rupiah(bal)} |")
+                    lines.append("")
+
     # 3. Balance Sheet Multi-Company Presentation
     elif tool == "get_balance_sheet":
         lines.append("### Laporan Neraca Multi-Perusahaan (Combined Balance Sheet)\n")
@@ -1551,44 +1582,80 @@ def synthesizer_node(
         except Exception:
             model = None
 
+    is_multi_co = state.get("is_multi_company", False)
+    is_large_deterministic = is_multi_co or len(deterministic_answer) > 1500
+
     if model is not None and status == "VALID":
         try:
-            prompt = (
-                "Anda adalah Asisten AI FastPrint ERP yang profesional dan teliti.\n"
-                "Sajikan data laporan berikut dalam Bahasa Indonesia yang formal, ringkas, dan jelas.\n"
-                "Pertahankan seluruh angka transaksi, kode, dan rincian tabel Markdown dengan akurat tanpa mengubah nilai.\n"
-                "DILARANG KERAS menghitung ulang atau mengestimasi angka nominal keuangan (omzet, HPP, laba kotor, laba bersih, selisih rekonsiliasi, saldo neraca). Seluruh angka wajib dikutip persis dari data laporan terstruktur.\n\n"
-                "Selain menyajikan data laporan di atas, susunlah 2 hingga 3 rekomendasi pertanyaan/prompt lanjutan yang paling logis, relevan, dan kontekstual untuk diajukan pengguna berikutnya berdasarkan data riil yang ditemukan di atas (misal: rincian transaksi terkait, mutasi kartu stok produk ini, cek tagihan overdue, atau rekonsiliasi bank).\n\n"
-                "ATURAN KETAT REKOMENDASI:\n"
-                "1. Wajib hanya menyarankan pertanyaan penelusuran data (READ-ONLY) pada modul FastPrint ERP. DILARANG menyarankan aksi membuat/mengubah transaksi.\n"
-                "2. Wajib menggunakan entitas riil (kode SKU, nama vendor, kode akun, nama gudang) yang terdapat pada data di atas.\n"
-                "3. DILARANG KERAS menggunakan karakter emoji pada label, query, maupun icon.\n"
-                "4. Panjang teks query rekomendasi WAJIB SINGKAT dan FOKUS SATU INTENSI (maksimal 10-12 kata, contoh: 'Cek mutasi kartu stok SKU ...', 'Cek stok SKU ... di semua cabang'). DILARANG membuat kalimat majemuk bertingkat yang berbelit-belit.\n"
-                "5. Formatkan rekomendasi di akhir respons dalam blok JSON khusus berikut:\n"
-                "```json:followups\n"
-                "[\n"
-                '  {"label": "Label Singkat (1-3 kata)", "query": "Prompt lengkap yang akan dieksekusi", "icon": "fa-arrow-right"}\n'
-                "]\n"
-                "```\n"
-                "DILARANG menuliskan judul pengantar seperti 'Rekomendasi lanjutan' atau teks apapun di luar blok kode json:followups.\n\n"
-                f"Pertanyaan Pengguna: {user_query}\n"
-                f"Data Laporan Terstruktur:\n{deterministic_answer}"
-            )
-            response = model.invoke([
-                SystemMessage(content="Anda adalah Asisten AI FastPrint ERP."),
-                HumanMessage(content=prompt),
-            ])
-            resp_meta = getattr(response, "response_metadata", {}) or {}
-            resolved_model = resp_meta.get("model_name") or resp_meta.get("model")
-            if resolved_model:
-                actual_model = str(resolved_model)
-            content = getattr(response, "content", None)
-            if content and isinstance(content, str) and content.strip():
-                clean_ans, llm_followups = _extract_llm_followups(content.strip())
-                if clean_ans:
-                    final_text = clean_ans
-                if llm_followups:
-                    followups = llm_followups
+            if is_large_deterministic:
+                # For large tabular or multi-company reports, keep deterministic tables intact
+                # to prevent hallucination, truncation, and slow token generation.
+                final_text = deterministic_answer
+                prompt = (
+                    "Anda adalah Asisten AI FastPrint ERP.\n"
+                    "Berdasarkan laporan di bawah ini, susunlah 2 hingga 3 rekomendasi pertanyaan/prompt lanjutan (READ-ONLY) yang paling logis dan relevan untuk diajukan pengguna berikutnya.\n\n"
+                    "ATURAN KETAT REKOMENDASI:\n"
+                    "1. Wajib hanya menyarankan pertanyaan penelusuran data (READ-ONLY) pada modul FastPrint ERP. DILARANG menyarankan aksi membuat/mengubah transaksi.\n"
+                    "2. DILARANG KERAS menggunakan karakter emoji pada label, query, maupun icon.\n"
+                    "3. Formatkan rekomendasi HANYA dalam blok JSON berikut tanpa teks lain di luar blok kode:\n"
+                    "```json:followups\n"
+                    "[\n"
+                    '  {"label": "Label Singkat (1-3 kata)", "query": "Prompt lengkap yang akan dieksekusi", "icon": "fa-arrow-right"}\n'
+                    "]\n"
+                    "```\n\n"
+                    f"Pertanyaan Pengguna: {user_query}\n"
+                    f"Ringkasan Laporan:\n{deterministic_answer[:1000]}"
+                )
+                response = model.invoke([
+                    SystemMessage(content="Anda adalah Asisten AI FastPrint ERP."),
+                    HumanMessage(content=prompt),
+                ])
+                resp_meta = getattr(response, "response_metadata", {}) or {}
+                resolved_model = resp_meta.get("model_name") or resp_meta.get("model")
+                if resolved_model:
+                    actual_model = str(resolved_model)
+                content = getattr(response, "content", None)
+                if content and isinstance(content, str) and content.strip():
+                    _, llm_followups = _extract_llm_followups(content.strip())
+                    if llm_followups:
+                        followups = llm_followups
+            else:
+                prompt = (
+                    "Anda adalah Asisten AI FastPrint ERP yang profesional dan teliti.\n"
+                    "Sajikan data laporan berikut dalam Bahasa Indonesia yang formal, ringkas, dan jelas.\n"
+                    "Pertahankan seluruh angka transaksi, kode, dan rincian tabel Markdown dengan akurat tanpa mengubah nilai.\n"
+                    "DILARANG KERAS menghitung ulang atau mengestimasi angka nominal keuangan (omzet, HPP, laba kotor, laba bersih, selisih rekonsiliasi, saldo neraca). Seluruh angka wajib dikutip persis dari data laporan terstruktur.\n\n"
+                    "Selain menyajikan data laporan di atas, susunlah 2 hingga 3 rekomendasi pertanyaan/prompt lanjutan yang paling logis, relevan, dan kontekstual untuk diajukan pengguna berikutnya berdasarkan data riil yang ditemukan di atas (misal: rincian transaksi terkait, mutasi kartu stok produk ini, cek tagihan overdue, atau rekonsiliasi bank).\n\n"
+                    "ATURAN KETAT REKOMENDASI:\n"
+                    "1. Wajib hanya menyarankan pertanyaan penelusuran data (READ-ONLY) pada modul FastPrint ERP. DILARANG menyarankan aksi membuat/mengubah transaksi.\n"
+                    "2. Wajib menggunakan entitas riil (kode SKU, nama vendor, kode akun, nama gudang) yang terdapat pada data di atas.\n"
+                    "3. DILARANG KERAS menggunakan karakter emoji pada label, query, maupun icon.\n"
+                    "4. Panjang teks query rekomendasi WAJIB SINGKAT dan FOKUS SATU INTENSI (maksimal 10-12 kata, contoh: 'Cek mutasi kartu stok SKU ...', 'Cek stok SKU ... di semua cabang'). DILARANG membuat kalimat majemuk bertingkat yang berbelit-belit.\n"
+                    "5. Formatkan rekomendasi di akhir respons dalam blok JSON khusus berikut:\n"
+                    "```json:followups\n"
+                    "[\n"
+                    '  {"label": "Label Singkat (1-3 kata)", "query": "Prompt lengkap yang akan dieksekusi", "icon": "fa-arrow-right"}\n'
+                    "]\n"
+                    "```\n"
+                    "DILARANG menuliskan judul pengantar seperti 'Rekomendasi lanjutan' atau teks apapun di luar blok kode json:followups.\n\n"
+                    f"Pertanyaan Pengguna: {user_query}\n"
+                    f"Data Laporan Terstruktur:\n{deterministic_answer}"
+                )
+                response = model.invoke([
+                    SystemMessage(content="Anda adalah Asisten AI FastPrint ERP."),
+                    HumanMessage(content=prompt),
+                ])
+                resp_meta = getattr(response, "response_metadata", {}) or {}
+                resolved_model = resp_meta.get("model_name") or resp_meta.get("model")
+                if resolved_model:
+                    actual_model = str(resolved_model)
+                content = getattr(response, "content", None)
+                if content and isinstance(content, str) and content.strip():
+                    clean_ans, llm_followups = _extract_llm_followups(content.strip())
+                    if clean_ans:
+                        final_text = clean_ans
+                    if llm_followups:
+                        followups = llm_followups
         except Exception as exc:
             logger.warning(f"LLM synthesis failed, falling back to deterministic output: {exc}")
             final_text = deterministic_answer

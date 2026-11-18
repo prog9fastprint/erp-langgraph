@@ -313,6 +313,21 @@ def resolve_relative_dates(
         start_date = today - timedelta(days=max(0, n_days - 1))
         return start_date.strftime("%Y-%m-%d"), today.strftime("%Y-%m-%d")
 
+    # 8. Tahun spesifik (e.g. 'tahun 2026', 'thn 2025', 'periode 2026')
+    year_match = re.search(r"\b(?:tahun|thn|periode)\s+(\d{4})\b", cleaned)
+    if year_match:
+        yr = int(year_match.group(1))
+        return f"{yr}-01-01", f"{yr}-12-31"
+
+    # 9. Tahun ini (current year)
+    if "tahun ini" in cleaned:
+        return f"{today.year}-01-01", f"{today.year}-12-31"
+
+    # 10. Tahun lalu (previous year)
+    if "tahun lalu" in cleaned or "tahun kemarin" in cleaned:
+        prev_yr = today.year - 1
+        return f"{prev_yr}-01-01", f"{prev_yr}-12-31"
+
     return None, None
 
 
@@ -1044,6 +1059,14 @@ def _extract_single_tool_params(
     if tool_name == "get_stock_level" and retry_count == 0:
         fast_params = try_fast_path_stock_extraction(sub_query, user_query, state.get("company_id"))
         if fast_params:
+            extracted_dict = dict(fast_params)
+    elif tool_name == "get_profit_and_loss" and retry_count == 0:
+        fast_params = _fallback_extract_profit_and_loss(sub_query, today)
+        if fast_params.get("date_from") or fast_params.get("date_to") or fast_params.get("include_breakdown"):
+            extracted_dict = dict(fast_params)
+    elif tool_name == "get_balance_sheet" and retry_count == 0:
+        fast_params = _fallback_extract_balance_sheet(sub_query, today)
+        if fast_params.get("as_of_date") or fast_params.get("include_breakdown"):
             extracted_dict = dict(fast_params)
 
     # 1. LLM Structured Output Attempt
