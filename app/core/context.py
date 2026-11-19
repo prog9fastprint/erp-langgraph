@@ -335,3 +335,93 @@ def should_preserve_plan_on_retry(
     if plan.get("status") == "success" and status_val == "VALID":
         return True
     return has_strict_document_identifier(plan.get("params"))
+
+
+SENSITIVE_PARAM_KEYS: Set[str] = {
+    "user_token",
+    "token",
+    "access_token",
+    "password",
+    "secret",
+    "service_key",
+    "api_key",
+    "authorization",
+    "client_secret",
+}
+
+
+def sanitize_tool_params(params: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Sanitize ERP tool input parameters for safe client-facing SSE emission.
+    Removes authentication tokens, passwords, secrets, internal keys, and empty values.
+    """
+    if not isinstance(params, dict):
+        return {}
+    sanitized: Dict[str, Any] = {}
+    for k, v in params.items():
+        if k in SENSITIVE_PARAM_KEYS or k.startswith("_"):
+            continue
+        if v is None:
+            continue
+        if isinstance(v, str) and not v.strip():
+            continue
+        sanitized[k] = v
+    return sanitized
+
+
+def resolve_tool_record_count(tool_result: Any) -> int:
+    """
+    Compute total record count found in ERP tool response envelope.
+    Handles paginated responses, raw record lists, and aggregate calculations.
+    """
+    if tool_result is None:
+        return 0
+    if isinstance(tool_result, list):
+        return len(tool_result)
+    if isinstance(tool_result, dict):
+        for count_key in ("total_count", "total_found", "count", "records_count"):
+            val = tool_result.get(count_key)
+            if val is not None:
+                try:
+                    return int(val)
+                except (ValueError, TypeError):
+                    pass
+        for list_key in (
+            "entries",
+            "items",
+            "accounts",
+            "products",
+            "bills",
+            "records",
+            "lines",
+            "warehouses",
+            "categories",
+        ):
+            collection = tool_result.get(list_key)
+            if isinstance(collection, list):
+                return len(collection)
+        return 1 if tool_result else 0
+    return 1
+
+
+def chunk_text_for_streaming(text: str, max_chunk_len: int = 35) -> List[str]:
+    """
+    Split markdown text into clean streaming chunks preserving words and whitespace.
+    """
+    if not text:
+        return []
+    words = re.findall(r"\S+\s*", text)
+    if not words:
+        return [text]
+    chunks: List[str] = []
+    curr = ""
+    for w in words:
+        if len(curr) + len(w) > max_chunk_len and curr:
+            chunks.append(curr)
+            curr = w
+        else:
+            curr += w
+    if curr:
+        chunks.append(curr)
+    return chunks
+

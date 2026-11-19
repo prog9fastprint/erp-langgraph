@@ -10,6 +10,7 @@ from collections import OrderedDict
 import concurrent.futures
 import logging
 import threading
+import time
 from typing import Any, Dict, List, Optional, Tuple
 import uuid
 import weakref
@@ -18,6 +19,11 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import StateGraph, START, END
 
 from app.core.config import settings
+from app.core.context import (
+    chunk_text_for_streaming,
+    resolve_tool_record_count,
+    sanitize_tool_params,
+)
 from app.graph.state import AgentState, create_initial_state
 from app.graph.nodes.summarizer import summarizer_node
 from app.graph.nodes.router import router_node
@@ -26,6 +32,7 @@ from app.graph.nodes.extractor import extractor_node
 from app.graph.nodes.tool_node import tool_node
 from app.graph.nodes.verifier import verifier_node, decide_after_verification
 from app.graph.nodes.synthesizer import synthesizer_node
+from app.services.llm import get_default_model_name
 
 logger = logging.getLogger("workflow")
 
@@ -561,6 +568,151 @@ async def astream_workflow_steps(
                 effective_thread_id,
                 max_threads=settings.MAX_CHECKPOINT_THREADS,
             )
+
+
+async def astream_workflow_events(
+    user_query: str,
+    user_token: Optional[str] = None,
+    company_id: Optional[int] = None,
+    company_ids: Optional[List[int]] = None,
+    thread_id: Optional[str] = None,
+    graph: Optional[Any] = None,
+    history: Optional[List[Any]] = None,
+    company_id_explicit: Optional[bool] = None,
+    token_delay_sec: float = 0.0,
+    steps_generator: Optional[Any] = None,
+):
+    """
+    Asynchronously stream fine-grained events from the workflow StateGraph.
+    Yields tuples of (event_type, payload) where event_type is one of:
+      - "step": {"node": str, "status": "completed", "elapsed_ms": float, "model": Optional[str]}
+      - "tool_start": {"tool": str, "input": Dict[str, Any]}
+      - "tool_end": {"tool": str, "status": "success" | "error", "elapsed_ms": float, "records_found": int}
+      - "token": {"content": str}
+      - "complete": accumulated_state_dict
+      - "error": {"detail": str}
+    """
+    started_at = time.perf_counter()
+    active_model = get_default_model_name()
+    tool_started_at = started_at
+    pending_tool_starts: List[str] = []
+    last_accumulated_state: Dict[str, Any] = {}
+
+    gen_func = steps_generator or astream_workflow_steps
+    step_stream = gen_func(
+        user_query=user_query,
+        user_token=user_token,
+        company_id=company_id,
+        company_ids=company_ids,
+        thread_id=thread_id,
+        graph=graph,
+        history=history,
+        company_id_explicit=company_id_explicit,
+    )
+
+    try:
+        async for node_name, update, accumulated_state in step_stream:
+            last_accumulated_state = accumulated_state
+            curr_model = accumulated_state.get("active_model") or active_model
+            node_elapsed_ms = round((time.perf_counter() - started_at) * 1000.0, 2)
+
+            # 1. Extractor node -> emit step, then emit tool_start if tools planned
+            if node_name == "extractor":
+                yield ("step", {
+                    "node": "extractor",
+                    "status": "completed",
+                    "elapsed_ms": node_elapsed_ms,
+                    "model": curr_model,
+                })
+
+                active_tools = accumulated_state.get("active_tools") or []
+                det_tool = accumulated_state.get("detected_tool")
+                det_params = accumulated_state.get("extracted_params") or {}
+
+                pending_tool_starts.clear()
+                if active_tools and len(active_tools) > 1:
+                    for t in active_tools:
+                        t_name = t.get("tool")
+                        t_params = sanitize_tool_params(t.get("params") or {})
+                        if t_name:
+                            pending_tool_starts.append(t_name)
+                            yield ("tool_start", {"tool": t_name, "input": t_params})
+                elif det_tool:
+                    pending_tool_starts.append(det_tool)
+                    yield ("tool_start", {"tool": det_tool, "input": sanitize_tool_params(det_params)})
+
+                tool_started_at = time.perf_counter()
+                continue
+
+            # 2. Tool node -> emit tool_end for executed tools, then emit step
+            if node_name == "tool_node":
+                tool_elapsed_ms = round((time.perf_counter() - tool_started_at) * 1000.0, 2)
+                is_error = accumulated_state.get("verification_status") == "ERROR"
+                status_str = "error" if is_error else "success"
+                active_tools = accumulated_state.get("active_tools") or []
+                det_tool = accumulated_state.get("detected_tool")
+                m_results = accumulated_state.get("multi_tool_results") or {}
+
+                if pending_tool_starts:
+                    for t_name in pending_tool_starts:
+                        t_res = m_results.get(t_name) if m_results else accumulated_state.get("tool_result")
+                        rec_count = resolve_tool_record_count(t_res)
+                        yield ("tool_end", {
+                            "tool": t_name,
+                            "status": status_str,
+                            "elapsed_ms": tool_elapsed_ms,
+                            "records_found": rec_count,
+                        })
+                    pending_tool_starts.clear()
+                elif det_tool:
+                    t_res = accumulated_state.get("tool_result")
+                    rec_count = resolve_tool_record_count(t_res)
+                    yield ("tool_end", {
+                        "tool": det_tool,
+                        "status": status_str,
+                        "elapsed_ms": tool_elapsed_ms,
+                        "records_found": rec_count,
+                    })
+
+                yield ("step", {
+                    "node": "tool_node",
+                    "status": "completed",
+                    "elapsed_ms": node_elapsed_ms,
+                    "model": curr_model,
+                })
+                continue
+
+            # 3. Synthesizer node -> emit tokens, then emit step
+            if node_name == "synthesizer":
+                final_ans = accumulated_state.get("final_answer", "")
+                if final_ans:
+                    chunks = chunk_text_for_streaming(final_ans)
+                    for c in chunks:
+                        yield ("token", {"content": c})
+                        if token_delay_sec > 0:
+                            await asyncio.sleep(token_delay_sec)
+
+                yield ("step", {
+                    "node": "synthesizer",
+                    "status": "completed",
+                    "elapsed_ms": node_elapsed_ms,
+                    "model": curr_model,
+                })
+                continue
+
+            # General step for other nodes (summarizer, router, verifier, rag_node)
+            yield ("step", {
+                "node": node_name,
+                "status": "completed",
+                "elapsed_ms": node_elapsed_ms,
+                "model": curr_model,
+            })
+
+        yield ("complete", last_accumulated_state)
+    except Exception as exc:
+        logger.exception("Error in astream_workflow_events: %s", exc)
+        yield ("error", {"detail": str(exc)})
+        raise
 
 
 _WORKFLOW_EXECUTOR: Optional[concurrent.futures.ThreadPoolExecutor] = None

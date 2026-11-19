@@ -24,6 +24,7 @@ class Settings(BaseSettings):
     REQUIRE_SERVICE_KEY: bool = Field(default=False, validation_alias="REQUIRE_SERVICE_KEY")
     INTERNAL_SERVICE_KEY: Optional[str] = Field(default=None, validation_alias="INTERNAL_SERVICE_KEY")
     MAX_CHECKPOINT_THREADS: int = Field(default=500, validation_alias="MAX_CHECKPOINT_THREADS")
+    SSE_HEARTBEAT_SECONDS: float = Field(default=15.0, validation_alias="SSE_HEARTBEAT_SECONDS")
 
     # 1. ERP Backend Connection
     ERP_BASE_URL: str = Field(

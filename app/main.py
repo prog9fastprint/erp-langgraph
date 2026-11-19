@@ -6,7 +6,9 @@ from contextlib import asynccontextmanager
 import hmac
 import json
 import logging
+import os
 import re
+import sys
 import time
 from typing import Annotated, Any, Dict, Optional, Set
 import uuid
@@ -17,6 +19,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from app.core.config import settings
 from app.graph.workflow import (
     arun_workflow,
+    astream_workflow_events,
     astream_workflow_steps,
     shutdown_workflow_executor,
 )
@@ -285,7 +288,7 @@ async def chat_endpoint(
 @app.post(
     "/api/v1/chat/stream",
     status_code=status.HTTP_200_OK,
-    summary="Stream real-time LangGraph node progress and final response via SSE",
+    summary="Stream real-time LangGraph node progress, tool lifecycle, tokens, and final response via SSE",
     tags=["Chat"],
 )
 async def chat_stream_endpoint(
@@ -294,8 +297,14 @@ async def chat_stream_endpoint(
     x_internal_service_key: Annotated[Optional[str], Header(alias="X-Internal-Service-Key")] = None,
 ) -> StreamingResponse:
     """
-    Execute LangGraph StateGraph pipeline and stream node progress events (event: step)
-    followed by the final ChatResponse payload (event: complete) as Server-Sent Events.
+    Execute LangGraph StateGraph pipeline and stream real-time events via Server-Sent Events (SSE):
+      - event: step (node progress updates)
+      - event: tool_start (sanitized ERP tool name and input filters)
+      - event: tool_end (tool duration, execution status, and record counts)
+      - event: token (synthesizer text chunks for typing effect)
+      - event: complete (final ChatResponse payload)
+      - : ping (heartbeat comment every 15s to keep proxy connections alive)
+      - event: error (pipeline failure diagnostics)
     """
     effective_token = _resolve_and_validate_auth(
         payload=payload,
@@ -305,31 +314,74 @@ async def chat_stream_endpoint(
     workflow_kwargs = _build_workflow_kwargs(payload, effective_token)
     started_at = time.perf_counter()
 
-    async def _event_generator():
-        accumulated_state: Dict[str, Any] = {}
-        active_model = get_default_model_name()
-        try:
-            async for node_name, _update, acc_state in astream_workflow_steps(**workflow_kwargs):
-                accumulated_state = acc_state
-                curr_model = accumulated_state.get("active_model") or active_model
-                step_payload = {
-                    "node": node_name,
-                    "status": "completed",
-                    "elapsed_ms": round((time.perf_counter() - started_at) * 1000.0, 2),
-                    "model": curr_model,
-                }
-                yield f"event: step\ndata: {json.dumps(step_payload, ensure_ascii=False)}\n\n"
+    is_test_env = (
+        "unittest" in sys.modules
+        or os.environ.get("FASTPRINT_TEST_ENV") == "true"
+        or settings.APP_ENV.strip().lower() == "test"
+    )
+    token_delay_sec = 0.0 if is_test_env else 0.01
 
-            chat_resp = _build_chat_response(accumulated_state, started_at)
-            yield f"event: complete\ndata: {chat_resp.model_dump_json()}\n\n"
-        except Exception as exc:
-            logger.exception("Unhandled error during chat SSE stream: %s", exc)
-            detail = (
-                "Chat workflow failed due to an internal server error."
-                if settings.APP_ENV.strip().lower() == "production"
-                else f"Chat workflow failed: {str(exc)}"
-            )
-            yield f"event: error\ndata: {json.dumps({'detail': detail}, ensure_ascii=False)}\n\n"
+    async def _event_generator():
+        q: asyncio.Queue[Optional[str]] = asyncio.Queue()
+        accumulated_state: Dict[str, Any] = {}
+
+        async def _producer():
+            try:
+                nonlocal accumulated_state
+                async for event_type, payload_data in astream_workflow_events(
+                    **workflow_kwargs,
+                    token_delay_sec=token_delay_sec,
+                    steps_generator=astream_workflow_steps,
+                ):
+                    if event_type == "step":
+                        await q.put(f"event: step\ndata: {json.dumps(payload_data, ensure_ascii=False)}\n\n")
+                    elif event_type == "tool_start":
+                        await q.put(f"event: tool_start\ndata: {json.dumps(payload_data, ensure_ascii=False)}\n\n")
+                    elif event_type == "tool_end":
+                        await q.put(f"event: tool_end\ndata: {json.dumps(payload_data, ensure_ascii=False)}\n\n")
+                    elif event_type == "token":
+                        await q.put(f"event: token\ndata: {json.dumps(payload_data, ensure_ascii=False)}\n\n")
+                    elif event_type == "complete":
+                        accumulated_state = payload_data
+                        chat_resp = _build_chat_response(accumulated_state, started_at)
+                        await q.put(f"event: complete\ndata: {chat_resp.model_dump_json()}\n\n")
+                    elif event_type == "error":
+                        detail = (
+                            "Chat workflow failed due to an internal server error."
+                            if settings.APP_ENV.strip().lower() == "production"
+                            else f"Chat workflow failed: {payload_data.get('detail', 'Unknown error')}"
+                        )
+                        await q.put(f"event: error\ndata: {json.dumps({'detail': detail}, ensure_ascii=False)}\n\n")
+            except Exception as exc:
+                logger.exception("Unhandled error during chat SSE stream producer: %s", exc)
+                detail = (
+                    "Chat workflow failed due to an internal server error."
+                    if settings.APP_ENV.strip().lower() == "production"
+                    else f"Chat workflow failed: {str(exc)}"
+                )
+                await q.put(f"event: error\ndata: {json.dumps({'detail': detail}, ensure_ascii=False)}\n\n")
+            finally:
+                await q.put(None)
+
+        producer_task = asyncio.create_task(_producer())
+        heartbeat_sec = float(getattr(settings, "SSE_HEARTBEAT_SECONDS", 15.0))
+
+        try:
+            while True:
+                try:
+                    frame = await asyncio.wait_for(q.get(), timeout=heartbeat_sec)
+                    if frame is None:
+                        break
+                    yield frame
+                except asyncio.TimeoutError:
+                    yield ": ping\n\n"
+        finally:
+            if not producer_task.done():
+                producer_task.cancel()
+                try:
+                    await producer_task
+                except (asyncio.CancelledError, Exception):
+                    pass
 
     return StreamingResponse(
         _event_generator(),
