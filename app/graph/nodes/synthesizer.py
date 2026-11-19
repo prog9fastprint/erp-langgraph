@@ -293,9 +293,9 @@ def _format_single_tool_presentation(
         diff = check.get("difference", 0.0)
         lines.append("\n#### Status Keseimbangan Neraca (Assets = Liabilities + Equity):")
         if is_bal and abs(diff) < 0.01:
-            lines.append("- **Status**: ✅ **SEIMBANG (BALANCED)** (Selisih: Rp 0,00)")
+            lines.append("- **Status**: **SEIMBANG (BALANCED)** (Selisih: Rp 0,00)")
         else:
-            lines.append(f"- **Status**: ⚠️ **TIDAK SEIMBANG** (Selisih: {_format_rupiah(diff)})")
+            lines.append(f"- **Status**: **TIDAK SEIMBANG** (Selisih: {_format_rupiah(diff)})")
 
         breakdown = tool_result.get("breakdown") or []
         if breakdown:
@@ -356,7 +356,7 @@ def _format_single_tool_presentation(
             lines.append(f"- **Total Tagihan Faktur**: {_format_rupiah(total_amount_sum)}")
             lines.append(f"- **Total Sisa Hutang Belum Lunas**: **{_format_rupiah(total_residual_sum)}**")
             if overdue_count > 0:
-                lines.append(f"- ⚠️ **Tagihan Lewat Jatuh Tempo (Overdue)**: **{overdue_count} faktur**")
+                lines.append(f"- **Tagihan Lewat Jatuh Tempo (Overdue)**: **{overdue_count} faktur**")
         else:
             lines.append("Tidak ada tagihan faktur vendor pada kriteria ini.")
         return "\n".join(lines)
@@ -390,9 +390,9 @@ def _format_single_tool_presentation(
         lines.append(f"- Transaksi Rekening Koran Belum Cocok: **{unrec_stmt} baris**")
         lines.append(f"- Transaksi Jurnal ERP Belum Cocok: **{unrec_gl} baris**")
         if abs(diff) < 0.01 and unrec_stmt == 0 and unrec_gl == 0:
-            lines.append("- **Status**: ✅ **Terekonsiliasi Sempurna (Fully Reconciled)**")
+            lines.append("- **Status**: **Terekonsiliasi Sempurna (Fully Reconciled)**")
         else:
-            lines.append("- **Status**: ⚠️ **Memerlukan Tindak Lanjut Pencocokan Transaksi**")
+            lines.append("- **Status**: **Memerlukan Tindak Lanjut Pencocokan Transaksi**")
         return "\n".join(lines)
 
     # 3. Stock Level
@@ -465,7 +465,7 @@ def _format_single_tool_presentation(
                 if missing_codes:
                     lines.append("")
                     for mc in missing_codes:
-                        lines.append(f"> ⚠️ **Catatan:** Kode SKU `{mc}` tidak ditemukan pada master data produk FastPrint ERP.")
+                        lines.append(f"> **Catatan:** Kode SKU `{mc}` tidak ditemukan pada master data produk FastPrint ERP.")
 
         return "\n".join(lines)
 
@@ -1175,7 +1175,7 @@ def format_deterministic_answer(state: AgentState) -> str:
     if domain == "out_of_scope":
         return (
             "### Permintaan di Luar Cakupan (Out of Scope)\n\n"
-            "Mohon maaf, permintaan Anda tidak dapat diproses karena berada di luar cakupan operasional Asisten AI FastPrint ERP.\n\n"
+            "Permintaan ini berada di luar cakupan operasional Asisten AI FastPrint ERP.\n\n"
             "Sistem ini dikhususkan untuk melayani penelusuran data operasional dan pembukuan internal perusahaan:\n"
             "- **Tagihan Vendor / Pemasok** (Hutang usaha & status verifikasi faktur)\n"
             "- **Saldo Akun Buku Kas & Neraca** (Accounting Balance & Kas Kecil)\n"
@@ -1344,6 +1344,83 @@ def _clean_label_emojis(label: str) -> str:
     cleaned = re.sub(r"[\U00010000-\U0010ffff\u2600-\u27bf\u2300-\u23ff\u2b50-\u2b55\u200d\ufe0f]", "", label)
     cleaned = re.sub(r"^[\s\-_:•>→↪]+", "", cleaned)
     return cleaned.strip()[:35]
+
+
+def _clean_ai_slop(text: str) -> str:
+    """
+    Sanitize LLM output by removing conversational AI slop, throat-clearing openers,
+    filler sign-offs, and empty corporate buzzwords.
+    Preserves tables, numeric calculations, markdown headers, and codeblocks intact.
+    """
+    if not text or not isinstance(text, str):
+        return ""
+
+    cleaned = text.strip()
+
+    # 1. Strip conversational throat-clearing openers from the beginning of text
+    opener_re = re.compile(
+        r"^(?:(?:Tentu(?: saja)?|Baik(?:lah)?|Halo)\s*[,!.:-]?\s*)+",
+        re.IGNORECASE,
+    )
+    cleaned = opener_re.sub("", cleaned).strip()
+
+    # Strip pretentious assistant intros: "Sebagai Asisten AI FastPrint ERP, ..."
+    asisten_re = re.compile(
+        r"^(?:Sebagai\s+Asisten\s+AI\s+FastPrint\s+ERP[^\n,.:]*[,.:]\s*)",
+        re.IGNORECASE,
+    )
+    cleaned = asisten_re.sub("", cleaned).strip()
+
+    # Strip redundant preamble: "Berdasarkan data yang (?:ada|tercatat|ditemukan)..."
+    preamble_re = re.compile(
+        r"^(?:Berdasarkan\s+data\s+(?:yang\s+)?(?:ada|tercatat|ditemukan)[^\n,.:]*[,.:]\s*)",
+        re.IGNORECASE,
+    )
+    cleaned = preamble_re.sub("", cleaned).strip()
+
+    # 2. Strip conversational closing sign-offs at the end of the text
+    closing_patterns = [
+        re.compile(r"(?:\n\s*)*\n\s*(?:Semoga\s+(?:informasi\s+ini\s+)?(?:bermanfaat|membantu)[^\n]*)[.!]?\s*$", re.IGNORECASE),
+        re.compile(r"(?:\n\s*)*\n\s*(?:Jangan\s+ragu\s+untuk\s+bertanya[^\n]*)[.!]?\s*$", re.IGNORECASE),
+        re.compile(r"(?:\n\s*)*\n\s*(?:Jika\s+(?:ada|Anda\s+memiliki)\s+pertanyaan[^\n]*)[.!]?\s*$", re.IGNORECASE),
+        re.compile(r"(?:\n\s*)*\n\s*(?:Silakan\s+tanyakan\s+(?:kembali|lagi)[^\n]*)[.!]?\s*$", re.IGNORECASE),
+        re.compile(r"(?:\n\s*)*\n\s*(?:Ada\s+(?:hal\s+lain|yang)\s+(?:bisa|dapat)\s+saya\s+bantu[^\n]*)[.?]?\s*$", re.IGNORECASE),
+    ]
+    for cp in closing_patterns:
+        cleaned = cp.sub("", cleaned).strip()
+
+    # 3. Strip empty metadiscourse phrases mid-text
+    cleaned = re.sub(
+        r"\b(?:Penting\s+untuk\s+dicatat\s+bahwa|Perlu\s+diperhatikan\s+bahwa|Dapat\s+disimpulkan\s+bahwa)\s+",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+
+    # 4. Strip unnecessary decorative emojis and emoticons
+    emoji_pattern = re.compile(
+        r"[\U00010000-\U0010ffff\u2600-\u27bf\u2300-\u23ff\u2b50-\u2b55\u200d\ufe0f]"
+    )
+    cleaned = emoji_pattern.sub("", cleaned)
+
+    emoticon_pattern = re.compile(
+        r"(?:\s|^)(?::[-~]?[)D(pP|/\\oO]|;[-~]?[)D]|<3|\^\^)(?=\s|$|[.,!?])"
+    )
+    cleaned = emoticon_pattern.sub("", cleaned)
+
+    # Fix extra spaces around markdown headers (#  Heading -> # Heading)
+    cleaned = re.sub(r"^(#{1,6})[ \t]{2,}", r"\1 ", cleaned, flags=re.MULTILINE)
+    # Fix extra spaces after bullet markers (-  Item -> - Item)
+    cleaned = re.sub(r"^(\s*[-*+])[ \t]{2,}", r"\1 ", cleaned, flags=re.MULTILINE)
+    # Trim trailing whitespace on each line
+    lines = [line.rstrip() for line in cleaned.splitlines()]
+    cleaned = "\n".join(lines).strip()
+
+    # 5. Capitalize first character if lowercase after trimming
+    if cleaned and cleaned[0].islower():
+        cleaned = cleaned[0].upper() + cleaned[1:]
+
+    return cleaned.strip()
 
 
 def _clean_trailing_followup_headers(text: str) -> str:
@@ -1721,7 +1798,7 @@ def synthesizer_node(
                     f"Ringkasan Laporan:\n{deterministic_answer[:1000]}"
                 )
                 response = model.invoke([
-                    SystemMessage(content="Anda adalah Asisten AI FastPrint ERP."),
+                    SystemMessage(content="Anda adalah Asisten AI FastPrint ERP yang presisi, lugas, dan bebas AI slop."),
                     HumanMessage(content=prompt),
                 ])
                 resp_meta = getattr(response, "response_metadata", {}) or {}
@@ -1735,11 +1812,15 @@ def synthesizer_node(
                         followups = llm_followups
             else:
                 prompt = (
-                    "Anda adalah Asisten AI FastPrint ERP yang profesional dan teliti.\n"
-                    "Sajikan data laporan berikut dalam Bahasa Indonesia yang formal, ringkas, dan jelas.\n"
-                    "Pertahankan seluruh angka transaksi, kode, dan rincian tabel Markdown dengan akurat tanpa mengubah nilai.\n"
-                    "DILARANG KERAS menghitung ulang atau mengestimasi angka nominal keuangan (omzet, HPP, laba kotor, laba bersih, selisih rekonsiliasi, saldo neraca). Seluruh angka wajib dikutip persis dari data laporan terstruktur.\n\n"
-                    "Selain menyajikan data laporan di atas, susunlah 2 hingga 3 rekomendasi pertanyaan/prompt lanjutan yang paling logis, relevan, dan kontekstual untuk diajukan pengguna berikutnya berdasarkan data riil yang ditemukan di atas (misal: rincian transaksi terkait, mutasi kartu stok produk ini, cek tagihan overdue, atau rekonsiliasi bank).\n\n"
+                    "Anda adalah Asisten AI FastPrint ERP yang profesional, presisi, dan lugas.\n"
+                    "Sajikan data laporan berikut dalam Bahasa Indonesia yang ringkas, jelas, dan bebas basa-basi (ZERO AI SLOP):\n"
+                    "1. LANGSUNG KE POKOK JAWABAN (Lead with the answer): Tuliskan angka total utama, saldo, atau status di kalimat paling pertama tanpa pengantar bertele-tele.\n"
+                    "2. DILARANG KERAS menggunakan basa-basi pembuka ('Tentu!', 'Berikut rinciannya...', 'Berdasarkan data...') maupun penutup ('Semoga membantu!', 'Jika ada pertanyaan lain...'). Hentikan respons langsung setelah data dan rekomendasi selesai disajikan.\n"
+                    "3. DILARANG KERAS menggunakan karakter emoji, emoticon (seperti 😊, :), 📊, 💰, 📦, 🏢, ✅, ⚠️, ❌), atau simbol dekoratif visual apapun pada judul, heading, poin peluru, tabel, maupun kalimat penjelas.\n"
+                    "4. DILARANG menggunakan kata klise korporat: mengoptimalkan, memfasilitasi, komprehensif, signifikan, ekosistem, holistik, menyeluruh, memberdayakan, penting untuk dicatat bahwa.\n"
+                    "5. PERTAHANKAN seluruh angka transaksi, kode, dan rincian tabel Markdown dengan akurat tanpa mengubah nilai.\n"
+                    "6. DILARANG KERAS menghitung ulang atau mengestimasi nominal keuangan. Seluruh angka wajib dikutip persis dari data laporan terstruktur.\n\n"
+                    "Selain menyajikan data laporan di atas, susunlah 2 hingga 3 rekomendasi pertanyaan/prompt lanjutan (READ-ONLY) yang paling logis, relevan, dan kontekstual untuk diajukan pengguna berikutnya berdasarkan data riil yang ditemukan di atas (misal: rincian transaksi terkait, mutasi kartu stok produk ini, cek tagihan overdue, atau rekonsiliasi bank).\n\n"
                     "ATURAN KETAT REKOMENDASI:\n"
                     "1. Wajib hanya menyarankan pertanyaan penelusuran data (READ-ONLY) pada modul FastPrint ERP yang didukung: Akuntansi (Saldo Akun, Jurnal, Buku Besar, Laba Rugi, Neraca, Tagihan Vendor, Rekonsiliasi Bank), Inventaris (Stok Fisik Gudang, Master Katalog & Harga, Kartu Stok, Mutasi Transfer, Alert Stok Rendah), dan Penjualan (Peringkat Produk Terlaris & Pendapatan Tertinggi). DILARANG menyarankan aksi membuat/mengubah transaksi atau modul di luar daftar ini.\n"
                     "2. Wajib menggunakan entitas riil (kode SKU, nama vendor, kode akun, nama gudang) yang terdapat pada data di atas.\n"
@@ -1756,7 +1837,7 @@ def synthesizer_node(
                     f"Data Laporan Terstruktur:\n{deterministic_answer}"
                 )
                 response = model.invoke([
-                    SystemMessage(content="Anda adalah Asisten AI FastPrint ERP."),
+                    SystemMessage(content="Anda adalah Asisten AI FastPrint ERP yang presisi, lugas, dan bebas AI slop."),
                     HumanMessage(content=prompt),
                 ])
                 resp_meta = getattr(response, "response_metadata", {}) or {}
@@ -1766,6 +1847,7 @@ def synthesizer_node(
                 content = getattr(response, "content", None)
                 if content and isinstance(content, str) and content.strip():
                     clean_ans, llm_followups = _extract_llm_followups(content.strip())
+                    clean_ans = _clean_ai_slop(clean_ans)
                     if clean_ans:
                         final_text = clean_ans
                     if llm_followups:

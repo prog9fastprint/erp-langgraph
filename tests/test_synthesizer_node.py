@@ -13,6 +13,7 @@ from app.graph.nodes.synthesizer import (
     synthesizer_node,
     format_deterministic_answer,
     _format_rupiah,
+    _clean_ai_slop,
 )
 
 
@@ -421,6 +422,126 @@ class TestSynthesizerNodeExecution(unittest.TestCase):
         self.assertIn("suggested_followups", update)
         labels = [f["label"] for f in update["suggested_followups"]]
         self.assertIn("Perluas Tanggal", labels)
+
+
+class TestSynthesizerAntiAiSlop(unittest.TestCase):
+    """Test suite validating AI slop removal, conversational filler sanitization, and output clarity."""
+
+    def test_clean_ai_slop_throat_clearing_openers(self):
+        """Sanitizer cleanly removes throat-clearing openers and assistant preambles."""
+        text1 = "Tentu saja! Total saldo kas utama saat ini adalah Rp 100.000.000,00."
+        self.assertEqual(_clean_ai_slop(text1), "Total saldo kas utama saat ini adalah Rp 100.000.000,00.")
+
+        text2 = "Baiklah, berikut ringkasan data tagihan vendor:"
+        self.assertEqual(_clean_ai_slop(text2), "Berikut ringkasan data tagihan vendor:")
+
+        text3 = "Sebagai Asisten AI FastPrint ERP, stok produk HVS A4 saat ini tersedia 50 unit."
+        self.assertEqual(_clean_ai_slop(text3), "Stok produk HVS A4 saat ini tersedia 50 unit.")
+
+    def test_clean_ai_slop_closing_filler(self):
+        """Sanitizer cleanly removes conversational sign-offs, helpfulness cliches, and fluff endings."""
+        text1 = "Total tagihan: Rp 5.000.000,00.\n\nSemoga informasi ini bermanfaat!"
+        self.assertEqual(_clean_ai_slop(text1), "Total tagihan: Rp 5.000.000,00.")
+
+        text2 = "Stok tersedia 25 unit.\n\nJangan ragu untuk bertanya kembali jika ada hal lain yang perlu diperiksa."
+        self.assertEqual(_clean_ai_slop(text2), "Stok tersedia 25 unit.")
+
+        text3 = "Saldo kas: Rp 10.000.000,00.\n\nAda yang bisa saya bantu lagi?"
+        self.assertEqual(_clean_ai_slop(text3), "Saldo kas: Rp 10.000.000,00.")
+
+    def test_clean_ai_slop_metadiscourse_stripping(self):
+        """Sanitizer strips empty metadiscourse phrases mid-text."""
+        text = "Penting untuk dicatat bahwa faktur ini telah melewati tanggal jatuh tempo."
+        self.assertEqual(_clean_ai_slop(text), "Faktur ini telah melewati tanggal jatuh tempo.")
+
+    def test_clean_ai_slop_preserves_tables_and_formatting(self):
+        """Sanitizer preserves markdown tables, currency numbers, and bullet points intact."""
+        raw_markdown = (
+            "### Laporan Transaksi Tagihan\n\n"
+            "| No | Nomor Dokumen | Tanggal | Total Debit |\n"
+            "|:---|:---|:---|:---|\n"
+            "| 1 | `BILL/2026/001` | 2026-11-05 | Rp 5.000.000,00 |\n\n"
+            "#### Ringkasan:\n"
+            "- **Total Tagihan**: Rp 5.000.000,00"
+        )
+        self.assertEqual(_clean_ai_slop(raw_markdown), raw_markdown)
+
+    def test_synthesizer_node_llm_output_is_sanitized(self):
+        """Synthesizer node cleanly removes AI slop from LLM-generated output before returning state."""
+        mock_llm = MagicMock()
+        mock_response = MagicMock()
+        mock_response.content = (
+            "Tentu saja! Berikut ringkasan stok produk HVS A4:\n"
+            "- Total Stok: 50 unit\n\n"
+            "Semoga informasi ini bermanfaat!\n\n"
+            "```json:followups\n"
+            "[\n"
+            '  {"label": "Riwayat Kartu Stok", "query": "Cek riwayat kartu stok HVS A4", "icon": "fa-clock-rotate-left"}\n'
+            "]\n"
+            "```"
+        )
+        mock_llm.invoke.return_value = mock_response
+
+        state = create_initial_state(user_query="Cek stok HVS A4")
+        state["detected_domain"] = "inventory"
+        state["detected_tool"] = "get_stock_level"
+        state["verification_status"] = "VALID"
+        state["extracted_params"] = {"code": "HVS-A4"}
+
+        update = synthesizer_node(state, llm=mock_llm)
+        final_answer = update["final_answer"]
+
+        self.assertNotIn("Tentu saja!", final_answer)
+        self.assertNotIn("Semoga informasi ini bermanfaat!", final_answer)
+        self.assertIn("Berikut ringkasan stok produk HVS A4:", final_answer)
+        self.assertIn("- Total Stok: 50 unit", final_answer)
+        self.assertEqual(len(update["suggested_followups"]), 1)
+        self.assertEqual(update["suggested_followups"][0]["label"], "Riwayat Kartu Stok")
+
+    def test_clean_ai_slop_removes_decorative_emojis_and_emoticons(self):
+        """Sanitizer strips all decorative emoticons and emojis from LLM generated text."""
+        raw = (
+            "### 📊 Ringkasan Laporan Keuangan 😊\n\n"
+            "- 💰 Total Tagihan: Rp 5.000.000,00 :)\n"
+            "- 📦 Status Barang: Tersedia di Gudang 🏢 ^^"
+        )
+        cleaned = _clean_ai_slop(raw)
+        self.assertNotIn("📊", cleaned)
+        self.assertNotIn("😊", cleaned)
+        self.assertNotIn("💰", cleaned)
+        self.assertNotIn(":)", cleaned)
+        self.assertNotIn("📦", cleaned)
+        self.assertNotIn("🏢", cleaned)
+        self.assertNotIn("^^", cleaned)
+        self.assertIn("### Ringkasan Laporan Keuangan", cleaned)
+        self.assertIn("- Total Tagihan: Rp 5.000.000,00", cleaned)
+        self.assertIn("- Status Barang: Tersedia di Gudang", cleaned)
+
+    def test_deterministic_answer_has_no_decorative_emojis(self):
+        """Verify deterministic financial status blocks have zero unnecessary emojis (e.g. checkmarks, warning icons)."""
+        state = create_initial_state(user_query="Rekonsiliasi bank")
+        state["detected_domain"] = "accounting"
+        state["detected_tool"] = "get_bank_reconciliation_summary"
+        state["verification_status"] = "VALID"
+        state["tool_result"] = {
+            "journal_name": "Bank BCA",
+            "bank_account_code": "111201",
+            "bank_account_name": "BCA Operasional",
+            "date_from": "2026-11-01",
+            "date_to": "2026-11-19",
+            "summary": {
+                "bank_statement_balance": 50000000.0,
+                "erp_book_balance": 50000000.0,
+                "difference": 0.0,
+                "unreconciled_statement_lines_count": 0,
+                "unreconciled_gl_lines_count": 0,
+            },
+        }
+
+        output = format_deterministic_answer(state)
+        self.assertNotIn("✅", output)
+        self.assertNotIn("⚠️", output)
+        self.assertIn("Terekonsiliasi Sempurna (Fully Reconciled)", output)
 
 
 if __name__ == "__main__":
