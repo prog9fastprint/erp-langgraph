@@ -24,28 +24,8 @@ logger = logging.getLogger("router_node")
 
 class PlannedToolCall(BaseModel):
     """Structured representation of an individual ERP tool call planned by router."""
-    tool: Literal[
-        "fetch_vendor_invoices",
-        "get_account_balance",
-        "get_journal_entries",
-        "get_general_ledger",
-        "get_profit_and_loss",
-        "get_balance_sheet",
-        "get_vendor_bills",
-        "get_bank_reconciliation_summary",
-        "get_stock_level",
-        "get_product_info",
-        "get_locations",
-        "get_stock_history",
-        "get_transfers",
-        "get_low_stock_alerts",
-        "get_stock_adjustments",
-        "get_scrap_records",
-        "get_warehouses",
-        "get_product_categories",
-        "get_top_selling_products",
-    ] = Field(..., description="Target ERP tool name.")
-    domain: Literal["accounting", "inventory", "sales"] = Field(
+    tool: str = Field(..., description="Target ERP tool name.")
+    domain: Literal["accounting", "inventory", "sales", "hr", "purchasing", "general"] = Field(
         ...,
         description="Target ERP domain: 'accounting', 'inventory', or 'sales'."
     )
@@ -57,7 +37,12 @@ class PlannedToolCall(BaseModel):
     @model_validator(mode="after")
     def validate_tool_domain(self) -> "PlannedToolCall":
         """Ensure domain aligns with the tool's registered domain."""
-        expected = TOOL_DOMAIN_MAP.get(self.tool)
+        from app.services.tool_registry_service import get_tool_registry_service
+        registry = get_tool_registry_service()
+        registered = registry.get_tool_by_name(self.tool)
+        if self.tool not in TOOL_DOMAIN_MAP and registered is None:
+            raise ValueError(f"Unregistered tool: '{self.tool}'. Tool must be registered in TOOL_DOMAIN_MAP or ToolRegistryService.")
+        expected = TOOL_DOMAIN_MAP.get(self.tool) or (registered.get("domain") if registered else None)
         if expected and self.domain != expected:
             self.domain = expected
         return self
@@ -73,27 +58,7 @@ class RouterDecision(BaseModel):
         "live_erp",
         description="Execution mode: 'vector_rag' for SOP/policies/specs, 'live_erp' for real-time transactions/stock, 'hybrid' for combined questions, 'general', or 'out_of_scope'."
     )
-    tool: Optional[Literal[
-        "fetch_vendor_invoices",
-        "get_account_balance",
-        "get_journal_entries",
-        "get_general_ledger",
-        "get_profit_and_loss",
-        "get_balance_sheet",
-        "get_vendor_bills",
-        "get_bank_reconciliation_summary",
-        "get_stock_level",
-        "get_product_info",
-        "get_locations",
-        "get_stock_history",
-        "get_transfers",
-        "get_low_stock_alerts",
-        "get_stock_adjustments",
-        "get_scrap_records",
-        "get_warehouses",
-        "get_product_categories",
-        "get_top_selling_products",
-    ]] = Field(
+    tool: Optional[str] = Field(
         None,
         description="Target tool name to invoke in ERP backend, or null if knowledge / general / out_of_scope."
     )
@@ -124,27 +89,7 @@ class MultiRouterDecision(BaseModel):
         "live_erp",
         description="Execution mode: 'vector_rag', 'live_erp', 'hybrid', 'general', or 'out_of_scope'."
     )
-    tool: Optional[Literal[
-        "fetch_vendor_invoices",
-        "get_account_balance",
-        "get_journal_entries",
-        "get_general_ledger",
-        "get_profit_and_loss",
-        "get_balance_sheet",
-        "get_vendor_bills",
-        "get_bank_reconciliation_summary",
-        "get_stock_level",
-        "get_product_info",
-        "get_locations",
-        "get_stock_history",
-        "get_transfers",
-        "get_low_stock_alerts",
-        "get_stock_adjustments",
-        "get_scrap_records",
-        "get_warehouses",
-        "get_product_categories",
-        "get_top_selling_products",
-    ]] = Field(
+    tool: Optional[str] = Field(
         None,
         description="Primary target tool name (for backward compatibility), or null if general/out_of_scope/knowledge."
     )
@@ -176,8 +121,11 @@ class MultiRouterDecision(BaseModel):
 
         # If primary tool is specified without planned_tools, synthesize planned_tools
         if self.tool and not self.planned_tools:
-            d = TOOL_DOMAIN_MAP.get(self.tool, self.domain)
-            if d in ("accounting", "inventory"):
+            from app.services.tool_registry_service import get_tool_registry_service
+            registry = get_tool_registry_service()
+            registered = registry.get_tool_by_name(self.tool)
+            d = TOOL_DOMAIN_MAP.get(self.tool) or (registered.get("domain") if registered else self.domain)
+            if d in ("accounting", "inventory", "sales"):
                 self.planned_tools = [PlannedToolCall(tool=self.tool, domain=d)]
 
         return self
@@ -328,6 +276,30 @@ SALES_TOP_PRODUCTS_PATTERNS = [
     r"\b(?:pendapatan|omset|omzet|penjualan)\s+(?:tertinggi|terbesar)\s+(?:per\s+|tiap\s+)?(?:produk|barang|sku)\b",
     r"\bproduk\s+terlaris\b",
     r"\bproduk\s+paling\s+laku\b",
+]
+
+SALES_SUMMARY_PATTERNS = [
+    r"\b(?:ringkasan|summary|performa|laporan)\s+(?:penjualan|sales|omzet|omset)\b",
+    r"\b(?:total|berapa)\s+(?:omzet|omset|penjualan)\b",
+    r"\b(?:omzet|omset)\s+(?:penjualan|bulan\s+ini|tahun\s+ini|hari\s+ini|kemarin|periode)\b",
+    r"\b(?:omzet|omset)\s+(?:cabang|perusahaan|toko)\b",
+    r"\b(?:rata-rata|aov)\s+(?:nilai\s+order|pesanan|penjualan)\b",
+]
+
+SALES_ORDER_DETAIL_PATTERNS = [
+    r"\b(?:detail|rincian|status|info|cek)\s+(?:so|sales\s*order|pesanan|order)\s+(?:nomor\s+|no\s*)?([a-zA-Z0-9/\-_]+)\b",
+    r"\b(?:detail|rincian)\s+(?:so|sales\s*order|pesanan|order)\b",
+    r"\b(?:lacak|resi|awb)\s+(?:so|pesanan|order|pengiriman)\b",
+    r"\b(?:so|sales\s*order)\s*(?:nomor\s+|no\s*)?[a-zA-Z0-9/\-_]+\s+(?:status|detail|rincian)\b",
+    r"\bso/\d{4}/\d+\b",
+]
+
+SALES_ORDERS_PATTERNS = [
+    r"\b(?:daftar|list|tampilkan|cari|cek)\s+(?:so|sales\s*order|order\s+penjualan|pesanan\s+penjualan|quotation|penawaran)\b",
+    r"\b(?:so|sales\s*order|order\s+penjualan|pesanan)\s+(?:terbaru|hari\s+ini|bulan\s+ini|kemarin|minggu\s+ini|pending|draft|cancel)\b",
+    r"\b(?:ada\s+berapa|daftar)\s+(?:pesanan|order)\s+(?:dari|customer|pelanggan)\b",
+    r"\bdaftar\s+pesanan\b",
+    r"\bpesanan\s+penjualan\b",
 ]
 
 INVENTORY_PRODUCT_PATTERNS = [
@@ -632,8 +604,23 @@ def classify_query_rule_based(query: str) -> Optional[Dict[str, Any]]:
     if m_top_sales:
         candidates.append(("get_top_selling_products", "sales", m_top_sales.start()))
 
+    # Sales: Summary / Omzet
+    m_sales_summary = _find_first_match(SALES_SUMMARY_PATTERNS, cleaned)
+    if m_sales_summary and not m_top_sales:
+        candidates.append(("get_sales_summary", "sales", m_sales_summary.start()))
+
+    # Sales: Order Detail
+    m_sales_detail = _find_first_match(SALES_ORDER_DETAIL_PATTERNS, cleaned)
+    if m_sales_detail and not m_top_sales and not m_sales_summary:
+        candidates.append(("get_sales_order_detail", "sales", m_sales_detail.start()))
+
+    # Sales: Orders List
+    m_sales_orders = _find_first_match(SALES_ORDERS_PATTERNS, cleaned)
+    if m_sales_orders and not m_top_sales and not m_sales_summary and not m_sales_detail:
+        candidates.append(("get_sales_orders", "sales", m_sales_orders.start()))
+
     # Inventory: Product info
-    if not is_rag and not m_top_sales:
+    if not is_rag and not m_top_sales and not m_sales_summary and not m_sales_detail and not m_sales_orders:
         # If stock level pattern matched, only add product_info if explicit product catalog detail terms are present
         # (avoid treating "stok produk ...", "sku ...", or "barcode ..." as a separate product_info tool call)
         if m_stock:
@@ -672,7 +659,7 @@ def classify_query_rule_based(query: str) -> Optional[Dict[str, Any]]:
     # 1. Negative Guardrail: Customer Invoice / Billing Inquiries
     has_customer_billing = has_customer and (
         any(term in cleaned for term in CUSTOMER_BILLING_TERMS)
-        or (bool(candidates) and all(c[1] != "inventory" for c in candidates))
+        or (bool(candidates) and all(c[1] not in ("inventory", "sales") for c in candidates))
         or not candidates
     )
     if has_customer_billing and not has_vendor and not has_purchase_invoice and not is_rag:
@@ -779,19 +766,35 @@ def classify_query_rule_based(query: str) -> Optional[Dict[str, Any]]:
 def _annotate_multi_company(res: Dict[str, Any], state: AgentState, user_query: str) -> Dict[str, Any]:
     if not isinstance(res, dict):
         return res
-    from app.graph.nodes.extractor import resolve_all_branch_company_ids, COMPANY_NAME_MAP
+    from app.graph.nodes.extractor import (
+        resolve_all_branch_company_ids,
+        resolve_branch_company_id,
+        COMPANY_NAME_MAP,
+    )
     multi_cids, is_all = resolve_all_branch_company_ids(user_query)
-    is_multi_co = bool(state.get("is_multi_company") or is_all or (len(multi_cids) > 1))
-    if is_multi_co:
+    explicit_single = resolve_branch_company_id(user_query)
+
+    if is_all:
         res["is_multi_company"] = True
-        effective_cids = (
-            state.get("company_ids")
-            if (state.get("company_ids") and len(state.get("company_ids")) > 1 and not is_all and not multi_cids)
-            else (multi_cids if multi_cids else (state.get("company_ids") or list(COMPANY_NAME_MAP.keys())))
-        )
-        if effective_cids:
-            res["company_ids"] = effective_cids
-            res["company_id"] = effective_cids[0]
+        effective_cids = list(COMPANY_NAME_MAP.keys())
+        res["company_ids"] = effective_cids
+        res["company_id"] = effective_cids[0]
+    elif len(multi_cids) > 1:
+        res["is_multi_company"] = True
+        res["company_ids"] = multi_cids
+        res["company_id"] = multi_cids[0]
+    elif explicit_single is not None or len(multi_cids) == 1:
+        # Explicit single company overrides prior multi-company state
+        target_cid = explicit_single if explicit_single is not None else multi_cids[0]
+        res["is_multi_company"] = False
+        res["company_id"] = target_cid
+        res["company_ids"] = [target_cid]
+    elif state.get("is_multi_company") and state.get("company_ids"):
+        # Follow-up without branch mention inherits prior multi-company scope
+        effective_cids = [int(c) for c in state.get("company_ids") if c]
+        res["is_multi_company"] = True
+        res["company_ids"] = effective_cids
+        res["company_id"] = (effective_cids or [1])[0]
     return res
 
 
@@ -805,8 +808,10 @@ def router_node(
     """
     user_query = state.get("user_query")
     if not user_query and state.get("messages"):
-        last_msg = state["messages"][-1]
-        user_query = getattr(last_msg, "content", "") or ""
+        for msg in reversed(state["messages"]):
+            if isinstance(msg, HumanMessage) or getattr(msg, "type", "") in ("human", "user"):
+                user_query = getattr(msg, "content", "") or ""
+                break
 
     user_query = (user_query or "").strip()
     raw_res = _router_node_impl(state=state, llm=llm, user_query=user_query)
@@ -861,6 +866,14 @@ def _router_node_impl(
     try:
         rule_result = classify_query_rule_based(user_query)
         if rule_result is not None:
+            from app.services.tool_registry_service import get_tool_registry_service
+            registry = get_tool_registry_service()
+            avail = []
+            for t_name in rule_result.get("detected_tools", []):
+                meta = registry.get_tool_by_name(t_name)
+                if meta:
+                    avail.append(meta)
+            rule_result["available_tools"] = avail
             return rule_result
     except Exception as exc:
         logger.warning(f"Error in rule-based classifier for query '{user_query}': {exc}")
@@ -873,7 +886,7 @@ def _router_node_impl(
     if len(history_messages) > 1:
         prior_q = find_previous_user_query(history_messages)
         if prior_q:
-            from app.graph.nodes.extractor import resolve_branch_company_id
+            from app.graph.nodes.extractor import resolve_branch_company_id, strip_company_scope_keywords
 
             clean_uq = user_query.strip().rstrip("?!.,;: '\"").lower()
             is_branch_mention = bool(resolve_branch_company_id(clean_uq)) or bool(
@@ -889,7 +902,11 @@ def _router_node_impl(
                     prior_result = classify_query_rule_based(prior_q)
                     if prior_result is not None and prior_result.get("detected_domain") in ("accounting", "inventory"):
                         effective_sub = user_query if is_branch_mention else prior_q
-                        effective_user = f"{prior_q} {user_query}" if is_branch_mention else prior_q
+                        if is_branch_mention:
+                            sanitized_prior = strip_company_scope_keywords(prior_q)
+                            effective_user = f"{sanitized_prior} {user_query}".strip() if sanitized_prior else user_query
+                        else:
+                            effective_user = prior_q
                         followup_tools = [
                             {
                                 "tool": t["tool"],
@@ -929,7 +946,11 @@ def _router_node_impl(
                 try:
                     prior_result = classify_query_rule_based(prior_q)
                     if prior_result is not None and prior_result.get("detected_domain") in ("accounting", "inventory"):
-                        effective_sub = f"{prior_q} {user_query}"
+                        if is_branch_mention:
+                            sanitized_prior = strip_company_scope_keywords(prior_q)
+                            effective_sub = f"{sanitized_prior} {user_query}".strip() if sanitized_prior else user_query
+                        else:
+                            effective_sub = f"{prior_q} {user_query}"
                         followup_tools = [
                             {
                                 "tool": t["tool"],
@@ -1069,12 +1090,64 @@ def _router_node_impl(
                 "detected_tools": detected_tools,
                 "active_tools": active_tools,
             }
+            from app.services.tool_registry_service import get_tool_registry_service
+            registry = get_tool_registry_service()
+            avail = []
+            for t_name in detected_tools:
+                meta = registry.get_tool_by_name(t_name)
+                if meta:
+                    avail.append(meta)
+            result["available_tools"] = avail
+
             if is_retry and prior_query:
                 result["user_query"] = prior_query
                 result["retry_instruction"] = f"Mengulang permintaan: {prior_query}"
             return result
         except Exception:
             pass
+
+    # Step 2.5: Dynamic Semantic Tool Retrieval via PGVector / In-Memory Catalog
+    if settings.DYNAMIC_TOOL_RETRIEVAL_ENABLED:
+        try:
+            from app.services.tool_registry_service import get_tool_registry_service
+            registry = get_tool_registry_service()
+            user_roles = state.get("user_roles")
+            candidates = registry.search_tools_sync(
+                query=user_query,
+                user_roles=user_roles,
+                top_k=settings.TOOL_RETRIEVAL_TOP_K,
+                distance_threshold=settings.TOOL_RETRIEVAL_DISTANCE_THRESHOLD,
+            )
+            if candidates:
+                best_match = candidates[0]
+                best_tool = best_match["tool_name"]
+                best_domain = best_match["domain"]
+                active_tools = [
+                    {
+                        "tool": best_tool,
+                        "domain": best_domain,
+                        "sub_query": user_query,
+                        "params": {},
+                        "status": "pending",
+                    }
+                ]
+                result_dynamic: Dict[str, Any] = {
+                    "detected_domain": best_domain,
+                    "detected_tool": best_tool,
+                    "query_mode": "live_erp",
+                    "rag_query": None,
+                    "is_multi_tool": False,
+                    "detected_domains": [best_domain],
+                    "detected_tools": [best_tool],
+                    "active_tools": active_tools,
+                    "available_tools": candidates,
+                }
+                if is_retry and prior_query:
+                    result_dynamic["user_query"] = prior_query
+                    result_dynamic["retry_instruction"] = f"Mengulang permintaan: {prior_query}"
+                return result_dynamic
+        except Exception as exc:
+            logger.warning(f"Error in dynamic semantic tool retrieval during router execution: {exc}")
 
     # Default fallback when unclassified
     return {
@@ -1086,4 +1159,5 @@ def _router_node_impl(
         "detected_domains": ["general"],
         "detected_tools": [],
         "active_tools": [],
+        "available_tools": [],
     }

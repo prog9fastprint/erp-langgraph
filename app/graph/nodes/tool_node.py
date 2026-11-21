@@ -241,6 +241,9 @@ async def tool_node(
             "get_warehouses": erp_client.fetch_warehouses,
             "get_product_categories": erp_client.fetch_product_categories,
             "get_top_selling_products": erp_client.fetch_top_selling_products,
+            "get_sales_orders": erp_client.fetch_sales_orders,
+            "get_sales_order_detail": erp_client.fetch_sales_order_detail,
+            "get_sales_summary": erp_client.fetch_sales_summary,
         }
 
         active_tools = state.get("active_tools")
@@ -418,6 +421,8 @@ async def tool_node(
                 "tool_result": primary_result,
                 "verification_status": "ERROR" if all_failed else "VALID",
                 "error_message": "; ".join(errors) if all_failed else (errors[0] if errors else None),
+                "is_multi_company": False,
+                "multi_company_results": {},
             }
 
         # ------------------------------------------------------------------
@@ -447,6 +452,10 @@ async def tool_node(
 
         return {
             "company_id": target_company_id,
+            "company_ids": [target_company_id],
+            "is_multi_company": False,
+            "multi_company_results": {},
+            "unauthorized_companies": [],
             "tool_result": final_tool_result,
             "multi_tool_results": {detected_tool: final_tool_result},
             "multi_verification_status": {detected_tool: "VALID"},

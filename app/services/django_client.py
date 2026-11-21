@@ -34,6 +34,9 @@ from app.schemas.tools import (
     WarehousesFilterSchema,
     ProductCategoriesFilterSchema,
     TopSellingProductsFilterSchema,
+    SalesOrdersFilterSchema,
+    SalesOrderDetailFilterSchema,
+    SalesSummaryFilterSchema,
 )
 
 logger = logging.getLogger("django_client")
@@ -791,6 +794,51 @@ class DjangoCoreClient:
         return await self.execute_tool(
             domain="sales",
             tool_name="get_top_selling_products",
+            params=_clean_params(params),
+            company_id=company_id,
+            user_token=user_token,
+        )
+
+    async def fetch_sales_orders(
+        self,
+        params: Optional[Union[SalesOrdersFilterSchema, Dict[str, Any]]] = None,
+        user_token: Optional[str] = None,
+        company_id: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Call sales.get_sales_orders tool."""
+        return await self.execute_tool(
+            domain="sales",
+            tool_name="get_sales_orders",
+            params=_clean_params(params),
+            company_id=company_id,
+            user_token=user_token,
+        )
+
+    async def fetch_sales_order_detail(
+        self,
+        params: Optional[Union[SalesOrderDetailFilterSchema, Dict[str, Any]]] = None,
+        user_token: Optional[str] = None,
+        company_id: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Call sales.get_sales_order_detail tool."""
+        return await self.execute_tool(
+            domain="sales",
+            tool_name="get_sales_order_detail",
+            params=_clean_params(params),
+            company_id=company_id,
+            user_token=user_token,
+        )
+
+    async def fetch_sales_summary(
+        self,
+        params: Optional[Union[SalesSummaryFilterSchema, Dict[str, Any]]] = None,
+        user_token: Optional[str] = None,
+        company_id: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Call sales.get_sales_summary tool."""
+        return await self.execute_tool(
+            domain="sales",
+            tool_name="get_sales_summary",
             params=_clean_params(params),
             company_id=company_id,
             user_token=user_token,

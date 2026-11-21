@@ -46,6 +46,9 @@ class AgentState(TypedDict, total=False):
     # 2. User Context & Multi-Company Scoping
     user_query: str
     user_token: Optional[str]
+    auth_token: Optional[str]
+    user_id: Optional[str]
+    user_roles: Optional[List[str]]
     company_id: Optional[int]
     company_ids: Optional[List[int]]
     is_multi_company: Optional[bool]
@@ -60,6 +63,7 @@ class AgentState(TypedDict, total=False):
     detected_domains: Optional[List[str]] # List of all detected domains e.g. ["inventory", "accounting"]
     detected_tools: Optional[List[str]]   # List of all detected tool names
     active_tools: Optional[List[ToolCallPlan]] # Ordered list of subagent tool execution plans
+    available_tools: Optional[List[Dict[str, Any]]] # Candidates retrieved via ToolRegistryService
 
     # 4. Tool Execution & Output Data
     tool_result: Optional[Dict[str, Any]] # Legacy/primary raw data & calculations returned from ERP
@@ -96,6 +100,9 @@ def create_initial_state(
     is_multi_tool: Optional[bool] = False,
     is_multi_company: Optional[bool] = False,
     active_model: Optional[str] = None,
+    auth_token: Optional[str] = None,
+    user_id: Optional[str] = None,
+    user_roles: Optional[List[str]] = None,
 ) -> AgentState:
     """
     Construct a clean initial AgentState dictionary with standard defaults.
@@ -120,10 +127,14 @@ def create_initial_state(
     effective_cids = list(company_ids) if company_ids else ([primary_cid] if primary_cid is not None else [1])
     is_multi_co = bool(is_multi_company or (company_ids and len(company_ids) > 1))
 
+    effective_token = user_token or auth_token
     return {
         "messages": initial_messages,
         "user_query": user_query,
-        "user_token": user_token,
+        "user_token": effective_token,
+        "auth_token": effective_token,
+        "user_id": user_id,
+        "user_roles": user_roles or [],
         "company_id": primary_cid,
         "company_ids": effective_cids,
         "is_multi_company": is_multi_co,
@@ -149,6 +160,7 @@ def create_initial_state(
         "detected_domains": [],
         "detected_tools": [],
         "active_tools": [],
+        "available_tools": [],
         "multi_tool_results": {},
         "multi_verification_status": {},
     }

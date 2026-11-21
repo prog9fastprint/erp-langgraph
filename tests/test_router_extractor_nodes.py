@@ -1402,6 +1402,124 @@ class TestMultiToolExtractorNode(unittest.TestCase):
         wh_res2 = _fallback_extract_warehouses("list master warehouses")
         self.assertNotIn("search", wh_res2)
 
+    def test_strip_company_scope_keywords(self):
+        """Verify strip_company_scope_keywords cleanly strips all-company rollups and prior branches."""
+        from app.graph.nodes.extractor import strip_company_scope_keywords
+
+        s1 = strip_company_scope_keywords("coba cek laba rugi untuk semua cabang + headoffice 2026")
+        self.assertEqual(s1, "coba cek laba rugi 2026")
+
+        s2 = strip_company_scope_keywords("cek stok tinta di cabang bandung bulan ini")
+        self.assertEqual(s2, "cek stok tinta bulan ini")
+
+    def test_multi_company_followup_scoping_to_single_branch(self):
+        """
+        Verify multi-turn flow:
+        Turn 1: 'coba cek laba rugi untuk semua cabang + headoffice 2026'
+        Turn 2: 'coba cek detail mainstore'
+        Properly scopes down to Main Store (company_id: 4), is_multi_company=False, and include_breakdown=True.
+        """
+        history = [
+            HumanMessage(content="coba cek laba rugi untuk semua cabang + headoffice 2026"),
+            AIMessage(content="### Laporan Laba Rugi Multi-Perusahaan..."),
+            HumanMessage(content="coba cek detail mainstore"),
+        ]
+        state = {
+            "messages": history,
+            "user_query": "coba cek detail mainstore",
+            "company_id": 1,
+            "company_ids": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 17],
+            "is_multi_company": True,
+        }
+
+        r_out = router_node(state)
+        self.assertIn("coba cek laba rugi 2026", r_out.get("user_query", ""))
+        self.assertNotIn("semua cabang", r_out.get("user_query", ""))
+        self.assertFalse(r_out.get("is_multi_company"))
+        self.assertEqual(r_out.get("company_id"), 4)
+        self.assertEqual(r_out.get("company_ids"), [4])
+
+        state.update(r_out)
+        e_out = extractor_node(state)
+        self.assertFalse(e_out.get("is_multi_company"))
+        self.assertEqual(e_out.get("company_id"), 4)
+        self.assertEqual(e_out.get("company_ids"), [4])
+        self.assertEqual(e_out.get("multi_company_results"), {})
+        params = e_out.get("extracted_params") or {}
+        self.assertEqual(params.get("company_id"), 4)
+        self.assertTrue(params.get("include_breakdown"))
+
+    def test_multi_company_followup_subset_branches(self):
+        """Verify follow-up specifying 2 branches runs multi-company restricted only to those 2 branches."""
+        history = [
+            HumanMessage(content="coba cek laba rugi untuk semua cabang + headoffice 2026"),
+            AIMessage(content="### Laporan Laba Rugi Multi-Perusahaan..."),
+            HumanMessage(content="bagaimana dengan mainstore dan surabaya?"),
+        ]
+        state = {
+            "messages": history,
+            "user_query": "bagaimana dengan mainstore dan surabaya?",
+            "company_id": 1,
+            "company_ids": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 17],
+            "is_multi_company": True,
+        }
+
+        r_out = router_node(state)
+        self.assertTrue(r_out.get("is_multi_company"))
+        self.assertEqual(r_out.get("company_ids"), [4, 7])
+
+        state.update(r_out)
+        e_out = extractor_node(state)
+        self.assertTrue(e_out.get("is_multi_company"))
+        self.assertEqual(e_out.get("company_ids"), [4, 7])
+
+    def test_multi_company_followup_no_branch_preserves_scope(self):
+        """Verify follow-up without naming any branch preserves prior multi-company scope."""
+        history = [
+            HumanMessage(content="coba cek laba rugi untuk semua cabang 2026"),
+            AIMessage(content="### Laporan Laba Rugi Multi-Perusahaan..."),
+            HumanMessage(content="tampilkan rincian akunnya"),
+        ]
+        state = {
+            "messages": history,
+            "user_query": "tampilkan rincian akunnya",
+            "company_id": 1,
+            "company_ids": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 17],
+            "is_multi_company": True,
+        }
+
+        r_out = router_node(state)
+        self.assertTrue(r_out.get("is_multi_company"))
+        self.assertEqual(len(r_out.get("company_ids") or []), 16)
+
+        state.update(r_out)
+        e_out = extractor_node(state)
+        self.assertTrue(e_out.get("is_multi_company"))
+        self.assertEqual(len(e_out.get("company_ids") or []), 16)
+
+    def test_single_to_all_branches_transition(self):
+        """Verify transition from single branch to all branches ('bagaimana jika semua cabang?')."""
+        history = [
+            HumanMessage(content="cek laba rugi di bandung 2026"),
+            AIMessage(content="dummy summary bandung"),
+            HumanMessage(content="bagaimana jika semua cabang?"),
+        ]
+        state = {
+            "messages": history,
+            "user_query": "bagaimana jika semua cabang?",
+            "company_id": 6,
+            "company_ids": [6],
+            "is_multi_company": False,
+        }
+
+        r_out = router_node(state)
+        self.assertTrue(r_out.get("is_multi_company"))
+        self.assertEqual(len(r_out.get("company_ids") or []), 16)
+
+        state.update(r_out)
+        e_out = extractor_node(state)
+        self.assertTrue(e_out.get("is_multi_company"))
+        self.assertEqual(len(e_out.get("company_ids") or []), 16)
 
 
 if __name__ == "__main__":

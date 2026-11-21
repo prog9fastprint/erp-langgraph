@@ -331,6 +331,67 @@ class TestWorkflowEndToEnd(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(res_3.get("detected_tool"))
             self.assertIn("Tidak Ada Permintaan Sebelumnya", res_3["final_answer"])
 
+    async def test_multi_company_followup_scoping_end_to_end(self):
+        """
+        Verify multi-turn flow:
+        Turn 1: 'coba cek laba rugi untuk semua cabang + headoffice 2026'
+        Turn 2: 'coba cek detail mainstore'
+        Ensures Turn 2 scopes down to Main Store (company_id: 4), is_multi_company=False,
+        and synthesizer outputs single-company Profit & Loss report instead of 16-company table.
+        """
+        mock_client = MagicMock(spec=DjangoCoreClient)
+        mock_client.fetch_profit_and_loss = AsyncMock(
+            return_value={
+                "date_from": "2026-01-01",
+                "date_to": "2026-12-31",
+                "summary": {
+                    "total_revenue": 60500905017.48,
+                    "cogs": 44933595950.31,
+                    "gross_profit": 15567309067.17,
+                    "gross_margin_percent": 25.73,
+                    "operating_expenses": 3966148853.14,
+                    "operating_profit": 11601160214.03,
+                    "other_net": 0.0,
+                    "net_profit": 11601160214.03,
+                },
+                "breakdown": [
+                    {
+                        "group_name": "Income",
+                        "types": [
+                            {
+                                "type_name": "Income",
+                                "accounts": [
+                                    {"account_code": "40000MS", "account_name": "PENJUALAN BARANG", "balance": 60500905017.48}
+                                ]
+                            }
+                        ]
+                    }
+                ],
+            }
+        )
+
+        with patch("app.graph.nodes.tool_node.DjangoCoreClient", return_value=mock_client):
+            graph = create_workflow_graph(checkpointer=MemorySaver())
+            thread_cfg = {"configurable": {"thread_id": "test_multi_to_single_scoping_thread"}}
+
+            # Turn 1: All companies query
+            state_1 = create_initial_state(user_query="coba cek laba rugi untuk semua cabang + headoffice 2026")
+            res_1 = await graph.ainvoke(state_1, config=thread_cfg)
+            self.assertTrue(res_1["is_multi_company"])
+            self.assertIn("Combined Profit & Loss", res_1["final_answer"])
+
+            # Turn 2: Follow-up narrowed down to mainstore
+            state_2 = create_initial_state(user_query="coba cek detail mainstore")
+            res_2 = await graph.ainvoke(state_2, config=thread_cfg)
+
+            self.assertFalse(res_2["is_multi_company"])
+            self.assertEqual(res_2["company_id"], 4)
+            self.assertEqual(res_2["company_ids"], [4])
+            self.assertEqual(res_2["verification_status"], "VALID")
+            self.assertNotIn("Laporan Laba Rugi Multi-Perusahaan", res_2["final_answer"])
+            self.assertIn("Laporan Laba Rugi (Profit & Loss)", res_2["final_answer"])
+            self.assertIn("40000MS", res_2["final_answer"])
+
     async def test_workflow_history_hydration_from_stateless_payload(self):
         """
         Scenario 9: When memory checkpoint is empty (e.g. server restart),

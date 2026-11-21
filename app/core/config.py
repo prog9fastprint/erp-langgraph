@@ -104,5 +104,11 @@ class Settings(BaseSettings):
     )
     GEMINI_EMBEDDING_MODEL: str = Field(default="gemini-embedding-001", validation_alias="GEMINI_EMBEDDING_MODEL")
 
+    # 6. Dynamic Semantic Tool Retrieval & RBAC
+    DYNAMIC_TOOL_RETRIEVAL_ENABLED: bool = Field(default=True, validation_alias="DYNAMIC_TOOL_RETRIEVAL_ENABLED")
+    TOOL_CATALOG_TABLE_NAME: str = Field(default="ai_tool_catalog", validation_alias="TOOL_CATALOG_TABLE_NAME")
+    TOOL_RETRIEVAL_TOP_K: int = Field(default=5, validation_alias="TOOL_RETRIEVAL_TOP_K")
+    TOOL_RETRIEVAL_DISTANCE_THRESHOLD: float = Field(default=0.65, validation_alias="TOOL_RETRIEVAL_DISTANCE_THRESHOLD")
+
 
 settings = Settings()

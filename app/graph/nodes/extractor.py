@@ -46,6 +46,9 @@ from app.schemas.tools import (
     WarehousesFilterSchema,
     ProductCategoriesFilterSchema,
     TopSellingProductsFilterSchema,
+    SalesOrdersFilterSchema,
+    SalesOrderDetailFilterSchema,
+    SalesSummaryFilterSchema,
     TOOL_DOMAIN_MAP,
 )
 from app.services.llm import get_chat_model
@@ -71,6 +74,9 @@ TOOL_SCHEMA_REGISTRY: Dict[str, Type[BaseModel]] = {
     "get_warehouses": WarehousesFilterSchema,
     "get_product_categories": ProductCategoriesFilterSchema,
     "get_top_selling_products": TopSellingProductsFilterSchema,
+    "get_sales_orders": SalesOrdersFilterSchema,
+    "get_sales_order_detail": SalesOrderDetailFilterSchema,
+    "get_sales_summary": SalesSummaryFilterSchema,
 }
 
 # Whitelist of valid accounting/journal/vendor bill statuses
@@ -224,6 +230,29 @@ def resolve_branch_company_id(text: Optional[str]) -> Optional[int]:
     if is_all:
         return None
     return ids[0] if ids else None
+
+
+def strip_company_scope_keywords(text: Optional[str]) -> str:
+    """
+    Strip multi-company rollup expressions ('semua cabang', 'seluruh cabang', '+ headoffice')
+    and explicit branch mentions from a prior query so a fresh follow-up branch scope
+    can be cleanly applied without keyword conflict.
+    """
+    if not text:
+        return ""
+    cleaned = text
+    # 1. Strip ALL_COMPANIES_KEYWORDS
+    for kw in ALL_COMPANIES_KEYWORDS:
+        cleaned = re.sub(rf"(?:\buntuk|\bdi)?\s*\b{re.escape(kw)}\b", "", cleaned, flags=re.IGNORECASE)
+    # 2. Strip "+ headoffice" / "+ head office" / "+ ho" / "+ pusat"
+    cleaned = re.sub(r"\+\s*(?:head\s*office|headoffice|ho|kantor\s*pusat|pusat)\b", "", cleaned, flags=re.IGNORECASE)
+    # 3. Strip individual branch mentions (e.g. "di bandung", "cabang surabaya")
+    for branch_key in sorted(BRANCH_COMPANY_MAP.keys(), key=lambda k: -len(k)):
+        pattern = rf"(?:\b(?:di\s*cabang|dicabang|cabang|di\s*toko|di\s*kantor|kantor|di)\s+)?\b{re.escape(branch_key)}\b"
+        cleaned = re.sub(pattern, "", cleaned, flags=re.IGNORECASE)
+    # Clean up leftover punctuation and excessive whitespace
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned
 
 
 def has_temporal_expression(text: Optional[str]) -> bool:
@@ -1061,6 +1090,103 @@ def _fallback_extract_top_selling_products(query: str, ref_date: Optional[date] 
     return params
 
 
+def _fallback_extract_sales_orders(query: str, today: date) -> Dict[str, Any]:
+    """Deterministic heuristic extraction for sales.get_sales_orders."""
+    params: Dict[str, Any] = {"limit": 20, "offset": 0, "status": "confirmed"}
+
+    clean_q = query.lower()
+    if "quotation" in clean_q or "penawaran" in clean_q:
+        params["status"] = "quotation"
+    elif "cancel" in clean_q or "batal" in clean_q or "dibatalkan" in clean_q:
+        params["status"] = "cancel"
+    elif "semua" in clean_q or "all" in clean_q:
+        params["status"] = "all"
+    elif "lunas" in clean_q or "paid" in clean_q:
+        params["status"] = "paid"
+    elif "invoiced" in clean_q or "faktur" in clean_q:
+        params["status"] = "invoiced"
+
+    m_limit = re.search(r"\b(?:limit|tampilkan|daftar)?\s*(\d+)\s*(?:so|pesanan|order)?\b", query, re.IGNORECASE)
+    if m_limit:
+        try:
+            val = int(m_limit.group(1))
+            if 1 <= val <= 100:
+                params["limit"] = val
+        except ValueError:
+            pass
+
+    m_year = re.search(r"\b(20\d\d)\b", query)
+    if m_year:
+        yr = int(m_year.group(1))
+        params["date_from"] = f"{yr}-01-01"
+        params["date_to"] = f"{yr}-12-31"
+    else:
+        df, dt = resolve_relative_dates(query, today)
+        if df or dt:
+            if df:
+                params["date_from"] = df
+            if dt:
+                params["date_to"] = dt
+
+    return params
+
+
+def _fallback_extract_sales_order_detail(query: str) -> Dict[str, Any]:
+    """Deterministic heuristic extraction for sales.get_sales_order_detail."""
+    params: Dict[str, Any] = {}
+
+    m_so = re.search(r"\b(SO[/-][a-zA-Z0-9/_-]+)\b", query, re.IGNORECASE)
+    if m_so:
+        params["order_ref"] = m_so.group(1)
+        return params
+
+    m_inv = re.search(r"\b(INV[/-][a-zA-Z0-9/_-]+)\b", query, re.IGNORECASE)
+    if m_inv:
+        params["order_ref"] = m_inv.group(1)
+        return params
+
+    m_num = re.search(r"\b(?:so|nomor|no\.?|order|pesanan|resi)\s*[:#]?\s*([a-zA-Z0-9/_-]+)\b", query, re.IGNORECASE)
+    if m_num:
+        cand = m_num.group(1).strip()
+        if cand.lower() not in ("ini", "itu", "terbaru", "kemarin", "hari", "bulan", "tahun"):
+            params["order_ref"] = cand
+            return params
+
+    words = [w for w in query.strip().split() if any(c.isdigit() for c in w)]
+    if words:
+        params["order_ref"] = words[0]
+
+    return params
+
+
+def _fallback_extract_sales_summary(query: str, today: date) -> Dict[str, Any]:
+    """Deterministic heuristic extraction for sales.get_sales_summary."""
+    params: Dict[str, Any] = {"status": "confirmed"}
+
+    clean_q = query.lower()
+    if "quotation" in clean_q or "penawaran" in clean_q:
+        params["status"] = "quotation"
+    elif "cancel" in clean_q or "batal" in clean_q:
+        params["status"] = "cancel"
+    elif "semua" in clean_q or "all" in clean_q:
+        params["status"] = "all"
+
+    m_year = re.search(r"\b(20\d\d)\b", query)
+    if m_year:
+        yr = int(m_year.group(1))
+        params["date_from"] = f"{yr}-01-01"
+        params["date_to"] = f"{yr}-12-31"
+    else:
+        df, dt = resolve_relative_dates(query, today)
+        if df or dt:
+            if df:
+                params["date_from"] = df
+            if dt:
+                params["date_to"] = dt
+
+    return params
+
+
 def _extract_single_tool_params(
     plan: Dict[str, Any],
     all_plans: List[Dict[str, Any]],
@@ -1221,6 +1347,12 @@ def _extract_single_tool_params(
             extracted_dict = _fallback_extract_product_categories(sub_query)
         elif tool_name == "get_top_selling_products":
             extracted_dict = _fallback_extract_top_selling_products(sub_query, today)
+        elif tool_name == "get_sales_orders":
+            extracted_dict = _fallback_extract_sales_orders(sub_query, today)
+        elif tool_name == "get_sales_order_detail":
+            extracted_dict = _fallback_extract_sales_order_detail(sub_query)
+        elif tool_name == "get_sales_summary":
+            extracted_dict = _fallback_extract_sales_summary(sub_query, today)
         else:
             extracted_dict = {}
             if supports_dates and retry_count == 0:
@@ -1631,32 +1763,50 @@ def extractor_node(
     }
 
     multi_cids, is_all = resolve_all_branch_company_ids(user_query)
-    is_multi_co = bool(state.get("is_multi_company") or is_all or (len(multi_cids) > 1))
+    explicit_branch = resolve_branch_company_id(user_query)
 
-    if is_multi_co:
-        effective_cids = (
-            state.get("company_ids")
-            if (state.get("company_ids") and len(state.get("company_ids")) > 1 and not is_all and not multi_cids)
-            else (multi_cids if multi_cids else list(COMPANY_NAME_MAP.keys()))
-        )
+    if is_all:
+        effective_cids = list(COMPANY_NAME_MAP.keys())
+        result_update["is_multi_company"] = True
+        result_update["company_ids"] = effective_cids
+        primary_cid = effective_cids[0] if effective_cids else (state.get("company_id") or 1)
+        result_update["company_id"] = primary_cid
+        primary_params["company_id"] = primary_cid
+    elif len(multi_cids) > 1:
+        result_update["is_multi_company"] = True
+        result_update["company_ids"] = multi_cids
+        primary_cid = multi_cids[0]
+        result_update["company_id"] = primary_cid
+        primary_params["company_id"] = primary_cid
+    elif explicit_branch is not None or len(multi_cids) == 1:
+        # Explicit single company overrides prior multi-company state
+        target_cid = explicit_branch if explicit_branch is not None else multi_cids[0]
+        result_update["is_multi_company"] = False
+        result_update["company_ids"] = [target_cid]
+        result_update["company_id"] = target_cid
+        result_update["multi_company_results"] = {}
+        for plan_item in working_active_tools:
+            plan_params = plan_item.setdefault("params", {})
+            if plan_params:
+                plan_params["company_id"] = target_cid
+        if primary_params:
+            primary_params["company_id"] = target_cid
+    elif state.get("is_multi_company") and state.get("company_ids"):
+        # Follow-up without branch mention inherits prior multi-company scope
+        effective_cids = [int(c) for c in state.get("company_ids") if c]
         result_update["is_multi_company"] = True
         result_update["company_ids"] = effective_cids
         primary_cid = effective_cids[0] if effective_cids else (state.get("company_id") or 1)
         result_update["company_id"] = primary_cid
         primary_params["company_id"] = primary_cid
     else:
-        explicit_branch = resolve_branch_company_id(user_query)
-        if explicit_branch is not None:
-            result_update["company_id"] = explicit_branch
-            for plan_item in working_active_tools:
-                plan_params = plan_item.setdefault("params", {})
-                if plan_params:
-                    plan_params["company_id"] = explicit_branch
-            if primary_params:
-                primary_params["company_id"] = explicit_branch
-        elif state.get("company_id") is not None:
+        # Standard single-company fallback
+        result_update["is_multi_company"] = False
+        result_update["multi_company_results"] = {}
+        if state.get("company_id") is not None:
             session_cid = state.get("company_id")
             result_update["company_id"] = session_cid
+            result_update["company_ids"] = [session_cid]
             for plan_item in working_active_tools:
                 plan_params = plan_item.get("params")
                 if isinstance(plan_params, dict) and "company_id" in plan_params:
@@ -1665,5 +1815,6 @@ def extractor_node(
                 primary_params["company_id"] = session_cid
         elif primary_params.get("company_id") is not None:
             result_update["company_id"] = primary_params["company_id"]
+            result_update["company_ids"] = [primary_params["company_id"]]
 
     return result_update

@@ -363,6 +363,57 @@ class TopSellingProductsFilterSchema(BaseModel):
         return _validate_date_str(v, "date_to")
 
 
+class SalesOrdersFilterSchema(BaseModel):
+    """Input filter schema for sales.get_sales_orders."""
+    company_id: Optional[int] = Field(None, description="Company ID")
+    date_from: Optional[str] = Field(None, description="Tanggal awal transaksi (YYYY-MM-DD)")
+    date_to: Optional[str] = Field(None, description="Tanggal akhir transaksi (YYYY-MM-DD)")
+    status: Optional[str] = Field("confirmed", description="Filter status: 'confirmed', 'quotation', 'cancel', 'all', atau status spesifik")
+    customer_name: Optional[str] = Field(None, description="Filter nama pelanggan / customer")
+    customer_id: Optional[int] = Field(None, description="Filter ID kontak customer")
+    channel_name: Optional[str] = Field(None, description="Filter nama sales channel (e.g. 'Shopee', 'Tokopedia', 'Offline Store')")
+    search: Optional[str] = Field(None, description="Pencarian bebas nomor SO, alias, resi kurir, atau nama pelanggan")
+    min_amount: Optional[float] = Field(None, description="Batas minimal total nominal order")
+    max_amount: Optional[float] = Field(None, description="Batas maksimal total nominal order")
+    limit: int = Field(20, ge=1, le=100, description="Batas jumlah baris order (1-100, default 20)")
+    offset: int = Field(0, ge=0, description="Offset paginasi")
+
+    @field_validator("date_from")
+    @classmethod
+    def validate_date_from(cls, v: Optional[str]) -> Optional[str]:
+        return _validate_date_str(v, "date_from")
+
+    @field_validator("date_to")
+    @classmethod
+    def validate_date_to(cls, v: Optional[str]) -> Optional[str]:
+        return _validate_date_str(v, "date_to")
+
+
+class SalesOrderDetailFilterSchema(BaseModel):
+    """Input filter schema for sales.get_sales_order_detail."""
+    company_id: Optional[int] = Field(None, description="Company ID")
+    order_ref: str = Field(..., description="Nomor SO (misal 'SO/2026/001'), ID order, invoice marketplace, atau nomor resi kurir")
+
+
+class SalesSummaryFilterSchema(BaseModel):
+    """Input filter schema for sales.get_sales_summary."""
+    company_id: Optional[int] = Field(None, description="Company ID")
+    date_from: Optional[str] = Field(None, description="Tanggal awal periode pelaporan (YYYY-MM-DD)")
+    date_to: Optional[str] = Field(None, description="Tanggal akhir periode pelaporan (YYYY-MM-DD)")
+    channel: Optional[str] = Field(None, description="Filter sales channel tertentu")
+    status: Optional[str] = Field("confirmed", description="Filter status ('confirmed' default, 'all', 'quotation', 'cancel')")
+
+    @field_validator("date_from")
+    @classmethod
+    def validate_date_from(cls, v: Optional[str]) -> Optional[str]:
+        return _validate_date_str(v, "date_from")
+
+    @field_validator("date_to")
+    @classmethod
+    def validate_date_to(cls, v: Optional[str]) -> Optional[str]:
+        return _validate_date_str(v, "date_to")
+
+
 class VendorInvoiceFilterSchema(BaseModel):
     """Input filter schema for vendor bills & invoices (TASK-4.2)."""
     vendor_name: Optional[str] = Field(None, description="Nama lengkap atau alias vendor / supplier (e.g. 'PT Sumber Makmur')")
@@ -923,5 +974,8 @@ TOOL_DOMAIN_MAP: Dict[str, str] = {
     "get_warehouses": "inventory",
     "get_product_categories": "inventory",
     "get_top_selling_products": "sales",
+    "get_sales_orders": "sales",
+    "get_sales_order_detail": "sales",
+    "get_sales_summary": "sales",
 }
 

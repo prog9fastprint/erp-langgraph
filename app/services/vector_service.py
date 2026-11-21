@@ -103,6 +103,43 @@ class VectorService:
                     self._pool = None
                 logger.info("Dedicated PGVector asyncpg connection pool closed.")
 
+    async def initialize_table(self) -> bool:
+        """
+        Create ai_knowledge_chunks table and HNSW index if they do not exist.
+        """
+        pool = await self.get_pool()
+        if pool is None:
+            logger.warning("PGVector connection pool unavailable. Cannot initialize knowledge table.")
+            return False
+
+        ddl = f"""
+            CREATE TABLE IF NOT EXISTS {KNOWLEDGE_TABLE_NAME} (
+                id SERIAL PRIMARY KEY,
+                company_id INT NOT NULL DEFAULT 1,
+                title VARCHAR(255) NOT NULL,
+                category VARCHAR(64) NOT NULL DEFAULT 'sop',
+                content TEXT NOT NULL,
+                metadata JSONB DEFAULT '{{}}'::jsonb,
+                is_active BOOLEAN DEFAULT TRUE,
+                embedding vector(768),
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_{KNOWLEDGE_TABLE_NAME}_embedding 
+            ON {KNOWLEDGE_TABLE_NAME} USING hnsw (embedding vector_cosine_ops);
+
+            CREATE INDEX IF NOT EXISTS idx_{KNOWLEDGE_TABLE_NAME}_company_active 
+            ON {KNOWLEDGE_TABLE_NAME} (company_id, is_active);
+        """
+        try:
+            async with pool.acquire() as conn:
+                await conn.execute(ddl)
+            logger.info(f"Table '{KNOWLEDGE_TABLE_NAME}' and HNSW index verified successfully.")
+            return True
+        except Exception as exc:
+            logger.error(f"Failed to initialize table '{KNOWLEDGE_TABLE_NAME}': {exc}")
+            return False
+
     def _get_genai_client(self):
         """Lazy load and initialize Google GenAI Client."""
         if self._genai_client is None:

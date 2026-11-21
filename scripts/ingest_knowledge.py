@@ -11,7 +11,10 @@ import json
 import logging
 import os
 import re
+import sys
 from typing import Any, Dict, List, Optional
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from app.core.config import settings
 
@@ -115,6 +118,16 @@ async def ingest_document(
         from google.genai import types
         embed_config = types.EmbedContentConfig(output_dimensionality=768)
 
+        source_filename = os.path.basename(file_path)
+        await conn.execute(
+            """
+            DELETE FROM ai_knowledge_chunks 
+            WHERE company_id = $1 AND metadata->>'source_file' = $2
+            """,
+            int(company_id),
+            source_filename,
+        )
+
         for idx, chunk_text in enumerate(chunks, 1):
             logger.info(f"Generating Gemini embedding for chunk {idx}/{len(chunks)}...")
             res = genai_client.models.embed_content(
@@ -126,7 +139,7 @@ async def ingest_document(
             vector_arr = [float(v) for v in vector_values]
 
             meta = {
-                "source_file": os.path.basename(file_path),
+                "source_file": source_filename,
                 "chunk_index": idx,
                 "total_chunks": len(chunks),
             }
@@ -134,7 +147,7 @@ async def ingest_document(
             await conn.execute(
                 """
                 INSERT INTO ai_knowledge_chunks (title, category, content, metadata, embedding, company_id)
-                VALUES ($1, $2, $3, $4, $5, $6)
+                VALUES ($1, $2, $3, $4::jsonb, $5, $6)
                 """,
                 f"{file_title} (Part {idx})",
                 category,
@@ -153,7 +166,8 @@ async def main():
     parser = argparse.ArgumentParser(description="Ingest Markdown knowledge docs into Dedicated PGVector with Gemini.")
     parser.add_argument("--path", default="data/knowledge/*.md", help="Glob pattern for document files.")
     parser.add_argument("--db-url", default=settings.VECTOR_DB_URL, help="PostgreSQL connection string.")
-    parser.add_argument("--api-key", default=settings.GEMINI_API_KEY, help="Google Gemini API Key.")
+    default_api_key = settings.GEMINI_API_KEY or (settings.get_gemini_api_keys()[0] if settings.get_gemini_api_keys() else None)
+    parser.add_argument("--api-key", default=default_api_key, help="Google Gemini API Key.")
     parser.add_argument("--company-id", type=int, default=1, help="Target ERP Company ID.")
     parser.add_argument("--category", default="sop", help="Document category ('sop', 'product_spec', etc.).")
     args = parser.parse_args()

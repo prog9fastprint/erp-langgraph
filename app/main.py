@@ -51,8 +51,21 @@ async def lifespan(app: FastAPI):
             prewarm_task = loop.create_task(afetch_free_models_catalog())
             _BACKGROUND_TASKS.add(prewarm_task)
             prewarm_task.add_done_callback(_on_background_task_done)
+
+            is_test_env = "unittest" in sys.modules or os.environ.get("FASTPRINT_TEST_ENV") == "true" or settings.APP_ENV == "test"
+            if not is_test_env and settings.VECTOR_DB_URL:
+                init_vec_task = loop.create_task(vector_service.initialize_table())
+                _BACKGROUND_TASKS.add(init_vec_task)
+                init_vec_task.add_done_callback(_on_background_task_done)
+
+                if settings.DYNAMIC_TOOL_RETRIEVAL_ENABLED:
+                    from app.services.tool_registry_service import get_tool_registry_service
+                    registry = get_tool_registry_service()
+                    init_task = loop.create_task(registry.initialize_catalog(force_update=False))
+                    _BACKGROUND_TASKS.add(init_task)
+                    init_task.add_done_callback(_on_background_task_done)
     except Exception as exc:
-        logger.debug("Catalog pre-warm skipped during lifespan initialization: %s", exc)
+        logger.debug("Background pre-warm or catalog sync skipped during lifespan initialization: %s", exc)
 
     try:
         yield
@@ -184,7 +197,7 @@ def _resolve_and_validate_auth(
                 detail="Forbidden: invalid or missing X-Internal-Service-Key.",
             )
 
-    body_token = (payload.user_token or "").strip() or None
+    body_token = (payload.user_token or payload.auth_token or "").strip() or None
     header_token = _extract_bearer_token(authorization)
     effective_token = body_token or header_token
 
@@ -214,6 +227,12 @@ def _build_workflow_kwargs(payload: ChatRequest, effective_token: Optional[str])
         kwargs["company_ids"] = payload.company_ids
     if payload.history is not None:
         kwargs["history"] = payload.history
+    if payload.auth_token is not None:
+        kwargs["auth_token"] = payload.auth_token
+    if payload.user_id is not None:
+        kwargs["user_id"] = payload.user_id
+    if payload.user_roles is not None:
+        kwargs["user_roles"] = payload.user_roles
     return kwargs
 
 

@@ -427,6 +427,10 @@ async def _prepare_workflow_execution(
     graph: Optional[Any] = None,
     history: Optional[List[Any]] = None,
     company_id_explicit: Optional[bool] = None,
+    auth_token: Optional[str] = None,
+    user_id: Optional[str] = None,
+    user_roles: Optional[List[str]] = None,
+    **kwargs: Any,
 ) -> Tuple[Any, Dict[str, Any], AgentState, bool, str]:
     """
     Resolve thread isolation, checkpoint state, and hydrated initial state for workflow execution.
@@ -464,6 +468,9 @@ async def _prepare_workflow_execution(
     initial_state = create_initial_state(
         user_query=user_query,
         user_token=user_token,
+        auth_token=auth_token,
+        user_id=user_id,
+        user_roles=user_roles,
         company_id=effective_company_id,
         company_ids=effective_company_ids,
         is_multi_company=is_multi_company,
@@ -481,6 +488,10 @@ async def arun_workflow(
     graph: Optional[Any] = None,
     history: Optional[List[Any]] = None,
     company_id_explicit: Optional[bool] = None,
+    auth_token: Optional[str] = None,
+    user_id: Optional[str] = None,
+    user_roles: Optional[List[str]] = None,
+    **kwargs: Any,
 ) -> AgentState:
     """
     Asynchronously run the compiled workflow graph for a user query.
@@ -494,6 +505,9 @@ async def arun_workflow(
         graph: Optional compiled StateGraph instance.
         history: Optional list of past conversation messages for stateless memory recovery.
         company_id_explicit: Whether company_id was explicitly provided by caller/payload.
+        auth_token: Optional alias for user_token.
+        user_id: Optional authenticated user ID.
+        user_roles: Optional list of user permissions/roles for RBAC.
 
     Returns:
         Final resulting AgentState dictionary.
@@ -508,6 +522,10 @@ async def arun_workflow(
             graph=graph,
             history=history,
             company_id_explicit=company_id_explicit,
+            auth_token=auth_token,
+            user_id=user_id,
+            user_roles=user_roles,
+            **kwargs,
         )
     )
 
@@ -534,6 +552,10 @@ async def astream_workflow_steps(
     graph: Optional[Any] = None,
     history: Optional[List[Any]] = None,
     company_id_explicit: Optional[bool] = None,
+    auth_token: Optional[str] = None,
+    user_id: Optional[str] = None,
+    user_roles: Optional[List[str]] = None,
+    **kwargs: Any,
 ):
     """
     Asynchronously stream individual node completion events from the workflow StateGraph.
@@ -549,6 +571,10 @@ async def astream_workflow_steps(
             graph=graph,
             history=history,
             company_id_explicit=company_id_explicit,
+            auth_token=auth_token,
+            user_id=user_id,
+            user_roles=user_roles,
+            **kwargs,
         )
     )
     accumulated_state = dict(initial_state)
@@ -581,6 +607,10 @@ async def astream_workflow_events(
     company_id_explicit: Optional[bool] = None,
     token_delay_sec: float = 0.0,
     steps_generator: Optional[Any] = None,
+    auth_token: Optional[str] = None,
+    user_id: Optional[str] = None,
+    user_roles: Optional[List[str]] = None,
+    **kwargs: Any,
 ):
     """
     Asynchronously stream fine-grained events from the workflow StateGraph.
@@ -608,6 +638,10 @@ async def astream_workflow_events(
         graph=graph,
         history=history,
         company_id_explicit=company_id_explicit,
+        auth_token=auth_token,
+        user_id=user_id,
+        user_roles=user_roles,
+        **kwargs,
     )
 
     try:

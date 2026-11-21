@@ -59,16 +59,18 @@ def _calculate_records_count(tool_result: Any) -> int:
         # Check common collection list keys
         for list_key in (
             "entries", "accounts", "products", "items", "records", "lines", "locations",
-            "transfers", "history", "adjustments", "scraps", "warehouses", "categories", "alerts", "bills",
+            "transfers", "history", "adjustments", "scraps", "warehouses", "categories", "alerts", "bills", "orders",
         ):
             val = tool_result.get(list_key)
             if isinstance(val, list):
                 return len(val)
 
-        # Check financial report summary or totals blocks (e.g. P&L, Balance Sheet, Bank Recon, Account Totals)
+        # Check financial report summary or totals blocks (e.g. P&L, Balance Sheet, Bank Recon, Account Totals, Sales Summary)
         if isinstance(tool_result.get("summary"), dict) and tool_result["summary"]:
             return 1
         if isinstance(tool_result.get("totals"), dict) and tool_result["totals"]:
+            return 1
+        if isinstance(tool_result.get("confirmed_metrics"), dict) and tool_result["confirmed_metrics"]:
             return 1
 
         # Nested data field inspection (if envelope wasn't stripped)

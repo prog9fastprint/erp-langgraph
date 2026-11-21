@@ -760,6 +760,142 @@ def _format_single_tool_presentation(
             lines.append(f"| | **TOTAL** | | | **{tot_qty:g} unit** | **{_format_rupiah(tot_rev)}** |")
         return "\n".join(lines)
 
+    # 14. Sales: Sales Orders List
+    if tool == "get_sales_orders":
+        orders = tool_result.get("orders") if isinstance(tool_result, dict) else (
+            tool_result if isinstance(tool_result, list) else []
+        )
+        total_cnt = tool_result.get("total_count", len(orders)) if isinstance(tool_result, dict) else len(orders)
+        tot_sum = float(tool_result.get("total_amount_sum") or sum(float(o.get("total_amount") or 0.0) for o in orders))
+        st_filter = tool_result.get("status_filter", "confirmed") if isinstance(tool_result, dict) else "confirmed"
+
+        lines.append(f"### Daftar Pesanan Penjualan ({len(orders)} dari {total_cnt} Dokumen, Status: `{st_filter}`)\n")
+        if orders:
+            lines.append("| No | No. SO | Tanggal | Pelanggan | Channel | Status | Total Nominal |")
+            lines.append("|:---:|:---|:---:|:---|:---|:---:|:---|")
+            for idx, o in enumerate(orders, start=1):
+                so_num = o.get("so_number") or "-"
+                dt = o.get("quotation_date") or "-"
+                cust = o.get("customer_name") or "-"
+                ch = o.get("channel_name") or "Direct"
+                st = o.get("status") or "-"
+                tot = float(o.get("total_amount") or 0.0)
+                lines.append(f"| {idx} | `{so_num}` | {dt} | {cust} | {ch} | `{st}` | **{_format_rupiah(tot)}** |")
+            lines.append(f"| | **TOTAL** | | | | | **{_format_rupiah(tot_sum)}** |")
+        else:
+            lines.append("*Tidak ada dokumen sales order yang sesuai dengan kriteria filter.*")
+        return "\n".join(lines)
+
+    # 15. Sales: Sales Order Detail
+    if tool == "get_sales_order_detail":
+        if not isinstance(tool_result, dict) or not tool_result.get("id"):
+            return "Informasi detail sales order tidak ditemukan."
+
+        so_num = tool_result.get("so_number") or "-"
+        alias = tool_result.get("so_number_alias")
+        alias_str = f" (`{alias}`)" if alias else ""
+        c_name = tool_result.get("company_name") or "-"
+        status = tool_result.get("status") or "-"
+        q_date = tool_result.get("quotation_date") or "-"
+        pay_term = tool_result.get("payment_terms") or "-"
+        channel = tool_result.get("channel") or "Direct"
+        deliv = tool_result.get("delivery_method") or "-"
+        resi = tool_result.get("manual_resi")
+        packing = "Selesai" if tool_result.get("status_packing") else "Belum Packing"
+
+        cust = tool_result.get("customer") or {}
+        cust_name = cust.get("name") or "-"
+        cust_phone = cust.get("sales_phone") or "-"
+
+        fin = tool_result.get("financial_summary") or {}
+        tot_amount = float(fin.get("total_amount") or 0.0)
+        disc_nom = float(fin.get("discount_nominal") or 0.0)
+
+        lines.append(f"### Detail Sales Order: `{so_num}`{alias_str}\n")
+        lines.append(f"- **Cabang / Perusahaan**: {c_name}")
+        lines.append(f"- **Status Dokumen**: `{status}` | **Status Packing**: `{packing}`")
+        lines.append(f"- **Tanggal Order**: {q_date} | **Termin Pembayaran**: {pay_term}")
+        lines.append(f"- **Pelanggan**: **{cust_name}** (Telp: {cust_phone})")
+        lines.append(f"- **Channel**: {channel} | **Metode Pengiriman**: {deliv}")
+        if resi:
+            lines.append(f"- **No. Resi Kurir**: `{resi}`")
+
+        # Marketplace block if applicable
+        mp = tool_result.get("marketplace")
+        if mp:
+            mp_acc = mp.get("marketplace_account") or "-"
+            mp_inv = mp.get("mp_invoice_number") or "-"
+            awb = mp.get("awb_number") or "-"
+            buyer = mp.get("buyer_name") or "-"
+            carrier = mp.get("carrier_name") or "-"
+            lines.append(f"\n> **Data Marketplace ({mp_acc})**:")
+            lines.append(f"> - No. Invoice MP: `{mp_inv}` | Resi AWB: `{awb}`")
+            lines.append(f"> - Pembeli: {buyer} | Kurir: {carrier}")
+
+        # Items Table
+        lines_data = tool_result.get("lines") or []
+        lines.append(f"\n#### Rincian Produk ({len(lines_data)} Item):\n")
+        if lines_data:
+            lines.append("| No | SKU | Nama Produk | Qty | Harga Satuan | Diskon | Subtotal |")
+            lines.append("|:---:|:---|:---|:---:|:---|:---|:---|")
+            for idx, li in enumerate(lines_data, start=1):
+                sku = li.get("sku") or "-"
+                p_name = li.get("product_name") or "-"
+                qty = li.get("qty") or 0
+                uom = li.get("uom") or "Pcs"
+                up = float(li.get("unit_price") or 0.0)
+                disc = float(li.get("disc_nominal") or 0.0)
+                sub = float(li.get("sub_total") or 0.0)
+                lines.append(f"| {idx} | `{sku}` | {p_name} | {qty} {uom} | {_format_rupiah(up)} | {_format_rupiah(disc)} | **{_format_rupiah(sub)}** |")
+
+            lines.append(f"\n- **Total Diskon**: {_format_rupiah(disc_nom)}")
+            lines.append(f"- **Total Tagihan**: **{_format_rupiah(tot_amount)}**")
+        return "\n".join(lines)
+
+    # 16. Sales: Sales Summary & KPI
+    if tool == "get_sales_summary":
+        if not isinstance(tool_result, dict):
+            return "Ringkasan data penjualan tidak ditemukan."
+
+        period = tool_result.get("period") or {}
+        df = period.get("date_from") or ""
+        dt = period.get("date_to") or ""
+        p_str = f" (Periode {df} s/d {dt})" if (df or dt) else ""
+
+        conf = tool_result.get("confirmed_metrics") or {}
+        real_rev = float(conf.get("realized_revenue") or 0.0)
+        orders_cnt = int(conf.get("orders_count") or 0)
+        aov = float(conf.get("average_order_value") or 0.0)
+
+        pipe = tool_result.get("pipeline_metrics") or {}
+        pipe_cnt = int(pipe.get("quotation_orders_count") or 0)
+        pipe_val = float(pipe.get("quotation_potential_value") or 0.0)
+
+        canc = tool_result.get("cancelled_metrics") or {}
+        canc_cnt = int(canc.get("cancelled_orders_count") or 0)
+        canc_val = float(canc.get("cancelled_value") or 0.0)
+
+        lines.append(f"### Ringkasan Eksekutif Penjualan & Omzet{p_str}\n")
+        lines.append(f"- **Total Omzet Terealisasi**: **{_format_rupiah(real_rev)}**")
+        lines.append(f"- **Volume Pesanan Dikonfirmasi**: **{orders_cnt:,} pesanan**")
+        lines.append(f"- **Average Order Value (AOV)**: **{_format_rupiah(aov)}** / order")
+        lines.append(f"- **Pipeline Penawaran (Quotation)**: {pipe_cnt} draft ({_format_rupiah(pipe_val)})")
+        lines.append(f"- **Pesanan Dibatalkan (Cancel)**: {canc_cnt} order ({_format_rupiah(canc_val)})\n")
+
+        channels = tool_result.get("channels_breakdown") or []
+        if channels:
+            lines.append("#### Distribusi Performa Channel Penjualan:\n")
+            lines.append("| No | Channel Penjualan | Jumlah Pesanan | Total Omzet | Kontribusi |")
+            lines.append("|:---:|:---|:---:|:---|:---:|")
+            for idx, ch in enumerate(channels, start=1):
+                ch_name = ch.get("channel_name") or "-"
+                cnt = ch.get("order_count") or 0
+                ch_rev = float(ch.get("total_revenue") or 0.0)
+                contrib = (ch_rev / real_rev * 100) if real_rev > 0 else 0.0
+                lines.append(f"| {idx} | **{ch_name}** | {cnt} order | {_format_rupiah(ch_rev)} | {contrib:.1f}% |")
+
+        return "\n".join(lines)
+
     # Default fallback
     return f"Hasil eksekusi data ERP: {str(tool_result)}"
 
@@ -1079,6 +1215,52 @@ def _format_multi_company_presentation(state: AgentState) -> str:
             tot_row.append(f"**{_format_rupiah(branch_totals[cid])}**")
         tot_row.append(f"**{_format_rupiah(grand_total)}**")
         lines.append("| " + " | ".join(tot_row) + " |")
+
+    elif tool == "get_sales_summary":
+        lines.append("### Perbandingan Performa Penjualan Multi-Cabang\n")
+        lines.append("| Cabang | Omzet Terealisasi | Jumlah Order | Rata-Rata Order (AOV) | Pipeline Quotation |")
+        lines.append("|:---|:---|:---:|:---|:---|")
+        tot_rev = 0.0
+        tot_orders = 0
+        tot_pipe = 0.0
+        for cid in sorted(mc_results.keys()):
+            res = mc_results[cid]
+            c_name = COMPANY_NAME_MAP.get(cid, f"Cabang {cid}")
+            if not res or not isinstance(res, dict):
+                lines.append(f"| **{c_name}** | *Tidak ada data* | - | - | - |")
+                continue
+            conf = res.get("confirmed_metrics") or {}
+            rev = float(conf.get("realized_revenue") or 0.0)
+            cnt = int(conf.get("orders_count") or 0)
+            aov = float(conf.get("average_order_value") or 0.0)
+            pipe = res.get("pipeline_metrics") or {}
+            pval = float(pipe.get("quotation_potential_value") or 0.0)
+            tot_rev += rev
+            tot_orders += cnt
+            tot_pipe += pval
+            lines.append(f"| **{c_name}** | **{_format_rupiah(rev)}** | {cnt:,} | {_format_rupiah(aov)} | {_format_rupiah(pval)} |")
+        aov_grand = (tot_rev / tot_orders) if tot_orders > 0 else 0.0
+        lines.append(f"| **TOTAL GABUNGAN** | **{_format_rupiah(tot_rev)}** | **{tot_orders:,}** | **{_format_rupiah(aov_grand)}** | **{_format_rupiah(tot_pipe)}** |")
+
+    elif tool == "get_sales_orders":
+        lines.append("### Ringkasan Pesanan Penjualan Multi-Cabang\n")
+        lines.append("| Cabang | Jumlah Pesanan | Total Nominal | Status Filter |")
+        lines.append("|:---|:---:|:---|:---:|")
+        grand_cnt = 0
+        grand_sum = 0.0
+        for cid in sorted(mc_results.keys()):
+            res = mc_results[cid]
+            c_name = COMPANY_NAME_MAP.get(cid, f"Cabang {cid}")
+            if not res or not isinstance(res, dict):
+                lines.append(f"| **{c_name}** | - | *Tidak ada data* | - |")
+                continue
+            cnt = int(res.get("total_count") or 0)
+            tot = float(res.get("total_amount_sum") or 0.0)
+            st = res.get("status_filter") or "confirmed"
+            grand_cnt += cnt
+            grand_sum += tot
+            lines.append(f"| **{c_name}** | {cnt:,} | **{_format_rupiah(tot)}** | `{st}` |")
+        lines.append(f"| **TOTAL GABUNGAN** | **{grand_cnt:,}** | **{_format_rupiah(grand_sum)}** | |")
 
     # Generic Fallback for other tools
     else:

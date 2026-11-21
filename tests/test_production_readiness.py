@@ -1008,6 +1008,7 @@ class TestLifespanCleanupAndSharedHttpPool(unittest.IsolatedAsyncioTestCase):
         """
         import app.graph.workflow as workflow_module
 
+        main_module.vector_service._pool = None
         mock_pg_pool = MagicMock()
         mock_pg_pool._closed = False
         mock_pg_pool.close = AsyncMock()
