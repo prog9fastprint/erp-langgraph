@@ -31,7 +31,7 @@ from app.graph.nodes.rag_node import rag_node
 from app.graph.nodes.extractor import extractor_node
 from app.graph.nodes.tool_node import tool_node
 from app.graph.nodes.verifier import verifier_node, decide_after_verification
-from app.graph.nodes.synthesizer import synthesizer_node
+from app.graph.nodes.synthesizer import asynthesizer_node, synthesizer_node
 from app.services.llm import get_default_model_name
 
 logger = logging.getLogger("workflow")
@@ -134,7 +134,7 @@ def create_workflow_graph(
     workflow.add_node("extractor", extractor_node)
     workflow.add_node("tool_node", tool_node)
     workflow.add_node("verifier", verifier_node)
-    workflow.add_node("synthesizer", synthesizer_node)
+    workflow.add_node("synthesizer", asynthesizer_node)
 
     # 2. Connect Edges
     workflow.add_edge(START, "summarizer")
@@ -628,125 +628,283 @@ async def astream_workflow_events(
     pending_tool_starts: List[str] = []
     last_accumulated_state: Dict[str, Any] = {}
 
-    gen_func = steps_generator or astream_workflow_steps
-    step_stream = gen_func(
-        user_query=user_query,
-        user_token=user_token,
-        company_id=company_id,
-        company_ids=company_ids,
-        thread_id=thread_id,
-        graph=graph,
-        history=history,
-        company_id_explicit=company_id_explicit,
-        auth_token=auth_token,
-        user_id=user_id,
-        user_roles=user_roles,
-        **kwargs,
-    )
+    # If caller provided a custom or mocked steps_generator, preserve backward-compatible step-stream iteration
+    if steps_generator is not None and steps_generator != astream_workflow_steps:
+        step_stream = steps_generator(
+            user_query=user_query,
+            user_token=user_token,
+            company_id=company_id,
+            company_ids=company_ids,
+            thread_id=thread_id,
+            graph=graph,
+            history=history,
+            company_id_explicit=company_id_explicit,
+            auth_token=auth_token,
+            user_id=user_id,
+            user_roles=user_roles,
+            **kwargs,
+        )
+        try:
+            async for node_name, update, accumulated_state in step_stream:
+                last_accumulated_state = accumulated_state
+                curr_model = accumulated_state.get("active_model") or active_model
+                node_elapsed_ms = round((time.perf_counter() - started_at) * 1000.0, 2)
 
-    try:
-        async for node_name, update, accumulated_state in step_stream:
-            last_accumulated_state = accumulated_state
-            curr_model = accumulated_state.get("active_model") or active_model
-            node_elapsed_ms = round((time.perf_counter() - started_at) * 1000.0, 2)
+                # 1. Extractor node -> emit step, then emit tool_start if tools planned
+                if node_name == "extractor":
+                    yield ("step", {
+                        "node": "extractor",
+                        "status": "completed",
+                        "elapsed_ms": node_elapsed_ms,
+                        "model": curr_model,
+                    })
+                    active_tools = accumulated_state.get("active_tools") or []
+                    det_tool = accumulated_state.get("detected_tool")
+                    det_params = accumulated_state.get("extracted_params") or {}
 
-            # 1. Extractor node -> emit step, then emit tool_start if tools planned
-            if node_name == "extractor":
-                yield ("step", {
-                    "node": "extractor",
-                    "status": "completed",
-                    "elapsed_ms": node_elapsed_ms,
-                    "model": curr_model,
-                })
+                    pending_tool_starts.clear()
+                    if active_tools and len(active_tools) > 1:
+                        for t in active_tools:
+                            t_name = t.get("tool")
+                            t_params = sanitize_tool_params(t.get("params") or {})
+                            if t_name:
+                                pending_tool_starts.append(t_name)
+                                yield ("tool_start", {"tool": t_name, "input": t_params})
+                    elif det_tool:
+                        pending_tool_starts.append(det_tool)
+                        yield ("tool_start", {"tool": det_tool, "input": sanitize_tool_params(det_params)})
+                    tool_started_at = time.perf_counter()
+                    continue
 
-                active_tools = accumulated_state.get("active_tools") or []
-                det_tool = accumulated_state.get("detected_tool")
-                det_params = accumulated_state.get("extracted_params") or {}
+                # 2. Tool node -> emit tool_end for executed tools, then emit step
+                if node_name == "tool_node":
+                    tool_elapsed_ms = round((time.perf_counter() - tool_started_at) * 1000.0, 2)
+                    is_error = accumulated_state.get("verification_status") == "ERROR"
+                    status_str = "error" if is_error else "success"
+                    active_tools = accumulated_state.get("active_tools") or []
+                    det_tool = accumulated_state.get("detected_tool")
+                    m_results = accumulated_state.get("multi_tool_results") or {}
 
-                pending_tool_starts.clear()
-                if active_tools and len(active_tools) > 1:
-                    for t in active_tools:
-                        t_name = t.get("tool")
-                        t_params = sanitize_tool_params(t.get("params") or {})
-                        if t_name:
-                            pending_tool_starts.append(t_name)
-                            yield ("tool_start", {"tool": t_name, "input": t_params})
-                elif det_tool:
-                    pending_tool_starts.append(det_tool)
-                    yield ("tool_start", {"tool": det_tool, "input": sanitize_tool_params(det_params)})
-
-                tool_started_at = time.perf_counter()
-                continue
-
-            # 2. Tool node -> emit tool_end for executed tools, then emit step
-            if node_name == "tool_node":
-                tool_elapsed_ms = round((time.perf_counter() - tool_started_at) * 1000.0, 2)
-                is_error = accumulated_state.get("verification_status") == "ERROR"
-                status_str = "error" if is_error else "success"
-                active_tools = accumulated_state.get("active_tools") or []
-                det_tool = accumulated_state.get("detected_tool")
-                m_results = accumulated_state.get("multi_tool_results") or {}
-
-                if pending_tool_starts:
-                    for t_name in pending_tool_starts:
-                        t_res = m_results.get(t_name) if m_results else accumulated_state.get("tool_result")
+                    if pending_tool_starts:
+                        for t_name in pending_tool_starts:
+                            t_res = m_results.get(t_name) if m_results else accumulated_state.get("tool_result")
+                            rec_count = resolve_tool_record_count(t_res)
+                            yield ("tool_end", {
+                                "tool": t_name,
+                                "status": status_str,
+                                "elapsed_ms": tool_elapsed_ms,
+                                "records_found": rec_count,
+                            })
+                        pending_tool_starts.clear()
+                    elif det_tool:
+                        t_res = accumulated_state.get("tool_result")
                         rec_count = resolve_tool_record_count(t_res)
                         yield ("tool_end", {
-                            "tool": t_name,
+                            "tool": det_tool,
                             "status": status_str,
                             "elapsed_ms": tool_elapsed_ms,
                             "records_found": rec_count,
                         })
-                    pending_tool_starts.clear()
-                elif det_tool:
-                    t_res = accumulated_state.get("tool_result")
-                    rec_count = resolve_tool_record_count(t_res)
-                    yield ("tool_end", {
-                        "tool": det_tool,
-                        "status": status_str,
-                        "elapsed_ms": tool_elapsed_ms,
-                        "records_found": rec_count,
+
+                    yield ("step", {
+                        "node": "tool_node",
+                        "status": "completed",
+                        "elapsed_ms": node_elapsed_ms,
+                        "model": curr_model,
                     })
+                    continue
 
+                # 3. Synthesizer node -> emit tokens, then emit step
+                if node_name == "synthesizer":
+                    final_ans = accumulated_state.get("final_answer", "")
+                    if final_ans:
+                        chunks = chunk_text_for_streaming(final_ans)
+                        for c in chunks:
+                            yield ("token", {"content": c})
+                            if token_delay_sec > 0:
+                                await asyncio.sleep(token_delay_sec)
+
+                    yield ("step", {
+                        "node": "synthesizer",
+                        "status": "completed",
+                        "elapsed_ms": node_elapsed_ms,
+                        "model": curr_model,
+                    })
+                    continue
+
+                # General step for other nodes (summarizer, router, verifier, rag_node)
                 yield ("step", {
-                    "node": "tool_node",
+                    "node": node_name,
                     "status": "completed",
                     "elapsed_ms": node_elapsed_ms,
                     "model": curr_model,
                 })
+
+            yield ("complete", last_accumulated_state)
+        except Exception as exc:
+            logger.exception("Error in astream_workflow_events (legacy steps): %s", exc)
+            yield ("error", {"detail": str(exc)})
+            raise
+        return
+
+    # Native True Streaming via LangGraph astream_events (version="v2")
+    active_graph, config, initial_state, is_ephemeral, effective_thread_id = (
+        await _prepare_workflow_execution(
+            user_query=user_query,
+            user_token=user_token,
+            company_id=company_id,
+            company_ids=company_ids,
+            thread_id=thread_id,
+            graph=graph,
+            history=history,
+            company_id_explicit=company_id_explicit,
+            auth_token=auth_token,
+            user_id=user_id,
+            user_roles=user_roles,
+            **kwargs,
+        )
+    )
+    accumulated_state = dict(initial_state)
+    streamed_tokens: List[str] = []
+
+    try:
+        async for ev in active_graph.astream_events(initial_state, config=config, version="v2"):
+            kind = ev.get("event")
+            name = ev.get("name")
+            meta = ev.get("metadata") or {}
+            lg_node = meta.get("langgraph_node")
+            node_elapsed_ms = round((time.perf_counter() - started_at) * 1000.0, 2)
+            curr_model = accumulated_state.get("active_model") or active_model
+
+            # 1. Capture custom token event (instant deterministic ERP table from asynthesizer_node)
+            if kind == "on_custom_event" and name == "token":
+                c = (ev.get("data") or {}).get("content", "")
+                if c:
+                    streamed_tokens.append(c)
+                    yield ("token", {"content": c})
+                    if token_delay_sec > 0:
+                        await asyncio.sleep(token_delay_sec)
                 continue
 
-            # 3. Synthesizer node -> emit tokens, then emit step
-            if node_name == "synthesizer":
-                final_ans = accumulated_state.get("final_answer", "")
-                if final_ans:
-                    chunks = chunk_text_for_streaming(final_ans)
-                    for c in chunks:
-                        yield ("token", {"content": c})
-                        if token_delay_sec > 0:
-                            await asyncio.sleep(token_delay_sec)
+            # 2. Capture live LLM token stream
+            if kind == "on_chat_model_stream" and lg_node == "synthesizer":
+                chunk = (ev.get("data") or {}).get("chunk")
+                c = getattr(chunk, "content", "") if chunk else ""
+                if c:
+                    streamed_tokens.append(c)
+                    yield ("token", {"content": c})
+                    if token_delay_sec > 0:
+                        await asyncio.sleep(token_delay_sec)
+                continue
 
+            # 3. Capture node completion
+            if kind == "on_chain_end" and lg_node and lg_node == name:
+                node_output = (ev.get("data") or {}).get("output")
+                if isinstance(node_output, dict):
+                    accumulated_state.update(node_output)
+                    curr_model = accumulated_state.get("active_model") or active_model
+
+                if lg_node == "extractor":
+                    yield ("step", {
+                        "node": "extractor",
+                        "status": "completed",
+                        "elapsed_ms": node_elapsed_ms,
+                        "model": curr_model,
+                    })
+                    active_tools = accumulated_state.get("active_tools") or []
+                    det_tool = accumulated_state.get("detected_tool")
+                    det_params = accumulated_state.get("extracted_params") or {}
+                    pending_tool_starts.clear()
+                    if active_tools and len(active_tools) > 1:
+                        for t in active_tools:
+                            t_name = t.get("tool")
+                            t_params = sanitize_tool_params(t.get("params") or {})
+                            if t_name:
+                                pending_tool_starts.append(t_name)
+                                yield ("tool_start", {"tool": t_name, "input": t_params})
+                    elif det_tool:
+                        pending_tool_starts.append(det_tool)
+                        yield ("tool_start", {"tool": det_tool, "input": sanitize_tool_params(det_params)})
+                    tool_started_at = time.perf_counter()
+                    continue
+
+                if lg_node == "tool_node":
+                    tool_elapsed_ms = round((time.perf_counter() - tool_started_at) * 1000.0, 2)
+                    is_error = accumulated_state.get("verification_status") == "ERROR"
+                    status_str = "error" if is_error else "success"
+                    active_tools = accumulated_state.get("active_tools") or []
+                    det_tool = accumulated_state.get("detected_tool")
+                    m_results = accumulated_state.get("multi_tool_results") or {}
+
+                    if pending_tool_starts:
+                        for t_name in pending_tool_starts:
+                            t_res = m_results.get(t_name) if m_results else accumulated_state.get("tool_result")
+                            rec_count = resolve_tool_record_count(t_res)
+                            yield ("tool_end", {
+                                "tool": t_name,
+                                "status": status_str,
+                                "elapsed_ms": tool_elapsed_ms,
+                                "records_found": rec_count,
+                            })
+                        pending_tool_starts.clear()
+                    elif det_tool:
+                        t_res = accumulated_state.get("tool_result")
+                        rec_count = resolve_tool_record_count(t_res)
+                        yield ("tool_end", {
+                            "tool": det_tool,
+                            "status": status_str,
+                            "elapsed_ms": tool_elapsed_ms,
+                            "records_found": rec_count,
+                        })
+
+                    yield ("step", {
+                        "node": "tool_node",
+                        "status": "completed",
+                        "elapsed_ms": node_elapsed_ms,
+                        "model": curr_model,
+                    })
+                    continue
+
+                if lg_node == "synthesizer":
+                    final_ans = accumulated_state.get("final_answer", "")
+                    if final_ans and not streamed_tokens:
+                        chunks = chunk_text_for_streaming(final_ans)
+                        for c in chunks:
+                            streamed_tokens.append(c)
+                            yield ("token", {"content": c})
+                            if token_delay_sec > 0:
+                                await asyncio.sleep(token_delay_sec)
+
+                    yield ("step", {
+                        "node": "synthesizer",
+                        "status": "completed",
+                        "elapsed_ms": node_elapsed_ms,
+                        "model": curr_model,
+                    })
+                    continue
+
+                # General step for other nodes (summarizer, router, verifier, rag_node)
                 yield ("step", {
-                    "node": "synthesizer",
+                    "node": lg_node,
                     "status": "completed",
                     "elapsed_ms": node_elapsed_ms,
                     "model": curr_model,
                 })
-                continue
 
-            # General step for other nodes (summarizer, router, verifier, rag_node)
-            yield ("step", {
-                "node": node_name,
-                "status": "completed",
-                "elapsed_ms": node_elapsed_ms,
-                "model": curr_model,
-            })
-
-        yield ("complete", last_accumulated_state)
+        yield ("complete", accumulated_state)
     except Exception as exc:
-        logger.exception("Error in astream_workflow_events: %s", exc)
+        logger.exception("Error in astream_workflow_events (v2): %s", exc)
         yield ("error", {"detail": str(exc)})
         raise
+    finally:
+        if is_ephemeral:
+            _cleanup_ephemeral_thread(active_graph, effective_thread_id)
+        else:
+            _enforce_checkpoint_lru_bound(
+                active_graph,
+                effective_thread_id,
+                max_threads=settings.MAX_CHECKPOINT_THREADS,
+            )
 
 
 _WORKFLOW_EXECUTOR: Optional[concurrent.futures.ThreadPoolExecutor] = None

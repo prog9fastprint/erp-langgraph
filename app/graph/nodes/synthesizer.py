@@ -9,6 +9,7 @@ import os
 import re
 import sys
 from typing import Any, Dict, List, Optional, Tuple
+from langchain_core.callbacks import adispatch_custom_event
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
@@ -1979,12 +1980,166 @@ def generate_deterministic_followups(state: AgentState) -> List[Dict[str, str]]:
     return suggestions[:3]
 
 
+async def asynthesizer_node(
+    state: AgentState,
+    llm: Optional[BaseChatModel] = None,
+) -> Dict[str, Any]:
+    """
+    Asynchronous LangGraph pipeline node that synthesizes the final conversational response
+    with True Streaming and hybrid presentation support.
+    """
+    user_query = state.get("user_query")
+    status = state.get("verification_status")
+    query_mode = state.get("query_mode")
+    retry_instruction = state.get("retry_instruction") or ""
+    retry_header = (
+        f"> 🔄 **{retry_instruction}**\n\n"
+        if retry_instruction.startswith("Mengulang permintaan:")
+        else ""
+    )
+    deterministic_answer = format_deterministic_answer(state)
+    actual_model = state.get("active_model")
+
+    # For hybrid inquiries, combine live ERP results with semantic RAG findings
+    if query_mode == "hybrid":
+        rag_context = state.get("rag_context")
+        rag_sources = state.get("rag_sources")
+        rag_section = _format_rag_section(rag_context, rag_sources)
+        if rag_section:
+            deterministic_answer = f"{deterministic_answer}\n\n---\n\n{rag_section}"
+        else:
+            deterministic_answer = (
+                f"{deterministic_answer}\n\n"
+                f"> [!NOTE]\n"
+                f"> Dokumen SOP atau spesifikasi kebijakan terkait belum terdaftar di basis data pengetahuan perusahaan."
+            )
+
+    final_text = deterministic_answer
+    followups: List[Dict[str, str]] = []
+
+    # Emit deterministic table immediately via custom event for instant TTFT (<10ms)
+    if deterministic_answer:
+        try:
+            await adispatch_custom_event("token", {"content": deterministic_answer})
+        except Exception as dispatch_err:
+            logger.debug(f"Could not dispatch deterministic_chunk: {dispatch_err}")
+
+    # Attempt LLM natural language polish and follow-up generation if LLM is provided/available
+    model = llm
+    is_test_env = "unittest" in sys.modules or os.environ.get("FASTPRINT_TEST_ENV") == "true"
+    if model is None and not is_test_env:
+        try:
+            model = get_chat_model()
+        except Exception:
+            model = None
+
+    is_multi_co = state.get("is_multi_company", False)
+    is_large_deterministic = is_multi_co or len(deterministic_answer) > 1500
+
+    if model is not None and status == "VALID":
+        try:
+            if is_large_deterministic:
+                # For large tabular or multi-company reports, keep deterministic tables intact
+                # to prevent hallucination, truncation, and slow token generation.
+                final_text = deterministic_answer
+                prompt = (
+                    "Anda adalah Asisten AI FastPrint ERP.\n"
+                    "Berdasarkan laporan di bawah ini, susunlah 2 hingga 3 rekomendasi pertanyaan/prompt lanjutan (READ-ONLY) yang paling logis dan relevan untuk diajukan pengguna berikutnya.\n\n"
+                    "ATURAN KETAT REKOMENDASI:\n"
+                    "1. Wajib hanya menyarankan pertanyaan penelusuran data (READ-ONLY) pada modul FastPrint ERP yang didukung: Akuntansi (Saldo Akun, Jurnal, Buku Besar, Laba Rugi, Neraca, Tagihan Vendor, Rekonsiliasi Bank), Inventaris (Stok Fisik Gudang, Master Katalog & Harga, Kartu Stok, Mutasi Transfer, Alert Stok Rendah), dan Penjualan (Peringkat Produk Terlaris & Pendapatan Tertinggi). DILARANG menyarankan aksi membuat/mengubah transaksi atau modul di luar daftar ini.\n"
+                    "2. DILARANG KERAS menggunakan karakter emoji pada label, query, maupun icon.\n"
+                    "3. Formatkan rekomendasi HANYA dalam blok JSON berikut tanpa teks lain di luar blok kode:\n"
+                    "```json:followups\n"
+                    "[\n"
+                    '  {"label": "Label Singkat (1-3 kata)", "query": "Prompt lengkap yang akan dieksekusi", "icon": "fa-arrow-right"}\n'
+                    "]\n"
+                    "```\n\n"
+                    f"Pertanyaan Pengguna: {user_query}\n"
+                    f"Ringkasan Laporan:\n{deterministic_answer[:1000]}"
+                )
+                response = await model.ainvoke([
+                    SystemMessage(content="Anda adalah Asisten AI FastPrint ERP yang presisi, lugas, dan bebas AI slop."),
+                    HumanMessage(content=prompt),
+                ])
+                resp_meta = getattr(response, "response_metadata", {}) or {}
+                resolved_model = resp_meta.get("model_name") or resp_meta.get("model")
+                if resolved_model:
+                    actual_model = str(resolved_model)
+                content = getattr(response, "content", None)
+                if content and isinstance(content, str) and content.strip():
+                    _, llm_followups = _extract_llm_followups(content.strip())
+                    if llm_followups:
+                        followups = llm_followups
+            else:
+                prompt = (
+                    "Anda adalah Asisten AI FastPrint ERP yang profesional, presisi, dan lugas.\n"
+                    "Sajikan data laporan berikut dalam Bahasa Indonesia yang ringkas, jelas, dan bebas basa-basi (ZERO AI SLOP):\n"
+                    "1. LANGSUNG KE POKOK JAWABAN (Lead with the answer): Tuliskan angka total utama, saldo, atau status di kalimat paling pertama tanpa pengantar bertele-tele.\n"
+                    "2. DILARANG KERAS menggunakan basa-basi pembuka ('Tentu!', 'Berikut rinciannya...', 'Berdasarkan data...') maupun penutup ('Semoga membantu!', 'Jika ada pertanyaan lain...'). Hentikan respons langsung setelah data dan rekomendasi selesai disajikan.\n"
+                    "3. DILARANG KERAS menggunakan karakter emoji, emoticon (seperti 😊, :), 📊, 💰, 📦, 🏢, ✅, ⚠️, ❌), atau simbol dekoratif visual apapun pada judul, heading, poin peluru, tabel, maupun kalimat penjelas.\n"
+                    "4. DILARANG menggunakan kata klise korporat: mengoptimalkan, memfasilitasi, komprehensif, signifikan, ekosistem, holistik, menyeluruh, memberdayakan, penting untuk dicatat bahwa.\n"
+                    "5. PERTAHANKAN seluruh angka transaksi, kode, dan rincian tabel Markdown dengan akurat tanpa mengubah nilai.\n"
+                    "6. DILARANG KERAS menghitung ulang atau mengestimasi nominal keuangan. Seluruh angka wajib dikutip persis dari data laporan terstruktur.\n\n"
+                    "Selain menyajikan data laporan di atas, susunlah 2 hingga 3 rekomendasi pertanyaan/prompt lanjutan (READ-ONLY) yang paling logis, relevan, dan kontekstual untuk diajukan pengguna berikutnya berdasarkan data riil yang ditemukan di atas (misal: rincian transaksi terkait, mutasi kartu stok produk ini, cek tagihan overdue, atau rekonsiliasi bank).\n\n"
+                    "ATURAN KETAT REKOMENDASI:\n"
+                    "1. Wajib hanya menyarankan pertanyaan penelusuran data (READ-ONLY) pada modul FastPrint ERP yang didukung: Akuntansi (Saldo Akun, Jurnal, Buku Besar, Laba Rugi, Neraca, Tagihan Vendor, Rekonsiliasi Bank), Inventaris (Stok Fisik Gudang, Master Katalog & Harga, Kartu Stok, Mutasi Transfer, Alert Stok Rendah), dan Penjualan (Peringkat Produk Terlaris & Pendapatan Tertinggi). DILARANG menyarankan aksi membuat/mengubah transaksi atau modul di luar daftar ini.\n"
+                    "2. Wajib menggunakan entitas riil (kode SKU, nama vendor, kode akun, nama gudang) yang terdapat pada data di atas.\n"
+                    "3. DILARANG KERAS menggunakan karakter emoji pada label, query, maupun icon.\n"
+                    "4. Panjang teks query rekomendasi WAJIB SINGKAT dan FOKUS SATU INTENSI (maksimal 10-12 kata, contoh: 'Cek mutasi kartu stok SKU ...', 'Cek stok SKU ... di semua cabang'). DILARANG membuat kalimat majemuk bertingkat yang berbelit-belit.\n"
+                    "5. Formatkan rekomendasi di akhir respons dalam blok JSON khusus berikut:\n"
+                    "```json:followups\n"
+                    "[\n"
+                    '  {"label": "Label Singkat (1-3 kata)", "query": "Prompt lengkap yang akan dieksekusi", "icon": "fa-arrow-right"}\n'
+                    "]\n"
+                    "```\n"
+                    "DILARANG menuliskan judul pengantar seperti 'Rekomendasi lanjutan' atau teks apapun di luar blok kode json:followups.\n\n"
+                    f"Pertanyaan Pengguna: {user_query}\n"
+                    f"Data Laporan Terstruktur:\n{deterministic_answer}"
+                )
+                response = await model.ainvoke([
+                    SystemMessage(content="Anda adalah Asisten AI FastPrint ERP yang presisi, lugas, dan bebas AI slop."),
+                    HumanMessage(content=prompt),
+                ])
+                resp_meta = getattr(response, "response_metadata", {}) or {}
+                resolved_model = resp_meta.get("model_name") or resp_meta.get("model")
+                if resolved_model:
+                    actual_model = str(resolved_model)
+                content = getattr(response, "content", None)
+                if content and isinstance(content, str) and content.strip():
+                    clean_ans, llm_followups = _extract_llm_followups(content.strip())
+                    clean_ans = _clean_ai_slop(clean_ans)
+                    if clean_ans:
+                        final_text = clean_ans
+                    if llm_followups:
+                        followups = llm_followups
+        except Exception as exc:
+            logger.warning(f"LLM synthesis failed, falling back to deterministic output: {exc}")
+            final_text = deterministic_answer
+
+    # Fallback to deterministic follow-up generation if LLM didn't provide suggestions
+    if not followups:
+        followups = generate_deterministic_followups(state)
+
+    if retry_header and not final_text.startswith("> 🔄"):
+        final_text = f"{retry_header}{final_text}"
+
+    out_dict: Dict[str, Any] = {
+        "final_answer": final_text,
+        "deterministic_answer": deterministic_answer,
+        "suggested_followups": followups,
+        "messages": [AIMessage(content=final_text)],
+    }
+    if actual_model:
+        out_dict["active_model"] = actual_model
+    return out_dict
+
+
 def synthesizer_node(
     state: AgentState,
     llm: Optional[BaseChatModel] = None,
 ) -> Dict[str, Any]:
     """
-    LangGraph pipeline node that synthesizes the final conversational response.
+    LangGraph pipeline node that synthesizes the final conversational response (synchronous wrapper).
 
     Args:
         state: Current AgentState.
@@ -1993,6 +2148,7 @@ def synthesizer_node(
     Returns:
         Partial AgentState update dictionary containing:
             - final_answer: Markdown formatted response string
+            - deterministic_answer: Raw formatted ERP table/data string
             - suggested_followups: Contextual follow-up suggestions generated by LLM or deterministic fallback
             - messages: [AIMessage(content=final_answer)]
     """
@@ -2040,8 +2196,6 @@ def synthesizer_node(
     if model is not None and status == "VALID":
         try:
             if is_large_deterministic:
-                # For large tabular or multi-company reports, keep deterministic tables intact
-                # to prevent hallucination, truncation, and slow token generation.
                 final_text = deterministic_answer
                 prompt = (
                     "Anda adalah Asisten AI FastPrint ERP.\n"
@@ -2126,6 +2280,7 @@ def synthesizer_node(
 
     out_dict: Dict[str, Any] = {
         "final_answer": final_text,
+        "deterministic_answer": deterministic_answer,
         "suggested_followups": followups,
         "messages": [AIMessage(content=final_text)],
     }

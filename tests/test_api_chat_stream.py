@@ -249,6 +249,37 @@ class TestApiChatStream(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resolve_tool_record_count({"entries": [1, 2, 3]}), 3)
         self.assertEqual(resolve_tool_record_count({"accounts": [{"code": "1"}]}), 1)
 
+    async def test_synthesizer_graceful_fallback_on_stream_failure(self):
+        """When LLM raises mid-stream failure, asynthesizer_node falls back to deterministic answer cleanly."""
+        from app.graph.nodes.synthesizer import asynthesizer_node
+        from app.graph.state import create_initial_state
+
+        state = create_initial_state(user_query="Cek saldo kas operasional", company_id=1)
+        state["verification_status"] = "VALID"
+        state["detected_domain"] = "accounting"
+        state["detected_tool"] = "get_account_balance"
+        state["tool_result"] = {
+            "accounts": [{
+                "account_code": "1110",
+                "account_name": "Kas Operasional",
+                "ending_balance": 5000000.0,
+                "period_debit": 0.0,
+                "period_credit": 0.0,
+                "company_id": 1,
+            }]
+        }
+
+        failing_mock_llm = MagicMock()
+        failing_mock_llm.ainvoke = AsyncMock(side_effect=RuntimeError("API 429 RateLimit Exceeded"))
+
+        result = await asynthesizer_node(state, llm=failing_mock_llm)
+        self.assertIn("Kas Operasional", result["final_answer"])
+        self.assertIn("Rp 5.000.000", result["final_answer"])
+        self.assertIsNotNone(result.get("deterministic_answer"))
+        self.assertTrue(len(result["suggested_followups"]) > 0)
+        # Verify no unhandled exception occurred
+        self.assertTrue(result["final_answer"].startswith("### Informasi Saldo Chart of Account"))
+
 
 if __name__ == "__main__":
     unittest.main()

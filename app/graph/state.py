@@ -77,6 +77,7 @@ class AgentState(TypedDict, total=False):
 
     # 6. Final Presentation & Error Reporting
     final_answer: Optional[str]
+    deterministic_answer: Optional[str]
     error_message: Optional[str]
     suggested_followups: Optional[List[Dict[str, str]]]
     active_model: Optional[str]
