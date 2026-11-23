@@ -170,6 +170,29 @@ def _format_single_tool_presentation(
         total_count = _extract_total_count(tool_result, len(accounts))
         totals = tool_result.get("totals") or {}
         lines.append("### Informasi Saldo Chart of Account (Accounting Balance)\n")
+
+        # Tier 1: Single account presentation (Direct KPI + Bullet List)
+        if len(accounts) == 1:
+            acc = accounts[0]
+            code = acc.get("account_code") or "-"
+            name = acc.get("account_name") or "-"
+            op = _format_rupiah(acc.get("opening_balance", 0.0)) if acc.get("opening_balance") is not None else "-"
+            deb = _format_rupiah(acc.get("period_debit", acc.get("total_debit", 0.0)))
+            kred = _format_rupiah(acc.get("period_credit", acc.get("total_credit", 0.0)))
+            net = _format_rupiah(acc.get("ending_balance", acc.get("net_balance", 0.0)))
+            pos = acc.get("balance_position")
+            pos_str = f" (Posisi: {pos})" if pos else ""
+
+            lines.append(f"Saldo akhir untuk akun **{name}** (`{code}`) adalah **{net}**{pos_str}.\n")
+            lines.append(f"- **Kode Akun**: `{code}`")
+            lines.append(f"- **Nama Akun**: {name}")
+            if op != "-":
+                lines.append(f"- **Saldo Awal**: {op}")
+            lines.append(f"- **Mutasi Debit**: {deb}")
+            lines.append(f"- **Mutasi Kredit**: {kred}")
+            lines.append(f"- **Saldo Akhir**: **{net}**")
+            return "\n".join(lines)
+
         if totals:
             op = _format_rupiah(totals.get("opening_balance", 0.0))
             deb = _format_rupiah(totals.get("period_debit", 0.0))
@@ -225,18 +248,19 @@ def _format_single_tool_presentation(
 
             items = acc.get("items") or []
             if items:
-                lines.append("| Tanggal | No. Entri | Referensi | Rekanan | Keterangan | Debit | Kredit | Saldo Berjalan |")
-                lines.append("|:---|:---|:---|:---|:---|:---|:---|:---|")
+                lines.append("| Tanggal | No. Entri / Ref | Rekanan | Keterangan | Debit | Kredit | Saldo Berjalan |")
+                lines.append("|:---|:---|:---|:---|:---|:---|:---|")
                 for it in items:
                     tgl = it.get("date") or "-"
                     num = it.get("entry_number") or "-"
                     ref = it.get("ref") or "-"
+                    doc_ref = f"`{num}` ({ref})" if ref and ref != "-" and ref != num else f"`{num}`"
                     partner = it.get("partner_name") or "-"
                     desc = it.get("description") or "-"
                     deb = _format_rupiah(it.get("debit", 0.0))
                     kred = _format_rupiah(it.get("credit", 0.0))
                     run_bal = _format_rupiah(it.get("running_balance", 0.0))
-                    lines.append(f"| {tgl} | `{num}` | {ref} | {partner} | {desc} | {deb} | {kred} | **{run_bal}** |")
+                    lines.append(f"| {tgl} | {doc_ref} | {partner} | {desc} | {deb} | {kred} | **{run_bal}** |")
             else:
                 lines.append("*(Tidak ada mutasi transaksi pada periode ini)*")
             lines.append("")
@@ -405,6 +429,61 @@ def _format_single_tool_presentation(
         else:
             items = [tool_result]
         total_count = _extract_total_count(tool_result, len(items))
+
+        # Tier 1: Single item stock presentation (Direct KPI + Bullet List)
+        if len(items) == 1:
+            st_item = items[0]
+            code = st_item.get("code") or st_item.get("sku") or "-"
+            name = st_item.get("name") or st_item.get("product_name") or "-"
+            comp = (
+                st_item.get("company_name")
+                or (tool_result.get("company_name") if isinstance(tool_result, dict) else None)
+                or f"Company #{st_item.get('company_id', tool_result.get('company_id', 1) if isinstance(tool_result, dict) else 1)}"
+            )
+            loc = (
+                st_item.get("location_name")
+                or (tool_result.get("location_name") if isinstance(tool_result, dict) else None)
+                or (f"Location #{st_item.get('location_id')}" if st_item.get("location_id") else "Semua Lokasi")
+            )
+            qty = st_item.get("qty_on_hand") or st_item.get("quantity") or 0.0
+
+            lines.append(f"Total stok fisik untuk **{name}** (SKU `{code}`) saat ini adalah **{qty} unit** ({comp} - {loc}).\n")
+            lines.append(f"- **Nama Produk**: {name}")
+            lines.append(f"- **Kode / SKU**: `{code}`")
+            lines.append(f"- **Perusahaan**: {comp}")
+            lines.append(f"- **Lokasi**: {loc}")
+            lines.append(f"- **Kuantitas Fisik On Hand**: **{qty} unit**")
+
+            # Render breakdown if available
+            single_bd = (
+                (tool_result.get("breakdown") if isinstance(tool_result, dict) else None)
+                or (st_item.get("breakdown") if isinstance(st_item, dict) else None)
+            )
+            if single_bd:
+                lines.append("\n#### Rincian Stok per Lokasi / Rak:")
+                lines.append("| Gudang | Lokasi / Rak | Kuantitas |")
+                lines.append("|:---|:---|:---|")
+                for bd in single_bd:
+                    wh = bd.get("warehouse_name") or f"Gudang #{bd.get('warehouse_id', '-')}"
+                    loc_n = bd.get("location_name") or f"Rak #{bd.get('location_id', '-')}"
+                    b_qty = bd.get("qty", 0.0)
+                    lines.append(f"| {wh} | {loc_n} | **{b_qty:g} unit** |")
+
+            # Missing requested SKU warning callout
+            if extracted_params and isinstance(extracted_params, dict):
+                req_codes = extracted_params.get("codes")
+                if req_codes and isinstance(req_codes, list):
+                    found_codes = {
+                        str(it.get("code") or it.get("sku") or "").strip().lower()
+                        for it in items
+                        if isinstance(it, dict)
+                    }
+                    missing_codes = [c for c in req_codes if str(c).strip().lower() not in found_codes]
+                    if missing_codes:
+                        lines.append("")
+                        for mc in missing_codes:
+                            lines.append(f"> **Catatan:** Kode SKU `{mc}` tidak ditemukan pada master data produk FastPrint ERP.")
+            return "\n".join(lines)
 
         lines.append("| SKU / Kode | Nama Produk | Perusahaan | Lokasi / Gudang | Qty Fisik |")
         lines.append("|:---|:---|:---|:---|:---|")

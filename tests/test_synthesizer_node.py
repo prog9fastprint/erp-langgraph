@@ -81,7 +81,7 @@ class TestSynthesizerFormatting(unittest.TestCase):
         self.assertIn("Tidak ada transaksi tercatat pada periode ini.", output)
 
     def test_format_account_balance(self):
-        """Account balance summary formatting."""
+        """Account balance summary formatting for single account (Tier 1 Direct KPI)."""
         state = create_initial_state(user_query="Saldo kas")
         state["detected_domain"] = "accounting"
         state["detected_tool"] = "get_account_balance"
@@ -103,9 +103,51 @@ class TestSynthesizerFormatting(unittest.TestCase):
         self.assertIn("Kas Utama", output)
         self.assertIn("111100", output)
         self.assertIn("Rp 100.000.000,00", output)
+        self.assertIn("Saldo akhir untuk akun **Kas Utama**", output)
+        self.assertNotIn("| Kode Akun | Nama Akun |", output)
+
+    def test_format_account_balance_multiple_accounts_table(self):
+        """Account balance comparative table formatting for multi-account queries (Tier 3)."""
+        state = create_initial_state(user_query="Daftar saldo kas dan bank")
+        state["detected_domain"] = "accounting"
+        state["detected_tool"] = "get_account_balance"
+        state["verification_status"] = "VALID"
+        state["tool_result"] = {
+            "total_count": 2,
+            "totals": {
+                "opening_balance": 50000000.0,
+                "period_debit": 200000000.0,
+                "period_credit": 100000000.0,
+                "ending_balance": 150000000.0,
+            },
+            "accounts": [
+                {
+                    "account_code": "111100",
+                    "account_name": "Kas Utama",
+                    "opening_balance": 20000000.0,
+                    "period_debit": 150000000.0,
+                    "period_credit": 50000000.0,
+                    "ending_balance": 120000000.0,
+                },
+                {
+                    "account_code": "111200",
+                    "account_name": "Bank BCA",
+                    "opening_balance": 30000000.0,
+                    "period_debit": 50000000.0,
+                    "period_credit": 50000000.0,
+                    "ending_balance": 30000000.0,
+                },
+            ]
+        }
+
+        output = format_deterministic_answer(state)
+        self.assertIn("| Kode Akun | Nama Akun | Saldo Awal | Mutasi Debit | Mutasi Kredit | Saldo Akhir |", output)
+        self.assertIn("Kas Utama", output)
+        self.assertIn("Bank BCA", output)
+        self.assertIn("Rp 150.000.000,00", output)
 
     def test_format_stock_level(self):
-        """Inventory stock level formatting."""
+        """Inventory stock level formatting for single SKU (Tier 1 Direct KPI)."""
         state = create_initial_state(user_query="Cek stok kertas A4")
         state["detected_domain"] = "inventory"
         state["detected_tool"] = "get_stock_level"
@@ -121,6 +163,80 @@ class TestSynthesizerFormatting(unittest.TestCase):
         self.assertIn("SKU-PAPER-A4", output)
         self.assertIn("Kertas HVS A4 80gsm", output)
         self.assertIn("250.0 unit", output)
+        self.assertIn("Total stok fisik untuk **Kertas HVS A4 80gsm**", output)
+        self.assertNotIn("| SKU / Kode | Nama Produk |", output)
+
+    def test_format_stock_level_multiple_sku_table(self):
+        """Inventory stock comparative table for multi-product queries (Tier 3)."""
+        state = create_initial_state(user_query="Cek stok kertas")
+        state["detected_domain"] = "inventory"
+        state["detected_tool"] = "get_stock_level"
+        state["verification_status"] = "VALID"
+        state["tool_result"] = {
+            "total_count": 2,
+            "products": [
+                {
+                    "code": "SKU-PAPER-A4",
+                    "name": "Kertas HVS A4 80gsm",
+                    "company_name": "FastPrint Surabaya",
+                    "location_name": "Gudang Utama",
+                    "qty_on_hand": 250.0,
+                },
+                {
+                    "code": "SKU-PAPER-F4",
+                    "name": "Kertas HVS F4 70gsm",
+                    "company_name": "FastPrint Surabaya",
+                    "location_name": "Gudang Utama",
+                    "qty_on_hand": 180.0,
+                },
+            ]
+        }
+
+        output = format_deterministic_answer(state)
+        self.assertIn("| SKU / Kode | Nama Produk | Perusahaan | Lokasi / Gudang | Qty Fisik |", output)
+        self.assertIn("SKU-PAPER-A4", output)
+        self.assertIn("SKU-PAPER-F4", output)
+        self.assertIn("250.0 unit", output)
+        self.assertIn("180.0 unit", output)
+
+    def test_format_general_ledger_streamlined_columns(self):
+        """General ledger table streamlines 8 columns to 7 essential columns with No. Entri / Ref merged."""
+        state = create_initial_state(user_query="Buku besar kas")
+        state["detected_domain"] = "accounting"
+        state["detected_tool"] = "get_general_ledger"
+        state["verification_status"] = "VALID"
+        state["tool_result"] = {
+            "date_from": "2026-11-01",
+            "date_to": "2026-11-23",
+            "accounts": [
+                {
+                    "account_code": "111100",
+                    "account_name": "Kas Utama",
+                    "opening_balance": 10000000.0,
+                    "closing_balance": 15000000.0,
+                    "period_debit": 7000000.0,
+                    "period_credit": 2000000.0,
+                    "items": [
+                        {
+                            "date": "2026-11-05",
+                            "entry_number": "JE/2026/001",
+                            "ref": "INV-001",
+                            "partner_name": "PT Mitra Abadi",
+                            "description": "Pembayaran Invoice",
+                            "debit": 5000000.0,
+                            "credit": 0.0,
+                            "running_balance": 15000000.0,
+                        }
+                    ]
+                }
+            ]
+        }
+
+        output = format_deterministic_answer(state)
+        self.assertIn("| Tanggal | No. Entri / Ref | Rekanan | Keterangan | Debit | Kredit | Saldo Berjalan |", output)
+        self.assertIn("`JE/2026/001` (INV-001)", output)
+        self.assertIn("PT Mitra Abadi", output)
+        self.assertIn("Rp 5.000.000,00", output)
 
     def test_format_multi_sku_stock_level_with_breakdown_and_missing_sku(self):
         """Batch multi-SKU stock output formatting with location breakdown and missing SKU alert."""
