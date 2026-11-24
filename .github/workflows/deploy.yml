@@ -1,0 +1,64 @@
+name: CI/CD Pipeline - Deploy to VPS
+
+on:
+  push:
+    branches:
+      - master
+      - main
+  workflow_dispatch:
+
+jobs:
+  lint-and-test:
+    name: Test Application
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Test Suite
+        env:
+          APP_ENV: test
+          FASTPRINT_TEST_ENV: "true"
+          OPENAI_API_KEY: "dummy-key-for-testing"
+          ERP_BASE_URL: "http://127.0.0.1:8000"
+        run: |
+          python -m unittest discover tests
+
+  deploy:
+    name: Deploy to VPS
+    needs: lint-and-test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main'
+    steps:
+      - name: Execute Remote SSH Commands
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USERNAME }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT || 22 }}
+          script: |
+            set -e
+            APP_DIR="${{ secrets.VPS_APP_DIR || '/www/app/django/erp/staging/erp-langgraph' }}"
+            BRANCH="${{ github.ref_name }}"
+            
+            echo ">>> Navigating to $APP_DIR"
+            cd "$APP_DIR"
+            
+            echo ">>> Fetching latest code from $BRANCH"
+            git fetch origin "$BRANCH"
+            git reset --hard "origin/$BRANCH"
+            
+            echo ">>> Running deployment script"
+            bash scripts/deploy.sh "$APP_DIR" "$BRANCH"
