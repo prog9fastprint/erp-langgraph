@@ -5,14 +5,12 @@ synthesizer dual citations, and StateGraph workflow integration.
 """
 import unittest
 from unittest.mock import AsyncMock, MagicMock
-from langchain_core.messages import HumanMessage
 
-from app.core.config import settings
 from app.graph.state import create_initial_state
-from app.graph.nodes.router import router_node, classify_query_rule_based
-from app.graph.nodes.rag_node import rag_node, rag_node_sync
+from app.graph.nodes.router import classify_query_rule_based
+from app.graph.nodes.rag_node import rag_node
 from app.graph.nodes.synthesizer import synthesizer_node, format_deterministic_answer
-from app.graph.workflow import create_workflow_graph, run_workflow_sync
+from app.graph.workflow import run_workflow_sync
 from app.services.django_client import DjangoCoreClient, DjangoCoreClientError
 
 

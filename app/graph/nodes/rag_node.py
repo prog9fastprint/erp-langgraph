@@ -31,7 +31,7 @@ async def _search_single_rag_query(
     is_client_error = False
 
     # Path 1: Check Dedicated Vector Service (PGVector + Gemini) first
-    if settings.VECTOR_DB_URL and settings.GEMINI_API_KEY:
+    if client is None and settings.VECTOR_DB_URL and (vector_service.gemini_api_key or settings.GEMINI_API_KEY):
         try:
             chunks = await vector_service.search_knowledge(
                 query=rag_query.strip(),
@@ -66,7 +66,7 @@ async def _search_single_rag_query(
             is_client_error = True
         except Exception as exc:
             logger.error(f"Unexpected error in rag_node: {exc}", exc_info=True)
-            return {"chunks": [], "sources": [], "error": None, "is_client_error": False}
+            return {"chunks": [], "sources": [], "error": str(exc), "is_client_error": True}
         finally:
             if own_client:
                 await erp_client.aclose()
@@ -84,7 +84,7 @@ async def _search_single_rag_query(
         score = float(c.get("similarity_score", 1.0))
         if score >= threshold:
             valid_chunks.append(c)
-            title = c.get("title") or c.get("metadata", {}).get("source") or "Dokumen SOP ERP"
+            title = c.get("title") or (c.get("metadata") or {}).get("source") or "Dokumen SOP ERP"
             if title not in sources:
                 sources.append(title)
 
@@ -170,7 +170,7 @@ async def rag_node(
         }
         for c in q_chunks:
             sig = (
-                c.get("title") or c.get("metadata", {}).get("source") or "",
+                c.get("title") or (c.get("metadata") or {}).get("source") or "",
                 c.get("content") or c.get("text") or "",
             )
             if sig not in seen_chunk_sigs:

@@ -12,7 +12,6 @@ from app.schemas.tools import (
     StockLevelFilterSchema,
     ProductInfoFilterSchema,
     # Envelope & Error
-    ERPErrorDetail,
     ERPResponseEnvelope,
     # Output schemas
     AccountBalanceResponseSchema,
@@ -20,8 +19,6 @@ from app.schemas.tools import (
     StockLevelResponseSchema,
     ProductInfoResponseSchema,
 )
-from app.tools.static import create_static_tools
-from app.services.erp_client import ERPClient
 
 
 class TestInputFilterSchemas(unittest.TestCase):
@@ -244,22 +241,6 @@ class TestOutputContractSchemas(unittest.TestCase):
         }
         with self.assertRaises(ValidationError):
             AccountBalanceResponseSchema(**raw_bad_payload)
-
-
-class TestStaticToolsIntegration(unittest.TestCase):
-    """Test suite ensuring LangChain static tools bind the centralized schemas."""
-
-    def test_static_tools_use_centralized_schemas(self):
-        """Verify that create_static_tools uses the schemas from app.schemas.tools."""
-        client = ERPClient()
-        tools = create_static_tools(client)
-        self.assertEqual(len(tools), 4)
-
-        tool_map = {t.name: t for t in tools}
-        self.assertEqual(tool_map["accounting_get_account_balance"].args_schema, AccountBalanceFilterSchema)
-        self.assertEqual(tool_map["accounting_get_journal_entries"].args_schema, JournalEntriesFilterSchema)
-        self.assertEqual(tool_map["inventory_get_stock_level"].args_schema, StockLevelFilterSchema)
-        self.assertEqual(tool_map["inventory_get_product_info"].args_schema, ProductInfoFilterSchema)
 
 
 class TestToolDomainMapRegistry(unittest.TestCase):

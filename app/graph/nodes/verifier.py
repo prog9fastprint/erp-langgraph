@@ -5,12 +5,13 @@ for empty query results (with maximum 2 retries), and provides conditional edge 
 """
 import logging
 import re
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple
 
 from app.core.context import (
     compute_multi_tool_counts,
     get_multi_tool_key,
     has_strict_document_identifier,
+    resolve_tool_record_count,
 )
 from app.graph.state import AgentState, VerificationStatus
 
@@ -18,207 +19,30 @@ logger = logging.getLogger("verifier_node")
 
 
 def _calculate_records_count(tool_result: Any) -> int:
-    """
-    Hierarchically inspect and extract the record count from diverse ERP response structures.
+    """Delegate record count inspection to unified context helper."""
+    return resolve_tool_record_count(tool_result)
 
-    Handles:
-    - total_count or count fields (e.g. Journal entries, Vendor invoices)
-    - list entries/records (e.g. accounts, entries, products, items, locations)
-    - root lists (e.g. multiple items array)
-    - single record dictionary with recognized business attributes (e.g. stock quant, product, balance)
-    - error or detail payload dicts, empty structures or None -> 0
-    """
-    if tool_result is None:
-        return 0
 
-    if isinstance(tool_result, list):
-        return len(tool_result)
-
-    if isinstance(tool_result, dict):
-        if not tool_result:
-            return 0
-
-        # Check explicit error payloads from upstream ERP / DRF endpoints
-        if (
-            tool_result.get("error") is not None
-            or tool_result.get("detail") is not None
-            or tool_result.get("errors") is not None
-            or tool_result.get("success") is False
-        ):
-            return 0
-
-        # Check explicit count fields
-        if "total_count" in tool_result and isinstance(tool_result["total_count"], (int, float)):
-            cnt_val = int(tool_result["total_count"])
-            if cnt_val > 0:
-                return cnt_val
-            # Clean-audit check: 0 issues/mismatches/anomalies when summary scanned > 0
-            summary_blk = tool_result.get("summary")
-            if isinstance(summary_blk, dict) and summary_blk:
-                scanned_keys = (
-                    "total_accounts",
-                    "total_evaluated",
-                    "total_kilat_scanned",
-                    "total_lines",
-                    "total_orders",
-                    "active_competitors",
-                )
-                if any(int(summary_blk.get(sk) or 0) > 0 for sk in scanned_keys):
-                    return 1
-                if "total_anomalies" in summary_blk and ("date_window" in tool_result or "filters" in tool_result):
-                    return 1
-            return 0
-
-        if "count" in tool_result and isinstance(tool_result["count"], (int, float)):
-            return int(tool_result["count"])
-
-        if "total_products" in tool_result and isinstance(tool_result["total_products"], (int, float)):
-            return int(tool_result["total_products"])
-
-        # Low-stock positive-only ranking: when all items are <= 0, still report out_of_stock_count
-        if (
-            tool_result.get("exclude_zero") is True
-            and isinstance(tool_result.get("out_of_stock_count"), (int, float))
-            and int(tool_result["out_of_stock_count"]) > 0
-        ):
-            alerts_list = tool_result.get("alerts")
-            if isinstance(alerts_list, list) and len(alerts_list) > 0:
-                return len(alerts_list)
-            return 1
-
-        # Marketplace sync execution logs totals & summaries (get_sync_execution_logs)
-        if any(k in tool_result for k in ("stock_logs_total", "price_logs_total", "pcls_logs_total", "stock_summary", "price_summary")):
-            log_row_total = sum(
-                int(tool_result.get(k) or 0)
-                for k in ("stock_logs_total", "price_logs_total", "pcls_logs_total")
-                if isinstance(tool_result.get(k), (int, float))
-            )
-            if log_row_total > 0:
-                return log_row_total
-            for sum_k in ("stock_summary", "price_summary"):
-                s_blk = tool_result.get(sum_k)
-                if isinstance(s_blk, dict) and int(s_blk.get("total") or 0) > 0:
-                    return 1
-            return 0
-
-        # Check common collection list keys
-        for list_key in (
-            "entries", "accounts", "products", "items", "records", "lines", "locations",
-            "transfers", "history", "adjustments", "scraps", "warehouses", "categories", "alerts", "bills", "orders", "contacts",
-            "mappings", "exceptions", "simulations", "stock_logs", "price_logs", "pcls_logs",
-            "anomalies", "by_store", "by_deduction_category", "cashflow_logs", "competitors",
-        ):
-            val = tool_result.get(list_key)
-            if isinstance(val, list):
-                if len(val) > 0:
-                    return len(val)
-                # Empty list with valid non-zero scanned summary -> clean audit
-                summary_blk = tool_result.get("summary")
-                if isinstance(summary_blk, dict) and any(
-                    int(summary_blk.get(sk) or 0) > 0
-                    for sk in (
-                        "total_accounts",
-                        "total_evaluated",
-                        "total_kilat_scanned",
-                        "total_lines",
-                        "total_orders",
-                        "active_competitors",
-                    )
-                ):
-                    return 1
-                return 0
-
-        # Check financial report summary or totals blocks (e.g. P&L, Balance Sheet, Bank Recon, Account Totals, Sales Summary)
-        if isinstance(tool_result.get("summary"), dict) and tool_result["summary"]:
-            return 1
-        if isinstance(tool_result.get("totals"), dict) and tool_result["totals"]:
-            return 1
-        if isinstance(tool_result.get("confirmed_metrics"), dict) and tool_result["confirmed_metrics"]:
-            return 1
-
-        # Nested data field inspection (if envelope wasn't stripped)
-        if "data" in tool_result and isinstance(tool_result["data"], (dict, list)):
-            return _calculate_records_count(tool_result["data"])
-
-        # Specific check for aggregate balance payloads without account records
-        balance_metric_keys = {
-            "net_balance", "total_debit", "total_credit",
-            "grand_net_balance", "grand_total_debit", "grand_total_credit",
-            "total_revenue", "total_assets", "bank_statement_balance",
-        }
-        if any(k in balance_metric_keys for k in tool_result.keys()):
-            has_value = any(float(v or 0) != 0.0 for v in tool_result.values() if isinstance(v, (int, float)))
-            return 1 if has_value else 0
-
-        # Single record entity check: verify presence of known ERP business record attributes
-        KNOWN_RECORD_ATTRS = {
-            "id",
-            "product_id",
-            "product_name",
-            "sku",
-            "code",
-            "default_code",
-            "barcode",
-            "account_id",
-            "account_code",
-            "account_name",
-            "location_id",
-            "location_name",
-            "partner_id",
-            "partner_name",
-            "vendor_id",
-            "vendor_name",
-            "invoice_id",
-            "journal_id",
-            "move_id",
-            "reference",
-            "name",
-            "uom",
-            "qty_on_hand",
-            "quantity",
-            "available_quantity",
-            "virtual_available",
-            "incoming_qty",
-            "outgoing_qty",
-            "net_balance",
-            "total_debit",
-            "total_credit",
-            "grand_net_balance",
-            "amount_total",
-            "price_unit",
-            "list_price",
-            "standard_price",
-            "debit",
-            "credit",
-            "balance",
-            "total_revenue",
-            "gross_profit",
-            "net_profit",
-            "cogs",
-            "operating_profit",
-            "gross_margin_percent",
-            "total_assets",
-            "total_liabilities",
-            "total_equity",
-            "total_liabilities_and_equity",
-            "bank_statement_balance",
-            "erp_book_balance",
-            "residual_balance",
-            "bill_date",
-            "due_date",
-            "due_status",
-            "closing_balance",
-            "running_balance",
-        }
-        has_business_attr = any(k in KNOWN_RECORD_ATTRS for k in tool_result.keys())
-        has_non_none_value = any(v is not None for v in tool_result.values())
-        if has_business_attr and has_non_none_value:
-            return 1
-
-        # Fallback for unrecognized payload dictionaries without ERP business attributes
-        return 0
-
-    return 0
+def _is_explicit_daily_existence(
+    state: AgentState,
+    tool_name: Optional[str],
+    params: Optional[Dict[str, Any]],
+) -> bool:
+    """Return True when the user asked an explicit yes/no daily sales existence check."""
+    user_q_low = (state.get("user_query") or "").lower()
+    ext_params = params or {}
+    return bool(
+        (
+            state.get("detected_domain") == "sales"
+            or tool_name in ("get_top_selling_products", "get_sales_orders", "get_contacts", "get_sales_summary")
+        )
+        and (ext_params.get("date_from") or ext_params.get("date_to"))
+        and re.search(r"\b(?:hari\s+ini|kemarin)\b", user_q_low)
+        and re.search(
+            r"\b(?:apakah\s+ada|ada\s+(?:tidak|penjualan|transaksi|order|quotation)|cek\s+(?:ada|apakah))\b",
+            user_q_low,
+        )
+    )
 
 
 def verifier_node(state: AgentState) -> Dict[str, Any]:
@@ -262,7 +86,7 @@ def verifier_node(state: AgentState) -> Dict[str, Any]:
         total_records = sum(_calculate_records_count(r) for r in mc_results.values() if r)
         unauth = state.get("unauthorized_companies") or []
 
-        if total_records > 0 or (len(mc_results) > len(unauth) and any(r is not None for r in mc_results.values())):
+        if total_records > 0:
             return {
                 "verification_status": "VALID",
                 "retry_instruction": None,
@@ -273,14 +97,10 @@ def verifier_node(state: AgentState) -> Dict[str, Any]:
                 "error_message": f"Akses ditolak ke seluruh cabang yang diminta (HTTP 403): {unauth}",
             }
         else:
-            user_q_low = (state.get("user_query") or "").lower()
-            det_tool = state.get("detected_tool") or ""
-            ext_params = state.get("extracted_params") or {}
-            is_explicit_daily_existence = bool(
-                (state.get("detected_domain") == "sales" or det_tool in ("get_top_selling_products", "get_sales_orders", "get_contacts", "get_sales_summary"))
-                and (ext_params.get("date_from") or ext_params.get("date_to"))
-                and re.search(r"\b(?:hari\s+ini|kemarin)\b", user_q_low)
-                and re.search(r"\b(?:apakah\s+ada|ada\s+(?:tidak|penjualan|transaksi|order|quotation)|cek\s+(?:ada|apakah))\b", user_q_low)
+            is_explicit_daily_existence = _is_explicit_daily_existence(
+                state,
+                state.get("detected_tool"),
+                state.get("extracted_params"),
             )
             current_retry = int(state.get("retry_count") or 0)
             if current_retry < 2 and not is_explicit_daily_existence:
@@ -333,11 +153,8 @@ def verifier_node(state: AgentState) -> Dict[str, Any]:
                 if len(plan_unauth) == len(plan_mc_results) and len(plan_unauth) > 0:
                     per_tool_status[key] = "ERROR"
                     has_error_tool = True
-                elif mc_total > 0 or (
-                    len(plan_mc_results) > len(plan_unauth)
-                    and any(r is not None for r in plan_mc_results.values())
-                ):
-                    total_records += max(mc_total, 1)
+                elif mc_total > 0:
+                    total_records += mc_total
                     per_tool_status[key] = "VALID"
                     has_valid_tool = True
                 else:
@@ -470,18 +287,10 @@ def verifier_node(state: AgentState) -> Dict[str, Any]:
         )
     )
 
-    user_q_low = (state.get("user_query") or "").lower()
-    is_explicit_daily_existence = bool(
-        (
-            state.get("detected_domain") == "sales"
-            or tool in ("get_top_selling_products", "get_sales_orders", "get_contacts", "get_sales_summary")
-        )
-        and (extracted_params.get("date_from") or extracted_params.get("date_to"))
-        and re.search(r"\b(?:hari\s+ini|kemarin)\b", user_q_low)
-        and re.search(
-            r"\b(?:apakah\s+ada|ada\s+(?:tidak|penjualan|transaksi|order|quotation)|cek\s+(?:ada|apakah))\b",
-            user_q_low,
-        )
+    is_explicit_daily_existence = _is_explicit_daily_existence(
+        state,
+        tool,
+        extracted_params if isinstance(extracted_params, dict) else None,
     )
 
     if (

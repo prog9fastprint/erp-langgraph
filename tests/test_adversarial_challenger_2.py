@@ -12,7 +12,7 @@ import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.graph.state import create_initial_state
-from app.graph.nodes.router import router_node, classify_query_rule_based
+from app.graph.nodes.router import router_node
 from app.graph.nodes.extractor import (
     extractor_node,
     _fallback_extract_stock_level,

@@ -8,7 +8,6 @@ from unittest.mock import patch
 from pydantic import BaseModel, Field
 
 from app.core.config import Settings, settings
-from app.services.erp_client import ERPClient
 from app.services.llm import get_chat_model
 
 
@@ -54,22 +53,6 @@ class TestCentralizedConfig(unittest.TestCase):
         with patch.dict(os.environ, env_precedence, clear=False):
             precedence_settings = Settings(_env_file=None)
             self.assertEqual(precedence_settings.ERP_BASE_URL, "http://primary.erp:8000")
-
-
-class TestERPClientTimeout(unittest.TestCase):
-    """Test suite for ERPClient integration with REQUEST_TIMEOUT_SEC."""
-
-    def test_erp_client_default_timeout_from_settings(self):
-        """ERPClient should inherit timeout from settings.REQUEST_TIMEOUT_SEC."""
-        client = ERPClient()
-        self.assertEqual(client.timeout, settings.REQUEST_TIMEOUT_SEC)
-        self.assertEqual(client.client.timeout.read, float(settings.REQUEST_TIMEOUT_SEC))
-
-    def test_erp_client_custom_timeout_override(self):
-        """Explicit timeout should override settings default."""
-        client = ERPClient(timeout=60)
-        self.assertEqual(client.timeout, 60)
-        self.assertEqual(client.client.timeout.read, 60.0)
 
 
 class TestLLMClientFactory(unittest.TestCase):

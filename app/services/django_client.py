@@ -8,48 +8,13 @@ import hashlib
 import logging
 import re
 import threading
-from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple
 import weakref
 import httpx
 
 from app.core.config import settings
 from app.core.context import get_current_erp_datetime
-from app.schemas.tools import (
-    AccountBalanceFilterSchema,
-    JournalEntriesFilterSchema,
-    GeneralLedgerFilterSchema,
-    ProfitAndLossFilterSchema,
-    BalanceSheetFilterSchema,
-    VendorBillsFilterSchema,
-    BankReconciliationFilterSchema,
-    StockLevelFilterSchema,
-    ProductInfoFilterSchema,
-    LocationsFilterSchema,
-    StockHistoryFilterSchema,
-    TransfersFilterSchema,
-    LowStockAlertsFilterSchema,
-    StockAdjustmentsFilterSchema,
-    ScrapRecordsFilterSchema,
-    WarehousesFilterSchema,
-    ProductCategoriesFilterSchema,
-    TopSellingProductsFilterSchema,
-    SalesOrdersFilterSchema,
-    SalesOrderDetailFilterSchema,
-    SalesSummaryFilterSchema,
-    ContactsFilterSchema,
-    AccountHealthFilterSchema,
-    MarketplaceOrdersFilterSchema,
-    KilatOrderDiagnosticsFilterSchema,
-    ProductMappingStatusFilterSchema,
-    StockSyncSimulationFilterSchema,
-    SyncExecutionLogsFilterSchema,
-    PriceComparisonFilterSchema,
-    FeeAndEscrowAnomaliesFilterSchema,
-    DeductionAndSettlementSummaryFilterSchema,
-    CashflowAndBalanceSummaryFilterSchema,
-    CompetitorInsightsFilterSchema,
-)
+from app.schemas.tools import TOOL_DOMAIN_MAP
 
 logger = logging.getLogger("django_client")
 
@@ -121,7 +86,7 @@ _SHARED_HTTPX_CLIENTS: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, htt
     weakref.WeakKeyDictionary()
 )
 
-_CACHED_SYSTEM_TOKEN: Optional[str] = None
+_CACHED_SYSTEM_TOKENS: Dict[Tuple[str, str], str] = {}
 _TOKEN_LOCK: Optional[asyncio.Lock] = None
 _TOKEN_LOCK_LOOP: Optional[asyncio.AbstractEventLoop] = None
 
@@ -134,18 +99,26 @@ def _get_token_lock() -> asyncio.Lock:
     except RuntimeError:
         running_loop = None
 
-    if _TOKEN_LOCK is None or (running_loop is not None and _TOKEN_LOCK_LOOP is not running_loop):
-        _TOKEN_LOCK = asyncio.Lock()
-        _TOKEN_LOCK_LOOP = running_loop
-    return _TOKEN_LOCK
+    with _SHARED_CLIENT_LOCK:
+        if _TOKEN_LOCK is None or (running_loop is not None and _TOKEN_LOCK_LOOP is not running_loop):
+            _TOKEN_LOCK = asyncio.Lock()
+            _TOKEN_LOCK_LOOP = running_loop
+        return _TOKEN_LOCK
 
 
-async def _invalidate_cached_system_token(expected_token: Optional[str]) -> None:
-    """Clear module-level cached system token only if it still matches expected_token."""
-    global _CACHED_SYSTEM_TOKEN
+async def _invalidate_cached_system_token(
+    expected_token: Optional[str],
+    cache_key: Optional[Tuple[str, str]] = None,
+) -> None:
+    """Clear module-level cached system token(s) matching expected_token."""
     async with _get_token_lock():
-        if _CACHED_SYSTEM_TOKEN == expected_token:
-            _CACHED_SYSTEM_TOKEN = None
+        if cache_key is not None:
+            if _CACHED_SYSTEM_TOKENS.get(cache_key) == expected_token:
+                _CACHED_SYSTEM_TOKENS.pop(cache_key, None)
+        else:
+            matching_keys = [k for k, v in _CACHED_SYSTEM_TOKENS.items() if v == expected_token]
+            for k in matching_keys:
+                _CACHED_SYSTEM_TOKENS.pop(k, None)
 
 
 def _get_shared_httpx_client(timeout: Optional[float] = None) -> Tuple[httpx.AsyncClient, bool]:
@@ -174,9 +147,8 @@ def _get_shared_httpx_client(timeout: Optional[float] = None) -> Tuple[httpx.Asy
 async def aclose_shared_django_client() -> None:
     """
     Close shared module-level httpx.AsyncClient pool(s) for the current event loop
-    and clear the cached system JWT token. Called during FastAPI lifespan shutdown.
+    and clear the cached system JWT tokens. Called during FastAPI lifespan shutdown.
     """
-    global _CACHED_SYSTEM_TOKEN
     try:
         running_loop = asyncio.get_running_loop()
     except RuntimeError:
@@ -199,7 +171,7 @@ async def aclose_shared_django_client() -> None:
         except Exception as exc:
             logger.warning("Error closing shared httpx.AsyncClient pool: %s", exc)
 
-    _CACHED_SYSTEM_TOKEN = None
+    _CACHED_SYSTEM_TOKENS.clear()
 
 
 class DjangoCoreClient:
@@ -222,15 +194,15 @@ class DjangoCoreClient:
     ):
         self.base_url = (base_url or settings.ERP_BASE_URL).rstrip("/")
         self._external_client = client is not None
-        explicit_token = (token or settings.ERP_API_TOKEN or "").strip() or None
-        if explicit_token is None and not self._external_client and _CACHED_SYSTEM_TOKEN:
-            explicit_token = _CACHED_SYSTEM_TOKEN
-        self.token = explicit_token
         self.username = (username or settings.ERP_USERNAME or "").strip() or None
         self.password = (password or settings.ERP_PASSWORD or "").strip() or None
+        explicit_token = (token or settings.ERP_API_TOKEN or "").strip() or None
+        if explicit_token is None and not self._external_client:
+            explicit_token = _CACHED_SYSTEM_TOKENS.get((self.base_url, self.username or ""))
+        self.token = explicit_token
         self.default_company_id = default_company_id or settings.DEFAULT_COMPANY_ID
         self.timeout = timeout if timeout is not None else settings.REQUEST_TIMEOUT_SEC
-        self.service_key = service_key or settings.ERP_API_TOKEN
+        self.service_key = service_key or settings.INTERNAL_SERVICE_KEY or settings.ERP_API_TOKEN
         self._shared_client_ref: Optional[httpx.AsyncClient] = None
         if client is not None:
             self.client = client
@@ -261,10 +233,19 @@ class DjangoCoreClient:
         if self.client is not None and not self.client.is_closed:
             await self.client.aclose()
 
+    def _token_cache_key(self) -> Tuple[str, str]:
+        """Return cache isolation key scoped by target ERP host and username."""
+        return (self.base_url, self.username or "")
+
     def _generate_secret_key(self) -> str:
         """Generate time-based MD5 secret key for /external_api/get_token/."""
+        secret = (settings.ERP_LOGIN_SECRET or "").strip()
+        if not secret:
+            raise DjangoAuthError(
+                "ERP_LOGIN_SECRET environment variable is required for ERP programmatic login."
+            )
         now = get_current_erp_datetime().strftime("%Y-%m-%d-%H:%M")
-        raw_string = f"erp_master_nexus-{now}"
+        raw_string = f"{secret}-{now}"
         return hashlib.md5(raw_string.encode()).hexdigest()
 
     async def _perform_login(self) -> str:
@@ -338,16 +319,17 @@ class DjangoCoreClient:
         Uses a lock-guarded module cache for managed internal clients so concurrent
         requests share one login call.
         """
-        global _CACHED_SYSTEM_TOKEN
         if self._external_client:
             return await self._perform_login()
 
+        cache_key = self._token_cache_key()
         async with _get_token_lock():
-            if _CACHED_SYSTEM_TOKEN:
-                self.token = _CACHED_SYSTEM_TOKEN
-                return _CACHED_SYSTEM_TOKEN
+            cached_token = _CACHED_SYSTEM_TOKENS.get(cache_key)
+            if cached_token:
+                self.token = cached_token
+                return cached_token
             token = await self._perform_login()
-            _CACHED_SYSTEM_TOKEN = token
+            _CACHED_SYSTEM_TOKENS[cache_key] = token
             return token
 
     async def _request(
@@ -421,7 +403,10 @@ class DjangoCoreClient:
             if not clean_user_token and not self.require_user_token and retries > 0:
                 logger.warning("System JWT token expired (401). Attempting re-login...")
                 if not self._external_client:
-                    await _invalidate_cached_system_token(active_token)
+                    await _invalidate_cached_system_token(
+                        active_token,
+                        cache_key=self._token_cache_key(),
+                    )
                 await self.login()
                 return await self._request(
                     method=method,
@@ -526,7 +511,11 @@ class DjangoCoreClient:
         Execute tool asynchronously via POST /ai/tools/<domain>/<tool_name>/
         """
         endpoint = f"/ai/tools/{domain}/{tool_name}/"
-        cleaned_params = _clean_params(params)
+        cleaned_params = (
+            params
+            if isinstance(params, dict) and all(v is not None for v in params.values())
+            else _clean_params(params)
+        )
         payload = {
             "company_id": company_id if company_id is not None else self.default_company_id,
             "params": cleaned_params,
@@ -538,507 +527,8 @@ class DjangoCoreClient:
         return await self._request("POST", endpoint, json=payload, user_token=user_token)
 
     # ==========================================================================
-    # Helper Methods for 4 Native FastPrint ERP Tools
+    # Special-Case Tool Wrappers (standard fetch_* wrappers auto-bound below)
     # ==========================================================================
-
-    async def fetch_account_balance(
-        self,
-        params: Union[AccountBalanceFilterSchema, Dict[str, Any]],
-        user_token: Optional[str] = None,
-        company_id: Optional[int] = None,
-    ) -> Dict[str, Any]:
-        """Call accounting.get_account_balance tool."""
-        return await self.execute_tool(
-            domain="accounting",
-            tool_name="get_account_balance",
-            params=_clean_params(params),
-            company_id=company_id,
-            user_token=user_token,
-        )
-
-    async def fetch_journal_entries(
-        self,
-        params: Union[JournalEntriesFilterSchema, Dict[str, Any]],
-        user_token: Optional[str] = None,
-        company_id: Optional[int] = None,
-    ) -> Dict[str, Any]:
-        """Call accounting.get_journal_entries tool."""
-        return await self.execute_tool(
-            domain="accounting",
-            tool_name="get_journal_entries",
-            params=_clean_params(params),
-            company_id=company_id,
-            user_token=user_token,
-        )
-
-    async def fetch_general_ledger(
-        self,
-        params: Union[GeneralLedgerFilterSchema, Dict[str, Any]],
-        user_token: Optional[str] = None,
-        company_id: Optional[int] = None,
-    ) -> Dict[str, Any]:
-        """Call accounting.get_general_ledger tool."""
-        return await self.execute_tool(
-            domain="accounting",
-            tool_name="get_general_ledger",
-            params=_clean_params(params),
-            company_id=company_id,
-            user_token=user_token,
-        )
-
-    async def fetch_profit_and_loss(
-        self,
-        params: Union[ProfitAndLossFilterSchema, Dict[str, Any]],
-        user_token: Optional[str] = None,
-        company_id: Optional[int] = None,
-    ) -> Dict[str, Any]:
-        """Call accounting.get_profit_and_loss tool."""
-        return await self.execute_tool(
-            domain="accounting",
-            tool_name="get_profit_and_loss",
-            params=_clean_params(params),
-            company_id=company_id,
-            user_token=user_token,
-        )
-
-    async def fetch_balance_sheet(
-        self,
-        params: Union[BalanceSheetFilterSchema, Dict[str, Any]],
-        user_token: Optional[str] = None,
-        company_id: Optional[int] = None,
-    ) -> Dict[str, Any]:
-        """Call accounting.get_balance_sheet tool."""
-        return await self.execute_tool(
-            domain="accounting",
-            tool_name="get_balance_sheet",
-            params=_clean_params(params),
-            company_id=company_id,
-            user_token=user_token,
-        )
-
-    async def fetch_vendor_bills(
-        self,
-        params: Union[VendorBillsFilterSchema, Dict[str, Any]],
-        user_token: Optional[str] = None,
-        company_id: Optional[int] = None,
-    ) -> Dict[str, Any]:
-        """Call accounting.get_vendor_bills tool."""
-        return await self.execute_tool(
-            domain="accounting",
-            tool_name="get_vendor_bills",
-            params=_clean_params(params),
-            company_id=company_id,
-            user_token=user_token,
-        )
-
-    async def fetch_bank_reconciliation_summary(
-        self,
-        params: Union[BankReconciliationFilterSchema, Dict[str, Any]],
-        user_token: Optional[str] = None,
-        company_id: Optional[int] = None,
-    ) -> Dict[str, Any]:
-        """Call accounting.get_bank_reconciliation_summary tool."""
-        return await self.execute_tool(
-            domain="accounting",
-            tool_name="get_bank_reconciliation_summary",
-            params=_clean_params(params),
-            company_id=company_id,
-            user_token=user_token,
-        )
-
-    async def fetch_stock_level(
-        self,
-        params: Union[StockLevelFilterSchema, Dict[str, Any]],
-        user_token: Optional[str] = None,
-        company_id: Optional[int] = None,
-    ) -> Dict[str, Any]:
-        """Call inventory.get_stock_level tool."""
-        return await self.execute_tool(
-            domain="inventory",
-            tool_name="get_stock_level",
-            params=_clean_params(params),
-            company_id=company_id,
-            user_token=user_token,
-        )
-
-    async def fetch_product_info(
-        self,
-        params: Union[ProductInfoFilterSchema, Dict[str, Any]],
-        user_token: Optional[str] = None,
-        company_id: Optional[int] = None,
-    ) -> Dict[str, Any]:
-        """Call inventory.get_product_info tool."""
-        return await self.execute_tool(
-            domain="inventory",
-            tool_name="get_product_info",
-            params=_clean_params(params),
-            company_id=company_id,
-            user_token=user_token,
-        )
-
-    async def fetch_locations(
-        self,
-        params: Optional[Union[LocationsFilterSchema, Dict[str, Any]]] = None,
-        user_token: Optional[str] = None,
-        company_id: Optional[int] = None,
-    ) -> Dict[str, Any]:
-        """Call inventory.get_locations tool."""
-        return await self.execute_tool(
-            domain="inventory",
-            tool_name="get_locations",
-            params=_clean_params(params),
-            company_id=company_id,
-            user_token=user_token,
-        )
-
-    async def fetch_stock_history(
-        self,
-        params: Optional[Union[StockHistoryFilterSchema, Dict[str, Any]]] = None,
-        user_token: Optional[str] = None,
-        company_id: Optional[int] = None,
-    ) -> Dict[str, Any]:
-        """Call inventory.get_stock_history tool (Phase 2)."""
-        return await self.execute_tool(
-            domain="inventory",
-            tool_name="get_stock_history",
-            params=_clean_params(params),
-            company_id=company_id,
-            user_token=user_token,
-        )
-
-    async def fetch_transfers(
-        self,
-        params: Optional[Union[TransfersFilterSchema, Dict[str, Any]]] = None,
-        user_token: Optional[str] = None,
-        company_id: Optional[int] = None,
-    ) -> Dict[str, Any]:
-        """Call inventory.get_transfers tool (Phase 2)."""
-        return await self.execute_tool(
-            domain="inventory",
-            tool_name="get_transfers",
-            params=_clean_params(params),
-            company_id=company_id,
-            user_token=user_token,
-        )
-
-    async def fetch_low_stock_alerts(
-        self,
-        params: Optional[Union[LowStockAlertsFilterSchema, Dict[str, Any]]] = None,
-        user_token: Optional[str] = None,
-        company_id: Optional[int] = None,
-    ) -> Dict[str, Any]:
-        """Call inventory.get_low_stock_alerts tool (Phase 3)."""
-        return await self.execute_tool(
-            domain="inventory",
-            tool_name="get_low_stock_alerts",
-            params=_clean_params(params),
-            company_id=company_id,
-            user_token=user_token,
-        )
-
-    async def fetch_stock_adjustments(
-        self,
-        params: Optional[Union[StockAdjustmentsFilterSchema, Dict[str, Any]]] = None,
-        user_token: Optional[str] = None,
-        company_id: Optional[int] = None,
-    ) -> Dict[str, Any]:
-        """Call inventory.get_stock_adjustments tool (Phase 3)."""
-        return await self.execute_tool(
-            domain="inventory",
-            tool_name="get_stock_adjustments",
-            params=_clean_params(params),
-            company_id=company_id,
-            user_token=user_token,
-        )
-
-    async def fetch_scrap_records(
-        self,
-        params: Optional[Union[ScrapRecordsFilterSchema, Dict[str, Any]]] = None,
-        user_token: Optional[str] = None,
-        company_id: Optional[int] = None,
-    ) -> Dict[str, Any]:
-        """Call inventory.get_scrap_records tool (Phase 3)."""
-        return await self.execute_tool(
-            domain="inventory",
-            tool_name="get_scrap_records",
-            params=_clean_params(params),
-            company_id=company_id,
-            user_token=user_token,
-        )
-
-    async def fetch_warehouses(
-        self,
-        params: Optional[Union[WarehousesFilterSchema, Dict[str, Any]]] = None,
-        user_token: Optional[str] = None,
-        company_id: Optional[int] = None,
-    ) -> Dict[str, Any]:
-        """Call inventory.get_warehouses tool (Phase 3)."""
-        return await self.execute_tool(
-            domain="inventory",
-            tool_name="get_warehouses",
-            params=_clean_params(params),
-            company_id=company_id,
-            user_token=user_token,
-        )
-
-    async def fetch_product_categories(
-        self,
-        params: Optional[Union[ProductCategoriesFilterSchema, Dict[str, Any]]] = None,
-        user_token: Optional[str] = None,
-        company_id: Optional[int] = None,
-    ) -> Dict[str, Any]:
-        """Call inventory.get_product_categories tool (Phase 3)."""
-        return await self.execute_tool(
-            domain="inventory",
-            tool_name="get_product_categories",
-            params=_clean_params(params),
-            company_id=company_id,
-            user_token=user_token,
-        )
-
-    async def fetch_top_selling_products(
-        self,
-        params: Optional[Union[TopSellingProductsFilterSchema, Dict[str, Any]]] = None,
-        user_token: Optional[str] = None,
-        company_id: Optional[int] = None,
-    ) -> Dict[str, Any]:
-        """Call sales.get_top_selling_products tool."""
-        return await self.execute_tool(
-            domain="sales",
-            tool_name="get_top_selling_products",
-            params=_clean_params(params),
-            company_id=company_id,
-            user_token=user_token,
-        )
-
-    async def fetch_sales_orders(
-        self,
-        params: Optional[Union[SalesOrdersFilterSchema, Dict[str, Any]]] = None,
-        user_token: Optional[str] = None,
-        company_id: Optional[int] = None,
-    ) -> Dict[str, Any]:
-        """Call sales.get_sales_orders tool."""
-        return await self.execute_tool(
-            domain="sales",
-            tool_name="get_sales_orders",
-            params=_clean_params(params),
-            company_id=company_id,
-            user_token=user_token,
-        )
-
-    async def fetch_sales_order_detail(
-        self,
-        params: Optional[Union[SalesOrderDetailFilterSchema, Dict[str, Any]]] = None,
-        user_token: Optional[str] = None,
-        company_id: Optional[int] = None,
-    ) -> Dict[str, Any]:
-        """Call sales.get_sales_order_detail tool."""
-        return await self.execute_tool(
-            domain="sales",
-            tool_name="get_sales_order_detail",
-            params=_clean_params(params),
-            company_id=company_id,
-            user_token=user_token,
-        )
-
-    async def fetch_sales_summary(
-        self,
-        params: Optional[Union[SalesSummaryFilterSchema, Dict[str, Any]]] = None,
-        user_token: Optional[str] = None,
-        company_id: Optional[int] = None,
-    ) -> Dict[str, Any]:
-        """Call sales.get_sales_summary tool."""
-        return await self.execute_tool(
-            domain="sales",
-            tool_name="get_sales_summary",
-            params=_clean_params(params),
-            company_id=company_id,
-            user_token=user_token,
-        )
-
-    async def fetch_contacts(
-        self,
-        params: Optional[Union[ContactsFilterSchema, Dict[str, Any]]] = None,
-        user_token: Optional[str] = None,
-        company_id: Optional[int] = None,
-    ) -> Dict[str, Any]:
-        """Call sales.get_contacts tool."""
-        return await self.execute_tool(
-            domain="sales",
-            tool_name="get_contacts",
-            params=_clean_params(params),
-            company_id=company_id,
-            user_token=user_token,
-        )
-
-    # ==========================================================================
-    # Marketplace Domain Helper Methods (11 Read-Only Tools)
-    # ==========================================================================
-
-    async def fetch_account_health(
-        self,
-        params: Optional[Union[AccountHealthFilterSchema, Dict[str, Any]]] = None,
-        user_token: Optional[str] = None,
-        company_id: Optional[int] = None,
-    ) -> Dict[str, Any]:
-        """Call marketplace.get_account_health tool."""
-        return await self.execute_tool(
-            domain="marketplace",
-            tool_name="get_account_health",
-            params=_clean_params(params),
-            company_id=company_id,
-            user_token=user_token,
-        )
-
-    async def fetch_marketplace_orders(
-        self,
-        params: Optional[Union[MarketplaceOrdersFilterSchema, Dict[str, Any]]] = None,
-        user_token: Optional[str] = None,
-        company_id: Optional[int] = None,
-    ) -> Dict[str, Any]:
-        """Call marketplace.get_marketplace_orders tool."""
-        return await self.execute_tool(
-            domain="marketplace",
-            tool_name="get_marketplace_orders",
-            params=_clean_params(params),
-            company_id=company_id,
-            user_token=user_token,
-        )
-
-    async def fetch_kilat_order_diagnostics(
-        self,
-        params: Optional[Union[KilatOrderDiagnosticsFilterSchema, Dict[str, Any]]] = None,
-        user_token: Optional[str] = None,
-        company_id: Optional[int] = None,
-    ) -> Dict[str, Any]:
-        """Call marketplace.get_kilat_order_diagnostics tool."""
-        return await self.execute_tool(
-            domain="marketplace",
-            tool_name="get_kilat_order_diagnostics",
-            params=_clean_params(params),
-            company_id=company_id,
-            user_token=user_token,
-        )
-
-    async def fetch_product_mapping_status(
-        self,
-        params: Optional[Union[ProductMappingStatusFilterSchema, Dict[str, Any]]] = None,
-        user_token: Optional[str] = None,
-        company_id: Optional[int] = None,
-    ) -> Dict[str, Any]:
-        """Call marketplace.get_product_mapping_status tool."""
-        return await self.execute_tool(
-            domain="marketplace",
-            tool_name="get_product_mapping_status",
-            params=_clean_params(params),
-            company_id=company_id,
-            user_token=user_token,
-        )
-
-    async def fetch_stock_sync_simulation(
-        self,
-        params: Optional[Union[StockSyncSimulationFilterSchema, Dict[str, Any]]] = None,
-        user_token: Optional[str] = None,
-        company_id: Optional[int] = None,
-    ) -> Dict[str, Any]:
-        """Call marketplace.get_stock_sync_simulation tool."""
-        return await self.execute_tool(
-            domain="marketplace",
-            tool_name="get_stock_sync_simulation",
-            params=_clean_params(params),
-            company_id=company_id,
-            user_token=user_token,
-        )
-
-    async def fetch_sync_execution_logs(
-        self,
-        params: Optional[Union[SyncExecutionLogsFilterSchema, Dict[str, Any]]] = None,
-        user_token: Optional[str] = None,
-        company_id: Optional[int] = None,
-    ) -> Dict[str, Any]:
-        """Call marketplace.get_sync_execution_logs tool."""
-        return await self.execute_tool(
-            domain="marketplace",
-            tool_name="get_sync_execution_logs",
-            params=_clean_params(params),
-            company_id=company_id,
-            user_token=user_token,
-        )
-
-    async def fetch_price_comparison(
-        self,
-        params: Optional[Union[PriceComparisonFilterSchema, Dict[str, Any]]] = None,
-        user_token: Optional[str] = None,
-        company_id: Optional[int] = None,
-    ) -> Dict[str, Any]:
-        """Call marketplace.get_price_comparison tool."""
-        return await self.execute_tool(
-            domain="marketplace",
-            tool_name="get_price_comparison",
-            params=_clean_params(params),
-            company_id=company_id,
-            user_token=user_token,
-        )
-
-    async def fetch_fee_and_escrow_anomalies(
-        self,
-        params: Optional[Union[FeeAndEscrowAnomaliesFilterSchema, Dict[str, Any]]] = None,
-        user_token: Optional[str] = None,
-        company_id: Optional[int] = None,
-    ) -> Dict[str, Any]:
-        """Call marketplace.get_fee_and_escrow_anomalies tool."""
-        return await self.execute_tool(
-            domain="marketplace",
-            tool_name="get_fee_and_escrow_anomalies",
-            params=_clean_params(params),
-            company_id=company_id,
-            user_token=user_token,
-        )
-
-    async def fetch_deduction_and_settlement_summary(
-        self,
-        params: Optional[Union[DeductionAndSettlementSummaryFilterSchema, Dict[str, Any]]] = None,
-        user_token: Optional[str] = None,
-        company_id: Optional[int] = None,
-    ) -> Dict[str, Any]:
-        """Call marketplace.get_deduction_and_settlement_summary tool."""
-        return await self.execute_tool(
-            domain="marketplace",
-            tool_name="get_deduction_and_settlement_summary",
-            params=_clean_params(params),
-            company_id=company_id,
-            user_token=user_token,
-        )
-
-    async def fetch_cashflow_and_balance_summary(
-        self,
-        params: Optional[Union[CashflowAndBalanceSummaryFilterSchema, Dict[str, Any]]] = None,
-        user_token: Optional[str] = None,
-        company_id: Optional[int] = None,
-    ) -> Dict[str, Any]:
-        """Call marketplace.get_cashflow_and_balance_summary tool."""
-        return await self.execute_tool(
-            domain="marketplace",
-            tool_name="get_cashflow_and_balance_summary",
-            params=_clean_params(params),
-            company_id=company_id,
-            user_token=user_token,
-        )
-
-    async def fetch_competitor_insights(
-        self,
-        params: Optional[Union[CompetitorInsightsFilterSchema, Dict[str, Any]]] = None,
-        user_token: Optional[str] = None,
-        company_id: Optional[int] = None,
-    ) -> Dict[str, Any]:
-        """Call marketplace.get_competitor_insights tool."""
-        return await self.execute_tool(
-            domain="marketplace",
-            tool_name="get_competitor_insights",
-            params=_clean_params(params),
-            company_id=company_id,
-            user_token=user_token,
-        )
 
     async def fetch_knowledge(
         self,
@@ -1074,6 +564,38 @@ class DjangoCoreClient:
             user_token=user_token,
             company_id=company_id,
         )
+
+
+def _make_tool_fetcher(domain: str, tool_name: str) -> Callable[..., Any]:
+    """Generate a typed async fetch_<tool> method backed directly by execute_tool."""
+    method_name = f"fetch_{tool_name[4:]}" if tool_name.startswith("get_") else tool_name
+
+    async def _fetcher(
+        self: DjangoCoreClient,
+        params: Optional[Any] = None,
+        user_token: Optional[str] = None,
+        company_id: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        return await self.execute_tool(
+            domain=domain,
+            tool_name=tool_name,
+            params=_clean_params(params),
+            company_id=company_id,
+            user_token=user_token,
+        )
+
+    _fetcher.__name__ = method_name
+    _fetcher.__qualname__ = f"DjangoCoreClient.{method_name}"
+    _fetcher.__doc__ = f"Call {domain}.{tool_name} tool via execute_tool."
+    return _fetcher
+
+
+# Declaratively bind fetch_<name> helpers for every get_* tool in TOOL_DOMAIN_MAP
+for _tool_name, _domain in TOOL_DOMAIN_MAP.items():
+    if _tool_name.startswith("get_"):
+        _method_name = f"fetch_{_tool_name[4:]}"
+        if not hasattr(DjangoCoreClient, _method_name):
+            setattr(DjangoCoreClient, _method_name, _make_tool_fetcher(_domain, _tool_name))
 
 
 # Class alias for seamless naming compatibility

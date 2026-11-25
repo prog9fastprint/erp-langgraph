@@ -11,6 +11,7 @@ import uuid
 from typing import Any, Dict, Optional
 
 from app.core.config import settings
+from app.core.context import resolve_tool_record_count
 from app.graph.workflow import run_workflow_sync, undo_workflow_thread
 from app.services.llm import clean_model_display_name, get_default_model_name
 
@@ -106,11 +107,7 @@ class LiveStepSpinner:
                 icon = "\033[31m✖\033[0m"
                 detail = f": {str(err)[:40]}..."
             elif tr:
-                count = (
-                    tr.get("total_count", len(tr.get("entries", [])))
-                    if isinstance(tr, dict)
-                    else (len(tr) if isinstance(tr, list) else 1)
-                )
+                count = resolve_tool_record_count(tr)
                 detail = f": {count} data ditemukan"
             else:
                 detail = " (eksekusi selesai)"
@@ -155,8 +152,8 @@ def main():
     print("=" * 68)
 
     provider = settings.MODEL_PROVIDER
-    model_name = settings.OPENROUTER_MODEL if provider == "openrouter" else settings.OPENAI_MODEL
-    print(f"• Pipeline     : StateGraph 5-Node (Router -> Extractor -> Tool -> Verifier -> Synthesizer)")
+    model_name = get_default_model_name()
+    print("• Pipeline     : StateGraph 5-Node (Router -> Extractor -> Tool -> Verifier -> Synthesizer)")
     print(f"• LLM Provider : {provider.upper()} ({model_name})")
     print(f"• ERP Base URL : {settings.ERP_BASE_URL}")
     print(f"• Default Co.  : ID {settings.DEFAULT_COMPANY_ID}")
@@ -172,6 +169,7 @@ def main():
     current_token: Optional[str] = settings.ERP_API_TOKEN
     session_id = f"cli_{uuid.uuid4().hex[:8]}"
     verbose = False
+    company_explicit_pending = False
 
     while True:
         try:
@@ -208,6 +206,7 @@ def main():
                 parts = user_input.split()
                 if len(parts) >= 2 and parts[1].isdigit():
                     current_company_id = int(parts[1])
+                    company_explicit_pending = True
                     print(f"\n🏢 Active Company ID diubah ke: {current_company_id}")
                 else:
                     print("\n⚠️ Format tidak valid. Gunakan: co <id> (contoh: co 2)")
@@ -236,7 +235,9 @@ def main():
                 company_id=current_company_id,
                 thread_id=session_id,
                 on_node_finish=on_finish,
+                company_id_explicit=company_explicit_pending,
             )
+            company_explicit_pending = False
 
             total_elapsed = spinner.stop()
             if spinner.is_tty:
@@ -269,13 +270,7 @@ def main():
                 print(f"• Status Verif  : {status} (Retries: {retries})")
                 if final_state.get("tool_result"):
                     tr = final_state["tool_result"]
-                    records = (
-                        tr.get("total_count", len(tr.get("entries", [])))
-                        if isinstance(tr, dict)
-                        else len(tr)
-                        if isinstance(tr, list)
-                        else 1
-                    )
+                    records = resolve_tool_record_count(tr)
                     print(f"• Jumlah Data   : {records}")
                 print("----------------------------------------------\n")
             else:

@@ -5,13 +5,12 @@ verifier record counting, and markdown synthesizer formatting.
 """
 import unittest
 from datetime import date
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 from pydantic import ValidationError
 
 from app.schemas.tools import (
     StockLevelFilterSchema,
     ProductInfoFilterSchema,
-    LocationsFilterSchema,
     StockHistoryFilterSchema,
     TransfersFilterSchema,
     LowStockAlertsFilterSchema,
@@ -20,16 +19,8 @@ from app.schemas.tools import (
     WarehousesFilterSchema,
     ProductCategoriesFilterSchema,
     # Response envelopes & data schemas
-    StockLevelResponseSchema,
-    ProductInfoResponseSchema,
-    LocationsResponseSchema,
     StockHistoryResponseSchema,
     TransfersResponseSchema,
-    LowStockAlertsResponseSchema,
-    StockAdjustmentsResponseSchema,
-    ScrapRecordsResponseSchema,
-    WarehousesResponseSchema,
-    ProductCategoriesResponseSchema,
     TOOL_DOMAIN_MAP,
 )
 from app.graph.nodes.router import router_node
@@ -39,11 +30,10 @@ from app.graph.nodes.extractor import (
     _fallback_extract_transfers,
     _fallback_extract_low_stock_alerts,
     _fallback_extract_stock_adjustments,
-    _fallback_extract_scrap_records,
     _fallback_extract_warehouses,
     _fallback_extract_product_categories,
 )
-from app.graph.nodes.verifier import _calculate_records_count, verifier_node
+from app.graph.nodes.verifier import _calculate_records_count
 from app.graph.nodes.synthesizer import (
     _build_table_query_meta,
     _format_multi_company_presentation,

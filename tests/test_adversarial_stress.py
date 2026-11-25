@@ -7,7 +7,6 @@ Stress-tests:
 4. run_workflow_sync in workflow.py: ThreadPoolExecutor reuse, no thread explosion, post-shutdown recovery.
 """
 import asyncio
-import concurrent.futures
 from enum import Enum
 import threading
 import time
@@ -16,7 +15,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 from fastapi import HTTPException
-from pydantic import ValidationError
 
 from app.core.config import settings
 from app.graph.nodes.rag_node import rag_node
@@ -28,13 +26,11 @@ from app.graph.workflow import (
     shutdown_workflow_executor,
 )
 import app.graph.workflow as workflow_module
-from app.main import app, ChatRequest, ChatResponse
+from app.main import app
 from app.services.django_client import DjangoCoreClient, DjangoCoreClientError
 from app.services.llm import (
     afetch_free_models_catalog,
     fetch_free_models_catalog,
-    _sync_fetch_free_models_catalog,
-    DEFAULT_CURATED_FREE_MODELS,
 )
 import app.services.llm as llm_module
 

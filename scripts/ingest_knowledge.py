@@ -10,42 +10,16 @@ import glob
 import json
 import logging
 import os
-import re
 import sys
-from typing import Any, Dict, List, Optional
+from typing import List
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from app.core.config import settings
+from app.services.vector_service import VectorService
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("ingest_knowledge")
-
-
-CREATE_TABLE_SQL = """
-CREATE EXTENSION IF NOT EXISTS vector;
-
-CREATE TABLE IF NOT EXISTS ai_knowledge_chunks (
-    id BIGSERIAL PRIMARY KEY,
-    title VARCHAR(255) NOT NULL,
-    category VARCHAR(50) NOT NULL DEFAULT 'sop',
-    content TEXT NOT NULL,
-    metadata JSONB DEFAULT '{}'::jsonb,
-    embedding vector(768) NOT NULL,
-    company_id INT NOT NULL DEFAULT 1,
-    is_active BOOLEAN NOT NULL DEFAULT TRUE,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE INDEX IF NOT EXISTS idx_ai_knowledge_hnsw 
-ON ai_knowledge_chunks 
-USING hnsw (embedding vector_cosine_ops)
-WITH (m = 16, ef_construction = 64);
-
-CREATE INDEX IF NOT EXISTS idx_ai_knowledge_company_cat 
-ON ai_knowledge_chunks (company_id, category, is_active);
-"""
 
 
 def split_text_into_chunks(text: str, max_chunk_words: int = 250, overlap_words: int = 40) -> List[str]:
@@ -75,15 +49,15 @@ def split_text_into_chunks(text: str, max_chunk_words: int = 250, overlap_words:
 
 async def init_vector_database(db_url: str):
     """Ensure vector extension and schema exist on dedicated PostgreSQL."""
-    import asyncpg
-    clean_url = db_url.replace("postgresql+asyncpg://", "postgresql://")
-    conn = await asyncpg.connect(clean_url)
+    logger.info("Initializing dedicated PGVector table and indexes...")
+    vec = VectorService(db_url=db_url)
     try:
-        logger.info("Initializing dedicated PGVector table and indexes...")
-        await conn.execute(CREATE_TABLE_SQL)
+        ok = await vec.initialize_table()
+        if not ok:
+            raise RuntimeError("Failed to initialize ai_knowledge_chunks table via VectorService.")
         logger.info("Table ai_knowledge_chunks ready.")
     finally:
-        await conn.close()
+        await vec.close_pool()
 
 
 async def ingest_document(
@@ -93,10 +67,11 @@ async def ingest_document(
     company_id: int = 1,
     category: str = "sop",
 ):
-    """Process a single file and store its chunks and Gemini embeddings into dedicated DB."""
+    """Process a single file, generate embeddings upfront, and replace chunks transactionally."""
     import asyncpg
     from pgvector.asyncpg import register_vector
     from google import genai
+    from google.genai import types
 
     if not os.path.exists(file_path):
         logger.error(f"File not found: {file_path}")
@@ -110,53 +85,47 @@ async def ingest_document(
     logger.info(f"Ingesting '{file_title}': {len(chunks)} chunks found.")
 
     genai_client = genai.Client(api_key=gemini_api_key)
+    embed_config = types.EmbedContentConfig(output_dimensionality=768)
+    source_filename = os.path.basename(file_path)
+
+    # Compute all embeddings before opening/modifying DB so failures cannot wipe existing chunks.
+    prepared_rows = []
+    for idx, chunk_text in enumerate(chunks, 1):
+        logger.info(f"Generating Gemini embedding for chunk {idx}/{len(chunks)}...")
+        res = genai_client.models.embed_content(
+            model=settings.GEMINI_EMBEDDING_MODEL,
+            contents=chunk_text,
+            config=embed_config,
+        )
+        vector_arr = [float(v) for v in res.embeddings[0].values]
+        meta = {
+            "source_file": source_filename,
+            "chunk_index": idx,
+            "total_chunks": len(chunks),
+        }
+        prepared_rows.append((f"{file_title} (Part {idx})", category, chunk_text, json.dumps(meta), vector_arr, int(company_id)))
+
     clean_url = db_url.replace("postgresql+asyncpg://", "postgresql://")
     conn = await asyncpg.connect(clean_url)
-
     try:
         await register_vector(conn)
-        from google.genai import types
-        embed_config = types.EmbedContentConfig(output_dimensionality=768)
-
-        source_filename = os.path.basename(file_path)
-        await conn.execute(
-            """
-            DELETE FROM ai_knowledge_chunks 
-            WHERE company_id = $1 AND metadata->>'source_file' = $2
-            """,
-            int(company_id),
-            source_filename,
-        )
-
-        for idx, chunk_text in enumerate(chunks, 1):
-            logger.info(f"Generating Gemini embedding for chunk {idx}/{len(chunks)}...")
-            res = genai_client.models.embed_content(
-                model=settings.GEMINI_EMBEDDING_MODEL,
-                contents=chunk_text,
-                config=embed_config,
-            )
-            vector_values = res.embeddings[0].values
-            vector_arr = [float(v) for v in vector_values]
-
-            meta = {
-                "source_file": source_filename,
-                "chunk_index": idx,
-                "total_chunks": len(chunks),
-            }
-
+        async with conn.transaction():
             await conn.execute(
                 """
-                INSERT INTO ai_knowledge_chunks (title, category, content, metadata, embedding, company_id)
-                VALUES ($1, $2, $3, $4::jsonb, $5, $6)
+                DELETE FROM ai_knowledge_chunks
+                WHERE company_id = $1 AND metadata->>'source_file' = $2
                 """,
-                f"{file_title} (Part {idx})",
-                category,
-                chunk_text,
-                json.dumps(meta),
-                vector_arr,
                 int(company_id),
+                source_filename,
             )
-
+            for row in prepared_rows:
+                await conn.execute(
+                    """
+                    INSERT INTO ai_knowledge_chunks (title, category, content, metadata, embedding, company_id)
+                    VALUES ($1, $2, $3, $4::jsonb, $5, $6)
+                    """,
+                    *row,
+                )
         logger.info(f"Successfully ingested {len(chunks)} chunks for '{file_title}'.")
     finally:
         await conn.close()

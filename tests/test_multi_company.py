@@ -16,9 +16,8 @@ from app.graph.nodes.tool_node import tool_node
 from app.graph.nodes.verifier import verifier_node
 from app.graph.nodes.synthesizer import (
     format_deterministic_answer,
-    _format_multi_company_presentation,
 )
-from app.schemas.chat import ChatRequest, ChatResponse
+from app.schemas.chat import ChatRequest
 from app.main import app
 from fastapi.testclient import TestClient
 

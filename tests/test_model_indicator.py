@@ -2,10 +2,9 @@
 Unit tests for active AI model tracking, display name cleaning,
 and API response serialization in FastPrint ERP AI Orchestrator.
 """
-import json
 import time
 import unittest
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 from app.core.config import settings
 from app.graph.state import create_initial_state

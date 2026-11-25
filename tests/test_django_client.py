@@ -7,6 +7,7 @@ import unittest
 from unittest.mock import AsyncMock, patch, MagicMock
 import httpx
 
+from app.core.config import settings
 from app.services.django_client import (
     DjangoCoreClient,
     AsyncERPClient,
@@ -113,7 +114,8 @@ class TestDjangoCoreClientTokenAndHeaders(unittest.IsolatedAsyncioTestCase):
             client=mock_async_client,
         )
 
-        res = await client.execute_tool(domain="inventory", tool_name="get_stock_level")
+        with patch.object(settings, "ERP_LOGIN_SECRET", "test-login-secret"):
+            res = await client.execute_tool(domain="inventory", tool_name="get_stock_level")
         self.assertEqual(res, {"logged_in": True})
         self.assertEqual(client.token, "newly-acquired-jwt")
         headers = mock_async_client.request.call_args.kwargs["headers"]
@@ -141,7 +143,8 @@ class TestDjangoCoreClientTokenAndHeaders(unittest.IsolatedAsyncioTestCase):
             client=mock_async_client,
         )
 
-        token = await client.login()
+        with patch.object(settings, "ERP_LOGIN_SECRET", "test-login-secret"):
+            token = await client.login()
         self.assertEqual(token, "token-after-retry")
         self.assertEqual(mock_async_client.post.call_count, 2)
 
@@ -164,7 +167,8 @@ class TestDjangoCoreClientTokenAndHeaders(unittest.IsolatedAsyncioTestCase):
             client=mock_async_client,
         )
 
-        with self.assertRaises(DjangoCoreClientError) as ctx:
+        with patch.object(settings, "ERP_LOGIN_SECRET", "test-login-secret"), \
+             self.assertRaises(DjangoCoreClientError) as ctx:
             await client.login()
         self.assertIn("ConnectionError at /external_api/get_token/", str(ctx.exception))
         self.assertNotIn("<!DOCTYPE html>", str(ctx.exception))

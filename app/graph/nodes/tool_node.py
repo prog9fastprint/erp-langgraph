@@ -9,11 +9,13 @@ import logging
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
+from app.core.branches import COMPANY_NAME_MAP, LOCATION_STOP_WORDS, resolve_branch_company_id
 from app.core.config import settings
 from app.core.context import (
     clean_product_identifier,
     compute_multi_tool_counts,
     get_multi_tool_key,
+    resolve_tool_record_count,
     sanitize_erp_payload,
     should_preserve_plan_on_retry,
 )
@@ -22,12 +24,26 @@ from app.schemas.tools import TOOL_DOMAIN_MAP
 from app.services.django_client import (
     DjangoCoreClient,
     DjangoCoreClientError,
-    DjangoPermissionError,
 )
 
 logger = logging.getLogger("tool_node")
 
 MAX_PRICE_COMPARISON_ACCOUNTS = 5
+
+# Single source of truth mapping canonical tool names to DjangoCoreClient fetch_* method names
+_TOOL_FETCH_METHOD_MAP: Dict[str, str] = {
+    tool_name: (f"fetch_{tool_name[4:]}" if tool_name.startswith("get_") else tool_name)
+    for tool_name in TOOL_DOMAIN_MAP
+}
+
+
+def _build_dispatch_map(erp_client: DjangoCoreClient) -> Dict[str, Any]:
+    """Bind canonical ERP tools to their DjangoCoreClient coroutine handlers."""
+    return {
+        tool_name: getattr(erp_client, method_name)
+        for tool_name, method_name in _TOOL_FETCH_METHOD_MAP.items()
+        if hasattr(erp_client, method_name)
+    }
 
 
 def _is_permission_error(err: Optional[str]) -> bool:
@@ -121,8 +137,6 @@ async def _resolve_and_execute_price_comparison(
     # Fallback: if active single branch has no MarketplaceAccount/AccountOrder configured
     # and user did not explicitly pin a branch in query, scan authorized branches safely.
     if not matched and not clean_params.get("company_ids"):
-        from app.graph.nodes.extractor import COMPANY_NAME_MAP, resolve_branch_company_id
-
         if not (user_query and resolve_branch_company_id(user_query) is not None):
             other_cids = [cid for cid in COMPANY_NAME_MAP.keys() if cid != target_company_id]
             sem = asyncio.Semaphore(getattr(settings, "ERP_MULTI_COMPANY_CONCURRENCY", 5))
@@ -307,7 +321,6 @@ async def _execute_single_tool(
         ]
 
     # Pre-lookup for stock location_name -> location_id or warehouse_id
-    from app.graph.nodes.extractor import LOCATION_STOP_WORDS
     loc_cand = str(clean_params.get("location_name") or "").strip().lower()
     if loc_cand in LOCATION_STOP_WORDS:
         clean_params.pop("location_name", None)
@@ -354,8 +367,6 @@ async def _execute_single_tool(
         has_location_name = bool(clean_params.get("location_name"))
 
         if not has_product_identifier and not has_resolved_location:
-            from app.graph.nodes.extractor import resolve_branch_company_id
-
             has_explicit_branch = bool(
                 user_query and resolve_branch_company_id(user_query) is not None
             )
@@ -478,6 +489,7 @@ async def _execute_single_tool(
         return None, f"Unexpected execution error: {str(exc)}"
 
     if isinstance(raw_result, dict) and raw_result:
+        raw_result = dict(raw_result)
         loc_label = clean_params.get("matched_location_name") or clean_params.get("location_name")
         if loc_label and not raw_result.get("location_name"):
             raw_result["location_name"] = loc_label
@@ -487,7 +499,6 @@ async def _execute_single_tool(
                 if raw_result.get("company_id") is None:
                     raw_result["company_id"] = cid_int
                 if not raw_result.get("company_name"):
-                    from app.graph.nodes.extractor import COMPANY_NAME_MAP
                     mapped_name = COMPANY_NAME_MAP.get(cid_int)
                     if mapped_name:
                         raw_result["company_name"] = mapped_name
@@ -580,8 +591,7 @@ async def _execute_tool_multi_company(
                     allow_empty_stock_params=True,
                 )
                 if err:
-                    err_lower = str(err).lower()
-                    if any(k in err_lower for k in ("403", "tidak memiliki akses", "akses ditolak", "permission", "unauthorized")):
+                    if _is_permission_error(str(err)):
                         unauthorized_companies.append(cid)
                         multi_company_results[cid] = None
                     else:
@@ -591,8 +601,7 @@ async def _execute_tool_multi_company(
                     multi_company_results[cid] = res
             except Exception as exc:
                 exc_str = str(exc)
-                exc_lower = exc_str.lower()
-                if any(k in exc_lower for k in ("403", "tidak memiliki akses", "akses ditolak", "permission", "unauthorized")):
+                if _is_permission_error(exc_str):
                     unauthorized_companies.append(cid)
                 else:
                     errors.append(f"Company {cid}: {exc_str}")
@@ -605,7 +614,7 @@ async def _execute_tool_multi_company(
     has_success = len(valid_companies) > 0
     all_failed = not has_success and len(target_company_ids) > 0
     v_status = "VALID" if has_success else ("ERROR" if errors else "EMPTY")
-    err_msg = "; ".join(errors) if (all_failed and errors) else (errors[0] if (all_failed and errors) else None)
+    err_msg = "; ".join(errors) if (all_failed and errors) else None
 
     return {
         "company_id": default_company_id or target_company_ids[0],
@@ -638,43 +647,8 @@ async def tool_node(
     erp_client = client or DjangoCoreClient(require_user_token=settings.REQUIRE_USER_TOKEN)
 
     try:
-        # Dynamic Tool Dispatch Registry
-        dispatch_map = {
-            "fetch_vendor_invoices": erp_client.fetch_vendor_invoices,
-            "get_journal_entries": erp_client.fetch_journal_entries,
-            "get_account_balance": erp_client.fetch_account_balance,
-            "get_general_ledger": erp_client.fetch_general_ledger,
-            "get_profit_and_loss": erp_client.fetch_profit_and_loss,
-            "get_balance_sheet": erp_client.fetch_balance_sheet,
-            "get_vendor_bills": erp_client.fetch_vendor_bills,
-            "get_bank_reconciliation_summary": erp_client.fetch_bank_reconciliation_summary,
-            "get_stock_level": erp_client.fetch_stock_level,
-            "get_product_info": erp_client.fetch_product_info,
-            "get_locations": erp_client.fetch_locations,
-            "get_stock_history": erp_client.fetch_stock_history,
-            "get_transfers": erp_client.fetch_transfers,
-            "get_low_stock_alerts": erp_client.fetch_low_stock_alerts,
-            "get_stock_adjustments": erp_client.fetch_stock_adjustments,
-            "get_scrap_records": erp_client.fetch_scrap_records,
-            "get_warehouses": erp_client.fetch_warehouses,
-            "get_product_categories": erp_client.fetch_product_categories,
-            "get_top_selling_products": erp_client.fetch_top_selling_products,
-            "get_sales_orders": erp_client.fetch_sales_orders,
-            "get_sales_order_detail": erp_client.fetch_sales_order_detail,
-            "get_sales_summary": erp_client.fetch_sales_summary,
-            "get_contacts": erp_client.fetch_contacts,
-            "get_account_health": erp_client.fetch_account_health,
-            "get_marketplace_orders": erp_client.fetch_marketplace_orders,
-            "get_kilat_order_diagnostics": erp_client.fetch_kilat_order_diagnostics,
-            "get_product_mapping_status": erp_client.fetch_product_mapping_status,
-            "get_stock_sync_simulation": erp_client.fetch_stock_sync_simulation,
-            "get_sync_execution_logs": erp_client.fetch_sync_execution_logs,
-            "get_price_comparison": erp_client.fetch_price_comparison,
-            "get_fee_and_escrow_anomalies": erp_client.fetch_fee_and_escrow_anomalies,
-            "get_deduction_and_settlement_summary": erp_client.fetch_deduction_and_settlement_summary,
-            "get_cashflow_and_balance_summary": erp_client.fetch_cashflow_and_balance_summary,
-            "get_competitor_insights": erp_client.fetch_competitor_insights,
-        }
+        # Dynamic Tool Dispatch Registry (derived from TOOL_DOMAIN_MAP)
+        dispatch_map = _build_dispatch_map(erp_client)
 
         active_tools = state.get("active_tools")
         is_multi_tool = state.get("is_multi_tool") or (bool(active_tools) and len(active_tools) > 1)
@@ -898,8 +872,6 @@ async def tool_node(
         user_q_str = str(state.get("user_query") or "")
         user_q_low = user_q_str.lower()
         hq_pinned = bool(re.search(r"\b(?:kantor\s+pusat|head\s*office|hq|pusat)\b", user_q_low))
-        from app.graph.nodes.verifier import _calculate_records_count
-        from app.graph.nodes.extractor import COMPANY_NAME_MAP, resolve_branch_company_id
 
         if (
             TOOL_DOMAIN_MAP.get(detected_tool) == "sales"
@@ -907,7 +879,7 @@ async def tool_node(
             and int(target_company_id or 0) in (1, 3)
             and not hq_pinned
             and resolve_branch_company_id(user_q_str) is None
-            and _calculate_records_count(final_tool_result) == 0
+            and resolve_tool_record_count(final_tool_result) == 0
         ):
             raw_auth = state.get("authorized_company_ids") or []
             probe_cids = [int(c) for c in raw_auth if c and int(c) not in (1, 3)]
@@ -992,7 +964,7 @@ def tool_node_sync(
     if loop and loop.is_running():
         # Running inside an active event loop (e.g. async runner or Jupyter)
         async def _exec() -> Dict[str, Any]:
-            if isinstance(client, DjangoCoreClient) and not hasattr(client, "_mock_return_value"):
+            if isinstance(client, DjangoCoreClient) and type(client) is DjangoCoreClient:
                 async with DjangoCoreClient(
                     base_url=client.base_url,
                     token=client.token,

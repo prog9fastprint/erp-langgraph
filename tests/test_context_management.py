@@ -3,20 +3,17 @@ Unit tests for Context Window Management & Payload Sanitization in FastPrint ERP
 Tests message trimming, ERP payload sanitization, summarizer node, and workflow integration.
 """
 import unittest
-from unittest.mock import MagicMock
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+from langchain_core.messages import HumanMessage, AIMessage
 
 from app.core.config import settings
 from app.core.context import (
     trim_conversation_messages,
     sanitize_erp_payload,
     build_contextual_prompt,
-    format_deterministic_summary,
 )
 from app.graph.state import create_initial_state
 from app.graph.nodes.summarizer import summarizer_node
-from app.graph.nodes.tool_node import tool_node_sync
-from app.graph.workflow import create_workflow_graph, run_workflow_sync
+from app.graph.workflow import run_workflow_sync
 
 
 class TestMessageTrimming(unittest.TestCase):

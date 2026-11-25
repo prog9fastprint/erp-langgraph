@@ -33,11 +33,9 @@ class TestApiChatStream(unittest.IsolatedAsyncioTestCase):
             lines = block.split("\n")
             ev_name = None
             ev_data = None
-            is_comment = False
             for line in lines:
                 line_stripped = line.strip()
                 if line_stripped.startswith(":"):
-                    is_comment = True
                     ev_name = "comment"
                     ev_data = line_stripped[1:].strip()
                 elif line_stripped.startswith("event:"):

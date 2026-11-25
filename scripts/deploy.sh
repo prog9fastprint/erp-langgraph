@@ -8,8 +8,10 @@ echo ">>> Deploying FastPrint ERP AI Orchestrator at ${APP_DIR} on branch ${BRAN
 
 cd "${APP_DIR}"
 
-git fetch origin "${BRANCH}"
-git reset --hard "origin/${BRANCH}"
+if [ "${SKIP_GIT_SYNC:-0}" != "1" ]; then
+  git fetch origin "${BRANCH}"
+  git reset --hard "origin/${BRANCH}"
+fi
 
 if [ ! -f .env ]; then
   echo "WARNING: .env file not found in ${APP_DIR}. Creating from .env.example..."
@@ -29,9 +31,22 @@ if command -v docker &> /dev/null && (docker compose version &> /dev/null || com
   ${DOCKER_CMD} build --pull
   ${DOCKER_CMD} up -d
   echo ">>> Checking container status..."
-  sleep 5
   ${DOCKER_CMD} ps
-  curl -f http://127.0.0.1:8002/health || true
+  HEALTH_OK=0
+  for i in $(seq 1 10); do
+    if curl -fsS http://127.0.0.1:8002/health > /dev/null; then
+      HEALTH_OK=1
+      break
+    fi
+    echo "Waiting for service health check (${i}/10)..."
+    sleep 2
+  done
+  if [ "${HEALTH_OK}" -ne 1 ]; then
+    echo "ERROR: Service failed /health check after deployment."
+    ${DOCKER_CMD} logs --tail=50
+    exit 1
+  fi
+  echo ">>> Health check passed."
 elif [ -f /etc/systemd/system/erp-langgraph.service ]; then
   echo ">>> Native systemd detected. Updating dependencies and restarting..."
   if [ -d .venv ]; then

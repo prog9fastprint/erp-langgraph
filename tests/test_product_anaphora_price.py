@@ -3,7 +3,7 @@ Regression test suite for product anaphora resolution, price inquiry formatting,
 and verifier strict entity guards (Fix for multi-turn product follow-up issue).
 """
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
 
 from langchain_core.messages import HumanMessage, AIMessage
 
