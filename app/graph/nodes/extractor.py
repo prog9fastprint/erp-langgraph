@@ -491,12 +491,34 @@ def _fallback_extract_vendor_invoice(
 
 STOCK_STOPWORDS = (
     "ini", "itu", "barang", "produk", "product", "item", "sku", "kode", "semua", "ada", "tersedia",
-    "stok", "stock", "sisa",
+    "stok", "stock", "sisa", "stocknya", "stoknya",
+    "yang", "mana", "paling", "tersedikit", "sedikit", "terbanyak", "terkecil", "terendah", "tertinggi", "dimana",
     "di", "ke", "dari", "pada", "untuk", "terkait", "tentang",
     "gudang", "lokasi", "customer", "pelanggan",
     "dan", "serta", "juga", "faktur", "tagihan", "invoice", "jurnal", "saldo",
 )
 STOCK_DELIMITERS = r"\b(?:dan|serta|di|ke|pada|untuk|bulan|hari|berapa|status|faktur|tagihan|invoice|saldo|jurnal|gudang|lokasi)\b"
+
+_NON_PRODUCT_PHRASE_RE = re.compile(
+    r"^(?:yang|mana)\b|\b(?:tersedikit|paling\s+sedikit|stok\s+menipis|stock\s+menipis|habis|kritis|terbanyak|terkecil|terendah)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_valid_product_identifier(value: Optional[str]) -> bool:
+    """Reject interrogative/superlative clause fragments masquerading as SKU or product names."""
+    if not value or not isinstance(value, str):
+        return False
+    cleaned = value.strip()
+    if not cleaned:
+        return False
+    if _NON_PRODUCT_PHRASE_RE.search(cleaned):
+        return False
+    remaining = [
+        w for w in cleaned.split()
+        if w.lower() not in STOCK_STOPWORDS and w.lower() not in PRODUCT_STOPWORDS
+    ]
+    return bool(remaining)
 
 
 def _is_pure_branch_token(token: Optional[str]) -> bool:
@@ -578,8 +600,9 @@ def _fallback_extract_stock_level(
         token = match.group(1).strip().rstrip("?!.,; '\"")
         token = clean_product_identifier(token)
         words = [w for w in token.split() if w.lower() not in STOCK_STOPWORDS]
-        if words and not _is_pure_branch_token(token):
-            params["code"] = token
+        candidate = " ".join(words)
+        if words and _is_valid_product_identifier(candidate) and not _is_pure_branch_token(candidate):
+            params["code"] = candidate
             return params
 
     tokens = re.findall(r"\b([A-Z0-9]+(?:-[A-Z0-9]+)+|\d{3,14})\b", cleaned)
@@ -659,7 +682,9 @@ def _fallback_extract_locations(query: str) -> Dict[str, Any]:
 
 PRODUCT_STOPWORDS = {
     "berapa", "harga", "beli", "jual", "belinya", "jualnya", "cek", "info",
-    "detail", "spesifikasi", "stok", "stoknya", "produk", "product", "barang", "item", "sku", "kode", "ada",
+    "detail", "spesifikasi", "stok", "stoknya", "stock", "stocknya",
+    "produk", "product", "barang", "item", "sku", "kode", "ada",
+    "yang", "mana", "paling", "tersedikit", "sedikit", "terbanyak", "terkecil", "terendah", "tertinggi", "dimana",
     "dan", "serta", "di", "ke", "dari", "pada", "untuk", "ini", "itu",
     "nya", "semua", "daftar", "list",
     # Anaphoric reference tokens
@@ -694,7 +719,8 @@ def _fallback_extract_product_info(
         if words:
             candidate = " ".join(words)
             if (
-                not is_vendor_name(candidate)
+                _is_valid_product_identifier(candidate)
+                and not is_vendor_name(candidate)
                 and not is_account_code_or_name(candidate)
                 and not is_accounting_term(candidate)
                 and not _is_pure_branch_token(candidate)
@@ -879,6 +905,9 @@ def _fallback_extract_low_stock_alerts(query: str) -> Dict[str, Any]:
             params["threshold"] = float(m_num.group(1))
         except ValueError:
             pass
+    if re.search(r"\b(?:tersedikit|paling\s+sedikit|terkecil|terendah)\b", cleaned, re.IGNORECASE):
+        params["exclude_zero"] = True
+        params["limit"] = 20
     return params
 
 
@@ -1077,16 +1106,77 @@ def try_fast_path_stock_extraction(
     return None
 
 
+_TOP_SALES_STOPWORDS = {
+    "dengan", "pendapatan", "omzet", "omset", "penjualan", "tertinggi", "terbanyak",
+    "terbesar", "terlaris", "teratas", "top", "paling", "laku", "produk", "product",
+    "barang", "item", "sku", "kode", "yang", "mana", "dimana", "cabang", "perusahaan",
+    "toko", "outlet", "kantor", "pusat", "semua", "seluruh", "tahun", "bulan", "hari",
+    "minggu", "kemarin", "ini", "itu", "lalu", "terakhir", "berapa", "cek", "tampilkan",
+    "daftar", "peringkat", "dari", "di", "ke", "pada", "untuk", "dan", "serta", "atau",
+    "unit", "qty", "revenue", "ytd", "mtd",
+}
+
+
 def _fallback_extract_top_selling_products(query: str, ref_date: Optional[date] = None) -> Dict[str, Any]:
     """Deterministic heuristic extraction for sales.get_top_selling_products."""
     today = ref_date or get_current_erp_date()
     params: Dict[str, Any] = {"limit": 10}
+    cleaned = (query or "").strip()
+    clean_q = cleaned.lower()
 
-    # Extract limit (e.g. "10 produk", "top 5")
-    m_limit = re.search(r"\b(?:top|peringkat|daftar)?\s*(\d+)\s*(?:produk|barang|item)?\b", query, re.IGNORECASE)
+    # Determine ranking metric
+    if (
+        re.search(r"\b(?:terbanyak|unit|qty|kuantitas|terjual)\b", clean_q)
+        and not re.search(r"\b(?:omzet|omset|pendapatan|revenue|laba)\b", clean_q)
+    ):
+        params["sort_by"] = "qty"
+    else:
+        params["sort_by"] = "revenue"
+
+    # Extract explicit SKU token first
+    sku_m = re.search(r"\b(?:sku|kode(?:\s+produk|\s+barang)?)\s*[:#]?\s*([A-Za-z0-9._\-\/]{2,40})\b", cleaned, re.IGNORECASE)
+    if sku_m:
+        cand = clean_product_identifier(sku_m.group(1))
+        if cand and cand.lower() not in _TOP_SALES_STOPWORDS and not _is_pure_branch_token(cand):
+            params["search"] = cand
+
+    if not params.get("search"):
+        m_pre = re.search(
+            r"^([A-Za-z0-9\-_]+(?:\s+[A-Za-z0-9\-_]+)?)\s+penjualan\s+(?:terbanyak|tertinggi|terbesar)\b",
+            cleaned,
+            re.IGNORECASE,
+        )
+        if m_pre:
+            words = [
+                w for w in m_pre.group(1).split()
+                if w.lower() not in _TOP_SALES_STOPWORDS and not _is_pure_branch_token(w)
+            ]
+            if words:
+                params["search"] = " ".join(words)
+
+    if not params.get("search"):
+        m_post = re.search(
+            r"\b(?:(?:omzet|omset)\s+)?(?:penjualan|omzet|omset|terjual)\s+(?:produk\s+|barang\s+)?([A-Za-z0-9\s\.\-\+\/]+?)(?:\s+\b(?:bulan|tahun|hari|minggu|kemarin|di|ke|pada|cabang|semua|terbanyak|tertinggi|terbesar|terlaris|dimana|berapa)\b|$)",
+            cleaned,
+            re.IGNORECASE,
+        )
+        if m_post:
+            raw_phrase = strip_company_scope_keywords(m_post.group(1))
+            words = [
+                w for w in raw_phrase.split()
+                if w.lower() not in _TOP_SALES_STOPWORDS
+                and not _is_pure_branch_token(w)
+                and not re.match(r"^20\d\d$", w)
+            ]
+            if words:
+                params["search"] = " ".join(words)
+
+    # Extract limit (e.g. "10 produk", "top 5") — avoid mistaking numeric SKU as limit
+    m_limit = re.search(r"\b(?:top|peringkat|daftar)\s*(\d+)\b|\b(\d+)\s+(?:produk|barang|item)\b", cleaned, re.IGNORECASE)
     if m_limit:
+        raw_lim = m_limit.group(1) or m_limit.group(2)
         try:
-            val = int(m_limit.group(1))
+            val = int(raw_lim)
             if 1 <= val <= 100:
                 params["limit"] = val
         except ValueError:
@@ -1260,9 +1350,11 @@ def _extract_mp_sku_token(query: str) -> Optional[str]:
     m_hy = re.search(r"\b([A-Za-z0-9]+(?:-[A-Za-z0-9]+)+)\b", cleaned)
     if m_hy:
         return clean_product_identifier(m_hy.group(1))
-    m_num = re.search(r"\b(\d{5,14})\b", cleaned)
+    m_num = re.search(r"\b(\d{4,14})\b", cleaned)
     if m_num:
-        return m_num.group(1)
+        cand_num = m_num.group(1)
+        if not (len(cand_num) == 4 and 2020 <= int(cand_num) <= 2035):
+            return cand_num
     return None
 
 
@@ -1493,6 +1585,11 @@ def _fallback_extract_price_comparison(query: str) -> Dict[str, Any]:
     sku = _extract_mp_sku_token(query)
     if sku:
         params["search"] = sku
+        if (
+            params["filter_status"] == "mismatch"
+            and not re.search(r"\b(selisih|mismatch|beda|lebih\s+mahal|lebih\s+murah)\b", cleaned)
+        ):
+            params["filter_status"] = "all"
     return params
 
 
@@ -1705,7 +1802,8 @@ def _extract_single_tool_params(
                 f"- For 'search': Extract ONLY key entity names or document numbers (e.g. 'TikTok', 'PT Sumber Makmur', 'BCA'). Do NOT include full conversational phrases like 'aku mau tanya', 'saldo di jurnal', or relative dates.\n"
                 f"- For 'vendor_name': Extract only clean vendor / supplier company names (e.g. 'MEGACOM BEC', 'PT Sumber Makmur'). Do NOT append branch or city names into vendor_name.\n"
                 f"- For 'account_code' (in get_account_balance): Only set if user provided an actual account code (e.g. '11285', '111100'). If the user provided a name like 'bank tiktok' or 'marketplace tiktok', do NOT set 'account_code' to the name.\n"
-                f"- For 'code' (in get_stock_level & get_product_info): Extract the product SKU code, barcode, OR product name (e.g. 'AMPLOP BUBBLE 15x18 + 4CM LK', 'Kertas HVS A4', 'Tinta Epson 664', 'HVS-A4-70') into 'code'. If the user mentions a product by name, ALWAYS put that name into 'code'. Strip any leading filler words like 'product', 'produk', 'barang', 'item', 'sku', 'kode' (e.g. for 'product FP BROTHER...' extract 'FP BROTHER...').\n"
+                f"- For 'code' (in get_stock_level): Extract the product SKU code, barcode, OR product name into 'code'. Strip filler words like 'product', 'produk', 'barang', 'item', 'sku', 'kode'.\n"
+                f"- For 'code' vs 'search' (in get_product_info): Put ONLY explicit SKU/barcode identifiers (e.g. '1362', '91030300', 'HVS-A4-70') into 'code'. Put product names or partial model keywords (e.g. 'L210', 'stiker hologram', 'botol kalkir') into 'search'.\n"
                 f"- For 'codes' (in get_stock_level): If the user specifies multiple product SKU codes or barcodes (e.g. '91010600 dan 91030300', 'SKU A, B, dan C'), extract all of them as a list of strings into 'codes' rather than a single 'code'.\n"
                 f"- For 'location_name' (in get_stock_level): Extract warehouse or location names (e.g. 'mainstore', 'gudang surabaya', 'pusat') into 'location_name'.\n"
                 f"- STRICT DATE RULE: Do NOT populate 'date_from' or 'date_to' unless the user explicitly specifies a date, relative date (e.g. 'bulan ini', 'bulan lalu', 'kemarin'), or time window. If no time expression is mentioned, leave both None.\n"
@@ -2039,6 +2137,32 @@ def _extract_single_tool_params(
         if loc_val in LOCATION_STOP_WORDS:
             extracted_dict.pop("location_name", None)
 
+    # Reject superlative/interrogative phrases masquerading as product identifiers
+    if tool_name in ("get_stock_level", "get_product_info"):
+        for k in ("code", "search"):
+            val = extracted_dict.get(k)
+            if isinstance(val, str) and not _is_valid_product_identifier(val):
+                extracted_dict.pop(k, None)
+
+    # Low stock alerts: superlative queries ("stocknya tersedikit") exclude <= 0 items
+    if tool_name == "get_low_stock_alerts" and re.search(
+        r"\b(?:tersedikit|paling\s+sedikit|terkecil|terendah)\b",
+        f"{sub_query} {user_query}",
+        re.IGNORECASE,
+    ):
+        extracted_dict["exclude_zero"] = True
+        if not extracted_dict.get("limit") or extracted_dict.get("limit") == 50:
+            extracted_dict["limit"] = 20
+
+    # Price comparison: for SKU lookup without mismatch intent, show all comparison rows
+    if tool_name == "get_price_comparison":
+        combined_q = f"{sub_query} {user_query}".lower()
+        if extracted_dict.get("search") and not re.search(
+            r"\b(selisih|mismatch|beda|lebih\s+mahal|lebih\s+murah)\b", combined_q
+        ):
+            if extracted_dict.get("filter_status") in (None, "mismatch"):
+                extracted_dict["filter_status"] = "all"
+
     # For get_stock_level & get_product_info: prevent LLM from setting product_id to SKU or internal code
     if tool_name in ("get_stock_level", "get_product_info") and extracted_dict.get("product_id"):
         raw_pid = extracted_dict["product_id"]
@@ -2051,11 +2175,15 @@ def _extract_single_tool_params(
             elif extracted_dict.get("code") or extracted_dict.get("search"):
                 extracted_dict.pop("product_id", None)
 
-    # For get_product_info: if code contains whitespace, it is a multi-word product name, NOT an exact SKU!
-    # Django get_product_info requires exact default_code for 'code', but matches names via 'search'.
+    # For get_product_info: move non-exact product names/model keywords (e.g. 'L210', 'stiker hologram')
+    # from 'code' into 'search' so exact SKU lookup does not miss partial name matches.
     if tool_name == "get_product_info" and extracted_dict.get("code"):
         code_str = str(extracted_dict["code"]).strip()
-        if " " in code_str:
+        is_explicit_sku_ref = bool(
+            re.search(rf"\b(?:sku|kode)\s*[:#]?\s*{re.escape(code_str)}\b", f"{sub_query} {user_query}", re.IGNORECASE)
+        )
+        is_exact_sku_shape = bool(re.match(r"^(?:\d{3,14}|[A-Za-z0-9]+(?:-[A-Za-z0-9]+)+)$", code_str))
+        if " " in code_str or (not is_exact_sku_shape and not is_explicit_sku_ref):
             if not extracted_dict.get("search"):
                 extracted_dict["search"] = code_str
             extracted_dict.pop("code", None)

@@ -132,7 +132,7 @@ class MultiRouterDecision(BaseModel):
 
 
 # Disambiguation term sets
-CUSTOMER_TERMS = {"pelanggan", "customer", "piutang", "penjualan", "sales", "buyer", "klien"}
+CUSTOMER_TERMS = {"pelanggan", "customer", "piutang", "buyer", "klien"}
 VENDOR_TERMS = {"vendor", "supplier", "pemasok", "hutang"}
 PURCHASE_INVOICE_TERMS = ("faktur pembelian", "tagihan pembelian", "invoice pembelian")
 CUSTOMER_BILLING_TERMS = (
@@ -215,8 +215,9 @@ INVENTORY_TRANSFERS_PATTERNS = [
 ]
 
 INVENTORY_LOW_STOCK_PATTERNS = [
-    r"\bstok(nya)?\s+(menipis|habis|kritis|minimum|kurang|minus|sedikit)\b",
-    r"\bstok(nya)?\s+.*?(menipis|habis|kritis|minimum)\b",
+    r"\b(?:stok|stock)(?:nya)?\s+(?:paling\s+)?(?:menipis|habis|kritis|minimum|kurang|minus|sedikit|tersedikit|terkecil|terendah)\b",
+    r"\b(?:stok|stock)(?:nya)?\s+.*?(?:menipis|habis|kritis|minimum|tersedikit|terkecil|terendah|paling\s+sedikit)\b",
+    r"\b(?:produk|barang|item)\s+(?:yang\s+)?(?:stok|stock)(?:nya)?\s+(?:paling\s+)?(?:tersedikit|sedikit|terkecil|terendah|menipis|habis)\b",
     r"\blow\s+stock\b",
     r"\balert\s+stok\b",
     r"\bstok\s+alert\b",
@@ -276,6 +277,8 @@ SALES_TOP_PRODUCTS_PATTERNS = [
     r"\b(?:pendapatan|omset|omzet|penjualan)\s+(?:tertinggi|terbesar)\s+(?:per\s+|tiap\s+)?(?:produk|barang|sku)\b",
     r"\bproduk\s+terlaris\b",
     r"\bproduk\s+paling\s+laku\b",
+    r"\bpenjualan\s+(?:terbanyak|tertinggi|terbesar)\s+(?:di\s*mana|cabang\s+mana|toko\s+mana|outlet\s+mana)\b",
+    r"\b(?:omzet|omset)\s+penjualan\s+sku\b",
 ]
 
 SALES_SUMMARY_PATTERNS = [
@@ -340,7 +343,7 @@ MARKETPLACE_SYNC_LOGS_PATTERNS = [
 
 MARKETPLACE_PRICE_COMPARISON_PATTERNS = [
     r"\b(?:bandingkan|perbandingan|selisih|compare)\s+harga\b.*?\b(?:marketplace|shopee|tiktok(?:\s*shop)?|tokopedia|lazada|pricelist|erp)\b",
-    r"\b(?:cek\s+)?harga\s+(?:sku\s+\S+\s+)?di\s+(?:shopee|tiktok(?:\s*shop)?|tokopedia|lazada|marketplace)\b.*?\b(?:vs|dibanding|terhadap|pricelist|erp)\b",
+    r"\b(?:cek\s+|lihat\s+|berapa\s+)?harga\b.*?\bdi\s+(?:shopee|tiktok(?:\s*shop)?|tokopedia|lazada|marketplace)\b",
     r"\b(?:harga\s+erp\s+vs\s+(?:harga\s+)?(?:shopee|tiktok(?:\s*shop)?|tokopedia|lazada|marketplace)|wholesalemp|harga\s+grosir\s+marketplace)\b",
 ]
 
@@ -485,6 +488,52 @@ def find_previous_user_query(messages: Optional[List[BaseMessage]]) -> Optional[
             if content_str and not is_retry_query(content_str):
                 return content_str
     return None
+
+
+_NON_PRODUCT_SALES_TOKENS = {
+    "perusahaan", "cabang", "toko", "outlet", "kantor", "pusat", "semua", "seluruh",
+    "hari", "minggu", "bulan", "tahun", "kemarin", "ini", "itu", "lalu", "terakhir",
+    "shopee", "tiktok", "tokopedia", "lazada", "marketplace", "offline", "online",
+    "confirmed", "quotation", "cancel", "cancelled", "paid", "invoiced", "draft",
+    "total", "ringkasan", "laporan", "summary", "performa", "rata", "aov", "di", "ke",
+    "dari", "pada", "untuk", "dan", "serta", "berapa", "cek", "tampilkan", "mana",
+    "dimana", "terbanyak", "tertinggi", "terbesar", "terlaris", "keseluruhan",
+    "surabaya", "jakarta", "bandung", "medan", "makassar", "makasar", "bekasi",
+    "tangerang", "malang", "mainstore", "main", "store", "headoffice", "head", "office",
+    "ho", "ms", "sby", "jkt", "bdg", "mdn", "mks", "bks", "tgr", "mlg", "fastmart",
+    "ytd", "mtd",
+}
+
+_EXPLICIT_PL_RE = re.compile(
+    r"\b(laba\s*(?:dan\s*)?rugi|rugi\s*laba|p&l|profit\s*(?:and|&)\s*loss|income\s*statement|gross\s*margin|laba\s*kotor|laba\s*bersih|hpp|cogs)\b",
+    re.IGNORECASE,
+)
+
+
+def _has_product_scoped_sales_intent(cleaned: str) -> bool:
+    """Return True when a sales/omzet query targets a specific product or SKU rather than company-wide totals."""
+    if not cleaned or _EXPLICIT_PL_RE.search(cleaned):
+        return False
+    if any(b in cleaned for b in ("faktur", "tagihan", "invoice", "bill", "piutang", "kuitansi", "bon", "sales order", "quotation", "so/")):
+        return False
+    if not re.search(r"\b(?:penjualan|omzet|omset|terjual)\b", cleaned):
+        return False
+    if re.search(r"\bsku\s*[:#]?\s*[a-z0-9._\-]+\b", cleaned):
+        return True
+    # Pattern: "<product> penjualan terbanyak ..."
+    m_pre = re.search(r"^([a-z0-9\-_]+(?:\s+[a-z0-9\-_]+)?)\s+penjualan\s+(?:terbanyak|tertinggi|terbesar)\b", cleaned)
+    if m_pre:
+        words = [w for w in m_pre.group(1).split() if w not in _NON_PRODUCT_SALES_TOKENS]
+        if words:
+            return True
+    # Pattern: "(omzet )?penjualan <product_phrase>"
+    m_post = re.search(r"\b(?:(?:omzet|omset)\s+)?(?:penjualan|omzet|omset|terjual)\s+(?:produk\s+|barang\s+)?([a-z0-9\-\_\.\+]+(?:\s+[a-z0-9\-\_\.\+]+){0,4})", cleaned)
+    if m_post:
+        phrase_tokens = m_post.group(1).split()
+        first_tok = phrase_tokens[0]
+        if first_tok not in _NON_PRODUCT_SALES_TOKENS and not re.match(r"^20\d\d$", first_tok):
+            return True
+    return False
 
 
 def classify_query_rule_based(query: str) -> Optional[Dict[str, Any]]:
@@ -680,24 +729,30 @@ def classify_query_rule_based(query: str) -> Optional[Dict[str, Any]]:
         else:
             candidates.append(("get_locations", "inventory", m_loc.start()))
 
-    # Sales: Top selling products by revenue
+    # Sales: Top selling products by revenue / qty (and product-scoped sales/omzet queries)
     m_top_sales = _find_first_match(SALES_TOP_PRODUCTS_PATTERNS, cleaned)
-    if m_top_sales:
-        candidates.append(("get_top_selling_products", "sales", m_top_sales.start()))
+    is_product_sales = _has_product_scoped_sales_intent(cleaned)
+    if m_top_sales or is_product_sales:
+        pos = m_top_sales.start() if m_top_sales else max(0, cleaned.find("penjualan"))
+        candidates.append(("get_top_selling_products", "sales", pos))
 
-    # Sales: Summary / Omzet
+    # Sales: Summary / Omzet (only when NOT scoped to a specific product or SKU)
     m_sales_summary = _find_first_match(SALES_SUMMARY_PATTERNS, cleaned)
-    if m_sales_summary and not m_top_sales:
+    if m_sales_summary and not m_top_sales and not is_product_sales:
         candidates.append(("get_sales_summary", "sales", m_sales_summary.start()))
+
+    # Suppress 'omzet'-only Profit & Loss trigger when sales domain owns the omzet query
+    if (m_sales_summary or m_top_sales or is_product_sales) and not _EXPLICIT_PL_RE.search(cleaned):
+        candidates = [c for c in candidates if c[0] != "get_profit_and_loss"]
 
     # Sales: Order Detail
     m_sales_detail = _find_first_match(SALES_ORDER_DETAIL_PATTERNS, cleaned)
-    if m_sales_detail and not m_top_sales and not m_sales_summary:
+    if m_sales_detail and not m_top_sales and not is_product_sales and not m_sales_summary:
         candidates.append(("get_sales_order_detail", "sales", m_sales_detail.start()))
 
     # Sales: Orders List
     m_sales_orders = _find_first_match(SALES_ORDERS_PATTERNS, cleaned)
-    if m_sales_orders and not m_top_sales and not m_sales_summary and not m_sales_detail:
+    if m_sales_orders and not m_top_sales and not is_product_sales and not m_sales_summary and not m_sales_detail:
         candidates.append(("get_sales_orders", "sales", m_sales_orders.start()))
 
     # Marketplace Domain: 11 Specialized Operational & Financial Diagnostic Tools
@@ -751,10 +806,12 @@ def classify_query_rule_based(query: str) -> Optional[Dict[str, Any]]:
     if (
         not is_rag
         and not m_top_sales
+        and not is_product_sales
         and not m_sales_summary
         and not m_sales_detail
         and not m_sales_orders
         and "get_price_comparison" not in matched_mp_tools
+        and (not m_low_stock or _find_first_match([r"\bharga\b", r"\bpricelist\b"], cleaned))
     ):
         # If stock level pattern matched, only add product_info if explicit product catalog detail terms are present
         # (avoid treating "stok produk ...", "sku ...", or "barcode ..." as a separate product_info tool call)
@@ -909,7 +966,12 @@ def _annotate_multi_company(res: Dict[str, Any], state: AgentState, user_query: 
     multi_cids, is_all = resolve_all_branch_company_ids(user_query)
     explicit_single = resolve_branch_company_id(user_query)
 
-    if is_all:
+    is_branch_ranking_query = bool(
+        res.get("detected_tool") in ("get_top_selling_products", "get_stock_level")
+        and re.search(r"\b(?:di\s*mana|cabang\s+mana|toko\s+mana|outlet\s+mana|gudang\s+mana)\b", user_query or "", re.IGNORECASE)
+    )
+
+    if is_all or (is_branch_ranking_query and explicit_single is None and not multi_cids):
         res["is_multi_company"] = True
         effective_cids = list(COMPANY_NAME_MAP.keys())
         res["company_ids"] = effective_cids
@@ -1023,24 +1085,33 @@ def _router_node_impl(
         if prior_q:
             from app.graph.nodes.extractor import resolve_branch_company_id, strip_company_scope_keywords
 
-            clean_uq = user_query.strip().rstrip("?!.,;: '\"").lower()
+            clean_uq = user_query.strip().rstrip("?!.,;:'\"> ").lower()
+            is_location_interrogative = clean_uq in {
+                "dimana", "di mana", "cabang mana", "toko mana", "gudang mana", "outlet mana",
+            }
             is_branch_mention = bool(resolve_branch_company_id(clean_uq)) or bool(
                 re.search(r"\b(?:di\s+|cabang\s+|gudang\s+|lokasi\s+|rak\s+)([A-Za-z0-9\_\-]+)", clean_uq)
             )
             is_followup_retry = is_retry_query(clean_uq) or bool(
                 re.search(r"\b(coba\s+(?:(?:di)?cek\s+|(?:di)?periksa\s+|(?:di)?cari\s+)?lagi|(?:di)?cek\s+lagi|coba\s+lagi|ulang(i)?|tes\s+lagi|(?:di)?cek\s+ulang)\b", clean_uq)
             )
-            is_short_followup = len(clean_uq.split()) <= 7 and (is_branch_mention or is_followup_retry)
+            is_short_followup = len(clean_uq.split()) <= 7 and (
+                is_branch_mention or is_followup_retry or is_location_interrogative
+            )
 
             if is_short_followup:
                 try:
                     prior_result = classify_query_rule_based(prior_q)
                     if prior_result is not None and prior_result.get("detected_domain") in ("accounting", "inventory", "sales", "marketplace"):
-                        effective_sub = user_query if is_branch_mention else prior_q
-                        if is_branch_mention:
+                        if is_location_interrogative:
+                            effective_sub = f"{prior_q} {clean_uq}".strip()
+                            effective_user = effective_sub
+                        elif is_branch_mention:
+                            effective_sub = user_query
                             sanitized_prior = strip_company_scope_keywords(prior_q)
                             effective_user = f"{sanitized_prior} {user_query}".strip() if sanitized_prior else user_query
                         else:
+                            effective_sub = prior_q
                             effective_user = prior_q
                         followup_tools = [
                             {

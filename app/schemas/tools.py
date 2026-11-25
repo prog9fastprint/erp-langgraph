@@ -286,7 +286,9 @@ class LowStockAlertsFilterSchema(BaseModel):
     company_id: Optional[int] = Field(None, description="Company ID")
     warehouse_id: Optional[int] = Field(None, description="Filter gudang tertentu")
     category_id: Optional[int] = Field(None, description="Filter kategori produk")
+    search: Optional[str] = Field(None, description="Kata kunci pencarian SKU atau nama produk")
     threshold: float = Field(0.0, description="Ambang batas stok (default 0 untuk stok habis/minus)")
+    exclude_zero: Optional[bool] = Field(None, description="Jika true, hanya tampilkan produk dengan stok positif (> 0) terendah")
     limit: int = Field(50, ge=1, le=100, description="Batas jumlah record (1-100)")
 
 
@@ -351,6 +353,7 @@ class TopSellingProductsFilterSchema(BaseModel):
     date_to: Optional[str] = Field(None, description="Tanggal akhir transaksi (YYYY-MM-DD)")
     limit: int = Field(10, ge=1, le=100, description="Jumlah produk teratas yang ditampilkan (1-100)")
     search: Optional[str] = Field(None, description="Pencarian bebas nama produk atau SKU")
+    sort_by: Optional[Literal["revenue", "qty"]] = Field(None, description="Urutkan peringkat berdasarkan 'revenue' atau 'qty'")
 
     @field_validator("date_from")
     @classmethod

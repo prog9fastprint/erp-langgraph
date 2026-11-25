@@ -117,6 +117,49 @@ async def _resolve_and_execute_price_comparison(
         marketplace_filter=mp_hint,
         require_order_config=True,
     )
+
+    # Fallback: if active single branch has no MarketplaceAccount/AccountOrder configured
+    # and user did not explicitly pin a branch in query, scan authorized branches safely.
+    if not matched and not clean_params.get("company_ids"):
+        from app.graph.nodes.extractor import COMPANY_NAME_MAP, resolve_branch_company_id
+
+        if not (user_query and resolve_branch_company_id(user_query) is not None):
+            other_cids = [cid for cid in COMPANY_NAME_MAP.keys() if cid != target_company_id]
+            sem = asyncio.Semaphore(getattr(settings, "ERP_MULTI_COMPANY_CONCURRENCY", 5))
+
+            async def _probe_branch_accounts(cid: int) -> List[Dict[str, Any]]:
+                async with sem:
+                    try:
+                        b_res = await erp_client.fetch_account_health(
+                            params=dict(health_params),
+                            user_token=user_token,
+                            company_id=cid,
+                        )
+                        return b_res.get("accounts", []) if isinstance(b_res, dict) else []
+                    except DjangoCoreClientError as b_err:
+                        if _is_permission_error(str(b_err)):
+                            return []
+                        logger.debug("Optional branch marketplace probe failed for cid=%s: %s", cid, b_err)
+                        return []
+                    except Exception:
+                        return []
+
+            branch_lists = await asyncio.gather(*[_probe_branch_accounts(cid) for cid in other_cids])
+            seen_acc_ids = {a.get("account_id") for a in accounts if isinstance(a, dict) and a.get("account_id") is not None}
+            merged_accounts = list(accounts)
+            for bl in branch_lists:
+                for acc_item in bl:
+                    aid = acc_item.get("account_id") if isinstance(acc_item, dict) else None
+                    if aid is not None and aid not in seen_acc_ids:
+                        seen_acc_ids.add(aid)
+                        merged_accounts.append(acc_item)
+            matched = _match_marketplace_accounts(
+                merged_accounts,
+                user_query=user_query,
+                marketplace_filter=mp_hint,
+                require_order_config=True,
+            )
+
     if not matched:
         return (
             None,
@@ -354,10 +397,17 @@ async def _execute_single_tool(
             clean_params.pop("product_id", None)
 
         raw_code = clean_params.get("code")
-        if raw_code and isinstance(raw_code, str) and " " in raw_code.strip():
-            if not clean_params.get("search"):
-                clean_params["search"] = raw_code.strip()
-            clean_params.pop("code", None)
+        if raw_code and isinstance(raw_code, str):
+            code_str = raw_code.strip()
+            is_explicit_sku_ref = bool(
+                user_query
+                and re.search(rf"\b(?:sku|kode)\s*[:#]?\s*{re.escape(code_str)}\b", user_query, re.IGNORECASE)
+            )
+            is_exact_sku_shape = bool(re.match(r"^(?:\d{3,14}|[A-Za-z0-9]+(?:-[A-Za-z0-9]+)+)$", code_str))
+            if " " in code_str or (not is_exact_sku_shape and not is_explicit_sku_ref):
+                if not clean_params.get("search"):
+                    clean_params["search"] = code_str
+                clean_params.pop("code", None)
 
     # Pre-resolve account_id for get_price_comparison when both account_id and pricelist_id are omitted
     if tool_name == "get_price_comparison" and not clean_params.get("account_id") and not clean_params.get("pricelist_id"):

@@ -563,10 +563,35 @@ def _format_single_tool_presentation(
 
     # 4. Product Info
     if tool == "get_product_info":
+        def _resolve_product_display_price(prod: Dict[str, Any]) -> float:
+            for key in (
+                "effective_sales_price",
+                "default_sales_price",
+                "sales_price",
+                "list_price",
+                "price",
+                "last_unit_price",
+            ):
+                val = prod.get(key)
+                if val is not None:
+                    try:
+                        fval = float(val)
+                        if fval > 0:
+                            return fval
+                    except (TypeError, ValueError):
+                        pass
+            return float(
+                prod.get("default_sales_price")
+                or prod.get("list_price")
+                or prod.get("last_unit_price")
+                or 0.0
+            )
+
         products = tool_result.get("products") if isinstance(tool_result, dict) else (
             tool_result if isinstance(tool_result, list) else [tool_result]
         )
         total_count = _extract_total_count(tool_result, len(products))
+        company_label = tool_result.get("company_name") if isinstance(tool_result, dict) else None
         q_lower = (user_query or "").lower()
         is_price_query = any(k in q_lower for k in ("harga", "harganya", "pricelist", "biaya", "tarip", "tarif", "berapa"))
 
@@ -581,19 +606,33 @@ def _format_single_tool_presentation(
                     cat_name = cat.get("name", "-") if isinstance(cat, dict) else (cat or "-")
                     uom = p.get("uom")
                     uom_name = uom.get("name", "Unit") if isinstance(uom, dict) else (uom or "Unit")
-                    price_val = p.get("last_unit_price") or p.get("price") or p.get("sales_price") or p.get("list_price", 0.0)
+                    price_val = _resolve_product_display_price(p)
                     cost_val = p.get("default_cost") or p.get("cost")
+                    pl_prices = p.get("pricelist_prices") or []
 
                     lines.append("### Informasi Harga Produk\n")
                     lines.append("| Atribut | Rincian |")
                     lines.append("|:---|:---|")
                     lines.append(f"| **Nama Produk** | {p_name} |")
                     lines.append(f"| **Kode / SKU** | `{sku}` |")
+                    if company_label:
+                        lines.append(f"| **Cabang** | {company_label} |")
                     lines.append(f"| **Harga Jual** | **{_format_rupiah(price_val)}** / {uom_name} |")
                     if cost_val is not None:
                         lines.append(f"| **Estimasi HPP** | {_format_rupiah(cost_val)} |")
                     lines.append(f"| **Kategori** | {cat_name} |")
-                    lines.append(f"\nHarga jual resmi untuk produk **{p_name}** (SKU `{sku}`) tercatat sebesar **{_format_rupiah(price_val)}** per {uom_name}.")
+                    if pl_prices:
+                        lines.append("\n#### Daftar Harga Pricelist Cabang:")
+                        lines.append("| Pricelist | Harga | Min. Qty |")
+                        lines.append("|:---|:---|:---:|")
+                        for pl in pl_prices:
+                            lines.append(f"| {pl.get('pricelist_name', '-')} | **{_format_rupiah(pl.get('price', 0))}** | {pl.get('min_qty', 1)} |")
+                    scope_note = (
+                        f" di **{company_label}**"
+                        if company_label and pl_prices
+                        else (f" (harga master default; belum ada pricelist khusus {company_label})" if company_label else "")
+                    )
+                    lines.append(f"\nHarga jual resmi untuk produk **{p_name}** (SKU `{sku}`){scope_note} tercatat sebesar **{_format_rupiah(price_val)}** per {uom_name}.")
                 else:
                     lines.append("### Informasi Perbandingan Harga Produk\n")
                     lines.append("| No | Nama Produk | Kode / SKU | Satuan (UoM) | Harga Jual | Estimasi HPP |")
@@ -603,7 +642,7 @@ def _format_single_tool_presentation(
                         sku = p.get("code") or p.get("sku") or p.get("default_code") or "-"
                         uom = p.get("uom")
                         uom_name = uom.get("name", "Unit") if isinstance(uom, dict) else (uom or "Unit")
-                        price_val = p.get("last_unit_price") or p.get("price") or p.get("sales_price") or p.get("list_price", 0.0)
+                        price_val = _resolve_product_display_price(p)
                         cost_val = p.get("default_cost") or p.get("cost")
                         cost_str = _format_rupiah(cost_val) if cost_val is not None else "-"
                         lines.append(f"| {idx} | {p_name} | `{sku}` | {uom_name} | **{_format_rupiah(price_val)}** | {cost_str} |")
@@ -623,8 +662,8 @@ def _format_single_tool_presentation(
                         lines.append(f"  - Satuan (UoM): {uom.get('name', '-')}")
                     elif uom:
                         lines.append(f"  - Satuan (UoM): {uom}")
-                    if "last_unit_price" in p or "price" in p or "sales_price" in p or "list_price" in p:
-                        price_val = p.get("last_unit_price") or p.get("price") or p.get("sales_price") or p.get("list_price", 0.0)
+                    if any(k in p for k in ("effective_sales_price", "default_sales_price", "last_unit_price", "price", "sales_price", "list_price")):
+                        price_val = _resolve_product_display_price(p)
                         lines.append(f"  - Harga Jual: {_format_rupiah(price_val)}")
                     if p.get("default_cost") is not None:
                         lines.append(f"  - Estimasi HPP: {_format_rupiah(p.get('default_cost'))}")
@@ -718,7 +757,16 @@ def _format_single_tool_presentation(
             tool_result if isinstance(tool_result, list) else [tool_result]
         )
         total_found = _extract_total_count(tool_result, len(alerts))
-        lines.append(f"### Peringatan Stok Menipis / Kritis ({total_found} Produk Perlu Perhatian)\n")
+        exclude_zero = isinstance(tool_result, dict) and bool(tool_result.get("exclude_zero"))
+        oos_count = int(tool_result.get("out_of_stock_count") or 0) if isinstance(tool_result, dict) else 0
+
+        if exclude_zero:
+            lines.append(f"### Produk dengan Stok Tersedikit (Stok Positif Terendah — {total_found} Item)\n")
+            if oos_count > 0:
+                lines.append(f"Terdapat **{oos_count} SKU** lain berstatus habis/minus (<= 0 unit) pada cabang ini.\n")
+        else:
+            lines.append(f"### Peringatan Stok Menipis / Kritis ({total_found} Produk Perlu Perhatian)\n")
+
         if alerts:
             lines.append("| No | SKU | Nama Produk | Gudang | Stok Saat Ini | Batas Minimum | Status |")
             lines.append("|:---|:---|:---|:---|:---|:---|:---|")
@@ -731,6 +779,8 @@ def _format_single_tool_presentation(
                 status_label = "HABIS" if qty <= 0 else "MENIPIS"
                 lines.append(f"| {idx} | `{code}` | {name} | {wh} | **{qty:g} unit** | {thresh:g} | **{status_label}** |")
             _append_pagination_footer(lines, len(alerts), total_found)
+        elif exclude_zero:
+            lines.append("Tidak ditemukan produk dengan stok positif (> 0 unit) yang tersisa pada cabang ini.")
         else:
             lines.append("Semua stok produk terpantau dalam batas aman.")
         return "\n".join(lines)
@@ -850,6 +900,19 @@ def _format_single_tool_presentation(
             tot_rev = float(summary.get("total_revenue") or sum(float(p.get("total_revenue") or 0.0) for p in products))
             tot_qty = float(summary.get("total_qty") or sum(float(p.get("total_qty") or 0) for p in products))
             lines.append(f"| | **TOTAL** | | | **{tot_qty:g} unit** | **{_format_rupiah(tot_rev)}** |")
+        channel_breakdown = tool_result.get("channel_breakdown") if isinstance(tool_result, dict) else None
+        if channel_breakdown:
+            lines.append("\n#### Ringkasan per Channel Penjualan:\n")
+            lines.append("| No | Channel | Jumlah Order | Kuantitas Terjual | Total Omzet |")
+            lines.append("|:---:|:---|:---:|:---:|:---|")
+            for c_idx, ch in enumerate(channel_breakdown, start=1):
+                ch_name = ch.get("channel_name") or "Direct / Manual"
+                ch_orders = int(ch.get("order_count") or 0)
+                ch_qty = float(ch.get("total_qty") or 0)
+                ch_rev = float(ch.get("total_revenue") or 0.0)
+                lines.append(
+                    f"| {c_idx} | **{ch_name}** | {ch_orders:,} | {ch_qty:g} unit | **{_format_rupiah(ch_rev)}** |"
+                )
         return "\n".join(lines)
 
     # 14. Sales: Sales Orders List
@@ -1709,64 +1772,156 @@ def _format_multi_company_presentation(state: AgentState) -> str:
 
     # 6. Top Selling Products Multi-Company Presentation (Consolidated National Ranking)
     elif tool == "get_top_selling_products":
-        # Merge products across branches
-        merged: Dict[str, Dict[str, Any]] = {}
-        for cid, res in mc_results.items():
-            if not res or not isinstance(res, dict):
-                continue
-            p_list = res.get("products") or []
-            for p in p_list:
-                key = p.get("code") or str(p.get("product_id") or p.get("name"))
-                if key not in merged:
-                    merged[key] = {
-                        "code": p.get("code") or "-",
-                        "name": p.get("name") or "-",
-                        "category": p.get("category") or "-",
-                        "branch_rev": {},
-                        "branch_qty": {},
-                        "total_rev": 0.0,
-                        "total_qty": 0.0,
-                    }
-                rev = float(p.get("total_revenue") or 0.0)
-                qty = float(p.get("total_qty") or 0.0)
-                merged[key]["branch_rev"][cid] = rev
-                merged[key]["branch_qty"][cid] = qty
-                merged[key]["total_rev"] += rev
-                merged[key]["total_qty"] += qty
-
-        sorted_merged = sorted(merged.values(), key=lambda x: x["total_rev"], reverse=True)
         params = state.get("extracted_params") or {}
-        limit = int(params.get("limit") or 10)
-        top_list = sorted_merged[:limit]
+        search_term = params.get("search")
+        sort_by = params.get("sort_by") or "revenue"
+        user_q_low = (state.get("user_query") or "").lower()
+        is_branch_ranking_mode = bool(search_term) or bool(
+            re.search(r"\b(?:di\s*mana|cabang\s+mana|toko\s+mana|outlet\s+mana)\b", user_q_low)
+        )
 
-        lines.append(f"### Laporan Produk Pendapatan Tertinggi Multi-Cabang (Top {len(top_list)} Nasional)\n")
-        headers = ["No", "Kode / SKU", "Nama Produk"]
-        for cid in sorted(mc_results.keys()):
-            c_name = COMPANY_NAME_MAP.get(cid, f"Cabang {cid}")
-            headers.append(f"Omzet {c_name}")
-        headers.append("Total Omzet Gabungan")
+        if is_branch_ranking_mode:
+            branch_rows: List[Dict[str, Any]] = []
+            agg_channels: Dict[str, Dict[str, float]] = {}
 
-        lines.append("| " + " | ".join(headers) + " |")
-        lines.append("|:" + ":|:".join(["---"] * len(headers)) + ":|")
+            for cid, res in mc_results.items():
+                c_name = COMPANY_NAME_MAP.get(cid, f"Cabang {cid}")
+                if not res or not isinstance(res, dict):
+                    continue
+                p_list = res.get("products") or []
+                ch_list = res.get("channel_breakdown") or []
+                b_qty = sum(float(p.get("total_qty") or 0.0) for p in p_list)
+                b_rev = sum(float(p.get("total_revenue") or 0.0) for p in p_list)
+                top_prod_label = ", ".join(
+                    f"`{p.get('code') or '-'}` {p.get('name') or ''}".strip()
+                    for p in p_list[:2]
+                ) or "-"
+                top_ch_label = (
+                    f"{ch_list[0].get('channel_name', '-')} ({float(ch_list[0].get('total_qty') or 0):g} unit)"
+                    if ch_list
+                    else "-"
+                )
+                for ch in ch_list:
+                    ch_n = ch.get("channel_name") or "Direct / Manual"
+                    if ch_n not in agg_channels:
+                        agg_channels[ch_n] = {"order_count": 0.0, "total_qty": 0.0, "total_revenue": 0.0}
+                    agg_channels[ch_n]["order_count"] += float(ch.get("order_count") or 0)
+                    agg_channels[ch_n]["total_qty"] += float(ch.get("total_qty") or 0)
+                    agg_channels[ch_n]["total_revenue"] += float(ch.get("total_revenue") or 0)
 
-        branch_totals = {cid: 0.0 for cid in sorted(mc_results.keys())}
-        grand_total = 0.0
+                if b_qty > 0 or b_rev > 0:
+                    branch_rows.append({
+                        "company_id": cid,
+                        "company_name": c_name,
+                        "products_label": top_prod_label,
+                        "total_qty": b_qty,
+                        "total_revenue": b_rev,
+                        "top_channel": top_ch_label,
+                    })
 
-        for idx, p in enumerate(top_list, start=1):
-            row = [str(idx), f"`{p['code']}`", p["name"]]
+            sort_key = (
+                (lambda r: (r["total_qty"], r["total_revenue"]))
+                if sort_by == "qty"
+                else (lambda r: (r["total_revenue"], r["total_qty"]))
+            )
+            branch_rows.sort(key=sort_key, reverse=True)
+
+            target_label = f" untuk `{search_term}`" if search_term else ""
+            if branch_rows:
+                win = branch_rows[0]
+                lines.append(
+                    f"Penjualan terbanyak{target_label} tercatat di cabang **{win['company_name']}** "
+                    f"(**{win['total_qty']:g} unit**, **{_format_rupiah(win['total_revenue'])}**).\n"
+                )
+            lines.append(f"### Peringkat Penjualan per Cabang{target_label}\n")
+            if branch_rows:
+                lines.append("| Peringkat | Cabang | Produk / SKU | Kuantitas Terjual | Total Omzet | Channel Teratas |")
+                lines.append("|:---:|:---|:---|:---:|:---|:---|")
+                tot_qty = 0.0
+                tot_rev = 0.0
+                for idx, br in enumerate(branch_rows, start=1):
+                    tot_qty += br["total_qty"]
+                    tot_rev += br["total_revenue"]
+                    lines.append(
+                        f"| {idx} | **{br['company_name']}** | {br['products_label']} | "
+                        f"**{br['total_qty']:g} unit** | **{_format_rupiah(br['total_revenue'])}** | {br['top_channel']} |"
+                    )
+                lines.append(f"| | **TOTAL** | | **{tot_qty:g} unit** | **{_format_rupiah(tot_rev)}** | |")
+            else:
+                lines.append(f"Tidak ditemukan transaksi penjualan terkonfirmasi{target_label} pada periode ini.")
+
+            if agg_channels:
+                sorted_ch = sorted(
+                    agg_channels.items(),
+                    key=lambda kv: (kv[1]["total_qty"], kv[1]["total_revenue"]) if sort_by == "qty" else (kv[1]["total_revenue"], kv[1]["total_qty"]),
+                    reverse=True,
+                )
+                lines.append(f"\n#### Ringkasan per Channel Penjualan{target_label}:\n")
+                lines.append("| No | Channel | Jumlah Order | Kuantitas Terjual | Total Omzet |")
+                lines.append("|:---:|:---|:---:|:---:|:---|")
+                for c_idx, (ch_n, c_vals) in enumerate(sorted_ch, start=1):
+                    lines.append(
+                        f"| {c_idx} | **{ch_n}** | {int(c_vals['order_count']):,} | "
+                        f"{c_vals['total_qty']:g} unit | **{_format_rupiah(c_vals['total_revenue'])}** |"
+                    )
+        else:
+            # Merge products across branches
+            merged: Dict[str, Dict[str, Any]] = {}
+            for cid, res in mc_results.items():
+                if not res or not isinstance(res, dict):
+                    continue
+                p_list = res.get("products") or []
+                for p in p_list:
+                    key = p.get("code") or str(p.get("product_id") or p.get("name"))
+                    if key not in merged:
+                        merged[key] = {
+                            "code": p.get("code") or "-",
+                            "name": p.get("name") or "-",
+                            "category": p.get("category") or "-",
+                            "branch_rev": {},
+                            "branch_qty": {},
+                            "total_rev": 0.0,
+                            "total_qty": 0.0,
+                        }
+                    rev = float(p.get("total_revenue") or 0.0)
+                    qty = float(p.get("total_qty") or 0.0)
+                    merged[key]["branch_rev"][cid] = rev
+                    merged[key]["branch_qty"][cid] = qty
+                    merged[key]["total_rev"] += rev
+                    merged[key]["total_qty"] += qty
+
+            sorted_merged = sorted(merged.values(), key=lambda x: x["total_rev"], reverse=True)
+            limit = int(params.get("limit") or 10)
+            top_list = sorted_merged[:limit]
+
+            lines.append(f"### Laporan Produk Pendapatan Tertinggi Multi-Cabang (Top {len(top_list)} Nasional)\n")
+            headers = ["No", "Kode / SKU", "Nama Produk"]
             for cid in sorted(mc_results.keys()):
-                b_rev = p["branch_rev"].get(cid, 0.0)
-                branch_totals[cid] += b_rev
-                row.append(_format_rupiah(b_rev) if b_rev > 0 else "-")
-            grand_total += p["total_rev"]
-            row.append(f"**{_format_rupiah(p['total_rev'])}**")
-            lines.append("| " + " | ".join(row) + " |")
+                c_name = COMPANY_NAME_MAP.get(cid, f"Cabang {cid}")
+                headers.append(f"Omzet {c_name}")
+            headers.append("Total Omzet Gabungan")
 
-        tot_row = ["", "**TOTAL GABUNGAN**", ""]
-        for cid in sorted(mc_results.keys()):
-            tot_row.append(f"**{_format_rupiah(branch_totals[cid])}**")
-        tot_row.append(f"**{_format_rupiah(grand_total)}**")
-        lines.append("| " + " | ".join(tot_row) + " |")
+            lines.append("| " + " | ".join(headers) + " |")
+            lines.append("|:" + ":|:".join(["---"] * len(headers)) + ":|")
+
+            branch_totals = {cid: 0.0 for cid in sorted(mc_results.keys())}
+            grand_total = 0.0
+
+            for idx, p in enumerate(top_list, start=1):
+                row = [str(idx), f"`{p['code']}`", p["name"]]
+                for cid in sorted(mc_results.keys()):
+                    b_rev = p["branch_rev"].get(cid, 0.0)
+                    branch_totals[cid] += b_rev
+                    row.append(_format_rupiah(b_rev) if b_rev > 0 else "-")
+                grand_total += p["total_rev"]
+                row.append(f"**{_format_rupiah(p['total_rev'])}**")
+                lines.append("| " + " | ".join(row) + " |")
+
+            tot_row = ["", "**TOTAL GABUNGAN**", ""]
+            for cid in sorted(mc_results.keys()):
+                tot_row.append(f"**{_format_rupiah(branch_totals[cid])}**")
+            tot_row.append(f"**{_format_rupiah(grand_total)}**")
+            lines.append("| " + " | ".join(tot_row) + " |")
 
     elif tool == "get_sales_summary":
         lines.append("### Perbandingan Performa Penjualan Multi-Cabang\n")
@@ -2063,7 +2218,7 @@ def format_deterministic_answer(state: AgentState) -> str:
                 elif res is None and t_name in multi_results:
                     res = multi_results[t_name]
 
-                if res:
+                if res and plan.get("status") != "error":
                     formatted = _format_single_tool_presentation(t_name, res, user_query, plan.get("params"))
                     if formatted:
                         sections.append(formatted)
@@ -2073,10 +2228,20 @@ def format_deterministic_answer(state: AgentState) -> str:
                         domain_label = "Inventaris / Stok"
                     elif "balance" in t_name or "invoice" in t_name or "journal" in t_name:
                         domain_label = "Akuntansi / Keuangan"
-                    sections.append(
-                        f"### Informasi {domain_label} (`{t_name}`)\n\n"
-                        f"Tidak ditemukan data atau terjadi kendala saat memuat informasi untuk modul ini."
-                    )
+                    elif "sales" in t_name or "selling" in t_name:
+                        domain_label = "Penjualan (Sales)"
+                    plan_err = plan.get("error") or (res.get("error") if isinstance(res, dict) else None)
+                    if plan.get("status") == "error" or plan_err:
+                        sections.append(
+                            f"### Kendala Modul {domain_label} (`{t_name}`)\n\n"
+                            f"> [!WARNING]\n"
+                            f"> Gagal memuat data modul ini: {plan_err or 'Terjadi kendala pada layanan ERP.'}"
+                        )
+                    else:
+                        sections.append(
+                            f"### Informasi {domain_label} (`{t_name}`)\n\n"
+                            f"Tidak ditemukan data atau terjadi kendala saat memuat informasi untuk modul ini."
+                        )
         else:
             for key, res in multi_results.items():
                 base_tool = key.rsplit("_", 1)[0] if ("_" in key and key.rsplit("_", 1)[1].isdigit()) else key
@@ -2278,6 +2443,26 @@ def generate_deterministic_followups(state: AgentState) -> List[Dict[str, str]]:
             if isinstance(plan, dict) and plan.get("params"):
                 params = plan["params"]
                 break
+
+    # 0. ERROR Status Guard: never interpolate unvalidated/failed entity params into follow-up chips
+    if status == "ERROR":
+        return [
+            {
+                "label": "Cek Stok Menipis",
+                "query": "Tampilkan daftar produk yang stoknya menipis atau habis",
+                "icon": "fa-arrow-right",
+            },
+            {
+                "label": "Saldo Kas & Bank",
+                "query": "Berapa total saldo kas dan rekening bank aktif saat ini?",
+                "icon": "fa-arrow-right",
+            },
+            {
+                "label": "Panduan Fitur AI",
+                "query": "/scope",
+                "icon": "fa-arrow-right",
+            },
+        ]
 
     # 1. EMPTY Status Fallback
     if status == "EMPTY":
@@ -2553,6 +2738,67 @@ def generate_deterministic_followups(state: AgentState) -> List[Dict[str, str]]:
     return suggestions[:3]
 
 
+def _is_routable_followup_query(query_str: str) -> bool:
+    """Return True if a follow-up query routes to a concrete ERP tool, RAG knowledge, or /scope."""
+    q = (query_str or "").strip()
+    if not q:
+        return False
+    if q.lower().startswith("/scope"):
+        return True
+    try:
+        from app.graph.nodes.router import classify_query_rule_based
+        res = classify_query_rule_based(q)
+        if not isinstance(res, dict):
+            return False
+        return res.get("detected_domain") not in (None, "general", "out_of_scope")
+    except Exception:
+        return True
+
+
+def _finalize_followups(
+    followups: List[Dict[str, str]],
+    user_query: Optional[str],
+    state: AgentState,
+) -> List[Dict[str, str]]:
+    """
+    Deduplicate, strip self-repeating chips matching current user_query,
+    validate routability via classify_query_rule_based, and backfill cleanly.
+    """
+    norm_user = re.sub(r"\s+", " ", (user_query or "").strip().rstrip("?!.,;:'\"> ")).lower()
+    seen_queries = set()
+    valid_chips: List[Dict[str, str]] = []
+
+    def _accept(chip: Dict[str, str], check_route: bool = True) -> None:
+        if not isinstance(chip, dict):
+            return
+        q_raw = str(chip.get("query") or "").strip()
+        lbl_raw = str(chip.get("label") or "").strip()
+        if not q_raw or not lbl_raw:
+            return
+        norm_q = re.sub(r"\s+", " ", q_raw.rstrip("?!.,;:'\"> ")).lower()
+        if norm_q == norm_user or norm_q in seen_queries:
+            return
+        if check_route and not _is_routable_followup_query(q_raw):
+            return
+        seen_queries.add(norm_q)
+        valid_chips.append({
+            "label": _clean_label_emojis(lbl_raw) or lbl_raw[:35],
+            "query": q_raw,
+            "icon": "fa-arrow-right",
+        })
+
+    for item in followups or []:
+        _accept(item, check_route=True)
+
+    if not valid_chips:
+        for det_item in generate_deterministic_followups(state):
+            _accept(det_item, check_route=False)
+            if len(valid_chips) >= 3:
+                break
+
+    return valid_chips[:3]
+
+
 async def asynthesizer_node(
     state: AgentState,
     llm: Optional[BaseChatModel] = None,
@@ -2692,6 +2938,7 @@ async def asynthesizer_node(
     # Fallback to deterministic follow-up generation if LLM didn't provide suggestions
     if not followups:
         followups = generate_deterministic_followups(state)
+    followups = _finalize_followups(followups, user_query, state)
 
     if retry_header and not final_text.startswith("> 🔄"):
         final_text = f"{retry_header}{final_text}"
@@ -2847,6 +3094,7 @@ def synthesizer_node(
     # Fallback to deterministic follow-up generation if LLM didn't provide suggestions
     if not followups:
         followups = generate_deterministic_followups(state)
+    followups = _finalize_followups(followups, user_query, state)
 
     if retry_header and not final_text.startswith("> 🔄"):
         final_text = f"{retry_header}{final_text}"

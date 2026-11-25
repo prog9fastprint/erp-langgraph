@@ -74,6 +74,17 @@ def _calculate_records_count(tool_result: Any) -> int:
         if "total_products" in tool_result and isinstance(tool_result["total_products"], (int, float)):
             return int(tool_result["total_products"])
 
+        # Low-stock positive-only ranking: when all items are <= 0, still report out_of_stock_count
+        if (
+            tool_result.get("exclude_zero") is True
+            and isinstance(tool_result.get("out_of_stock_count"), (int, float))
+            and int(tool_result["out_of_stock_count"]) > 0
+        ):
+            alerts_list = tool_result.get("alerts")
+            if isinstance(alerts_list, list) and len(alerts_list) > 0:
+                return len(alerts_list)
+            return 1
+
         # Marketplace sync execution logs totals & summaries (get_sync_execution_logs)
         if any(k in tool_result for k in ("stock_logs_total", "price_logs_total", "pcls_logs_total", "stock_summary", "price_summary")):
             log_row_total = sum(
