@@ -37,11 +37,23 @@ class TestCentralizedConfig(unittest.TestCase):
             "DJANGO_INTERNAL_SERVICE_KEY": "test-service-key-xyz",
             "REQUEST_TIMEOUT_SEC": "45",
         }
-        with patch.dict(os.environ, env_overrides, clear=False):
+        # Isolate environment by clearing primary aliases to test fallback resolution
+        env = {k: v for k, v in os.environ.items() if k not in ("ERP_BASE_URL", "ERP_API_TOKEN")}
+        env.update(env_overrides)
+        with patch.dict(os.environ, env, clear=True):
             custom_settings = Settings(_env_file=None)
             self.assertEqual(custom_settings.ERP_BASE_URL, "http://django.internal:8000")
             self.assertEqual(custom_settings.ERP_API_TOKEN, "test-service-key-xyz")
             self.assertEqual(custom_settings.REQUEST_TIMEOUT_SEC, 45)
+
+        # Verify that explicit ERP_BASE_URL takes precedence over DJANGO_INTERNAL_API_URL
+        env_precedence = {
+            "ERP_BASE_URL": "http://primary.erp:8000",
+            "DJANGO_INTERNAL_API_URL": "http://django.internal:8000",
+        }
+        with patch.dict(os.environ, env_precedence, clear=False):
+            precedence_settings = Settings(_env_file=None)
+            self.assertEqual(precedence_settings.ERP_BASE_URL, "http://primary.erp:8000")
 
 
 class TestERPClientTimeout(unittest.TestCase):
