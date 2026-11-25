@@ -290,6 +290,7 @@ class LowStockAlertsFilterSchema(BaseModel):
     threshold: float = Field(0.0, description="Ambang batas stok (default 0 untuk stok habis/minus)")
     exclude_zero: Optional[bool] = Field(None, description="Jika true, hanya tampilkan produk dengan stok positif (> 0) terendah")
     limit: int = Field(50, ge=1, le=100, description="Batas jumlah record (1-100)")
+    offset: int = Field(0, ge=0, description="Offset paginasi")
 
 
 class StockAdjustmentsFilterSchema(BaseModel):
@@ -1053,15 +1054,22 @@ class LowStockAlertItem(BaseModel):
     product_id: Optional[int] = None
     code: Optional[str] = None
     name: Optional[str] = None
+    company_id: Optional[int] = None
+    company_name: Optional[str] = None
     warehouse_id: Optional[int] = None
     warehouse_name: Optional[str] = None
+    location_id: Optional[int] = None
+    location_name: Optional[str] = None
     qty_on_hand: float = 0.0
     threshold: float = 0.0
     min_qty: Optional[float] = None
 
 
 class LowStockAlertsDataSchema(BaseModel):
+    company_id: Optional[int] = None
+    company_name: Optional[str] = None
     total_found: int = 0
+    total_count: Optional[int] = None
     alerts: List[LowStockAlertItem] = Field(default_factory=list)
 
 

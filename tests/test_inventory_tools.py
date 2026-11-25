@@ -44,7 +44,12 @@ from app.graph.nodes.extractor import (
     _fallback_extract_product_categories,
 )
 from app.graph.nodes.verifier import _calculate_records_count, verifier_node
-from app.graph.nodes.synthesizer import _format_single_tool_presentation, synthesizer_node
+from app.graph.nodes.synthesizer import (
+    _build_table_query_meta,
+    _format_multi_company_presentation,
+    _format_single_tool_presentation,
+    synthesizer_node,
+)
 from app.graph.nodes.tool_node import tool_node
 from app.services.django_client import DjangoCoreClient
 
@@ -527,4 +532,105 @@ class TestStockIdentifierAndWarehouseResolution(unittest.IsolatedAsyncioTestCase
         self.assertIn("Kode SKU / Barcode / Nama Produk", final_answer)
         self.assertIn("Nama Gudang / Lokasi Rak", final_answer)
         self.assertIn("HVS-A4-70", final_answer)
+
+
+class TestLowStockCompanyScopingAndTableMeta(unittest.TestCase):
+    """Tests for low stock company/warehouse formatting, pagination hints, and table_query_meta."""
+
+    def test_format_low_stock_alerts_includes_company_and_threshold_note(self):
+        payload = {
+            "company_id": 1,
+            "company_name": "FastPrint Pusat",
+            "total_found": 120,
+            "alerts": [
+                {
+                    "code": "TINTA-BK-01",
+                    "name": "Tinta Hitam Epson",
+                    "company_name": "FastPrint Pusat",
+                    "warehouse_name": "Gudang Pusat",
+                    "qty_on_hand": 0.0,
+                    "threshold": 0.0,
+                }
+            ],
+        }
+        md = _format_single_tool_presentation("get_low_stock_alerts", payload)
+        self.assertIn("| No | SKU | Nama Produk | Perusahaan | Gudang |", md)
+        self.assertIn("FastPrint Pusat", md)
+        self.assertIn("Gudang Pusat", md)
+        self.assertIn("Batas minimum default <= 0 unit", md)
+        self.assertIn("Menampilkan 1 dari 120 data.", md)
+        self.assertNotIn("filter periode tanggal", md)
+
+    def test_format_multi_company_low_stock_alerts_table(self):
+        state = {
+            "detected_tool": "get_low_stock_alerts",
+            "multi_company_results": {
+                1: {
+                    "total_found": 2,
+                    "alerts": [
+                        {
+                            "code": "SKU-01",
+                            "name": "Kertas HVS",
+                            "company_name": "FastPrint Pusat",
+                            "warehouse_name": "Gudang Pusat",
+                            "qty_on_hand": 0.0,
+                            "threshold": 0.0,
+                        }
+                    ],
+                },
+                2: {
+                    "total_found": 1,
+                    "alerts": [
+                        {
+                            "code": "SKU-02",
+                            "name": "Tinta Cyan",
+                            "company_name": "FastPrint Surabaya",
+                            "warehouse_name": "Gudang Surabaya",
+                            "qty_on_hand": 2.0,
+                            "threshold": 5.0,
+                        }
+                    ],
+                },
+            },
+        }
+        md = _format_multi_company_presentation(state)
+        self.assertIn("Peringatan Stok Menipis / Kritis Multi-Cabang", md)
+        self.assertIn("| No | Perusahaan / Cabang | SKU | Nama Produk | Gudang |", md)
+        self.assertIn("FastPrint Pusat", md)
+        self.assertIn("FastPrint Surabaya", md)
+        self.assertIn("Gudang Surabaya", md)
+
+    def test_build_table_query_meta_for_truncated_and_non_truncated_states(self):
+        base_state = {
+            "verification_status": "VALID",
+            "detected_domain": "inventory",
+            "detected_tool": "get_low_stock_alerts",
+            "company_id": 1,
+            "extracted_params": {"threshold": 0.0, "include_zero_stock": True, "limit": 50},
+            "is_multi_company": False,
+            "is_multi_tool": False,
+            "tool_result": {
+                "company_id": 1,
+                "company_name": "FastPrint Pusat",
+                "total_found": 120,
+                "alerts": [
+                    {"code": "A", "name": "Prod A", "qty_on_hand": 0.0, "threshold": 0.0},
+                    {"code": "B", "name": "Prod B", "qty_on_hand": 0.0, "threshold": 0.0},
+                ],
+            },
+        }
+        meta = _build_table_query_meta(base_state)
+        self.assertIsNotNone(meta)
+        self.assertEqual(meta["domain"], "inventory")
+        self.assertEqual(meta["tool"], "get_low_stock_alerts")
+        self.assertEqual(meta["company_id"], 1)
+        self.assertEqual(meta["total_count"], 120)
+        self.assertEqual(meta["displayed_count"], 2)
+
+        non_truncated = dict(base_state, tool_result={"total_found": 2, "alerts": base_state["tool_result"]["alerts"]})
+        self.assertIsNone(_build_table_query_meta(non_truncated))
+
+        multi_company = dict(base_state, is_multi_company=True)
+        self.assertIsNone(_build_table_query_meta(multi_company))
+
 

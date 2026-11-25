@@ -280,6 +280,66 @@ class TestApiChatStream(unittest.IsolatedAsyncioTestCase):
         # Verify no unhandled exception occurred
         self.assertTrue(result["final_answer"].startswith("### Informasi Saldo Chart of Account"))
 
+    async def test_stream_endpoint_emits_table_query_meta_on_truncated_low_stock(self):
+        """Truncated paginated inventory result emits table_query_meta in SSE complete event."""
+        isolated_graph = create_workflow_graph(checkpointer=MemorySaver())
+        mock_client = MagicMock(spec=DjangoCoreClient)
+        mock_client.aclose = AsyncMock()
+        mock_client.fetch_low_stock_alerts = AsyncMock(
+            return_value={
+                "company_id": 1,
+                "company_name": "FastPrint Pusat",
+                "total_found": 120,
+                "alerts": [
+                    {
+                        "code": "SKU-001",
+                        "name": "Tinta Hitam",
+                        "company_id": 1,
+                        "company_name": "FastPrint Pusat",
+                        "warehouse_name": "Gudang Pusat",
+                        "qty_on_hand": 0.0,
+                        "threshold": 0.0,
+                    },
+                    {
+                        "code": "SKU-002",
+                        "name": "Tinta Cyan",
+                        "company_id": 1,
+                        "company_name": "FastPrint Pusat",
+                        "warehouse_name": "Gudang Pusat",
+                        "qty_on_hand": 0.0,
+                        "threshold": 0.0,
+                    },
+                ],
+            }
+        )
+
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as http_client:
+            with patch("app.graph.workflow.default_workflow_graph", isolated_graph), \
+                 patch("app.graph.nodes.tool_node.DjangoCoreClient", return_value=mock_client):
+                resp = await http_client.post(
+                    "/api/v1/chat/stream",
+                    json={
+                        "query": "Tampilkan daftar produk yang stoknya menipis atau habis",
+                        "company_id": 1,
+                        "thread_id": "test_low_stock_table_meta",
+                    },
+                )
+
+        self.assertEqual(resp.status_code, 200)
+        events = self._parse_sse_events(resp.text)
+        complete_events = [data for name, data in events if name == "complete"]
+        self.assertEqual(len(complete_events), 1)
+        payload = complete_events[0]
+        self.assertIn("FastPrint Pusat", payload.get("final_answer", ""))
+        meta = payload.get("table_query_meta")
+        self.assertIsNotNone(meta)
+        self.assertEqual(meta.get("domain"), "inventory")
+        self.assertEqual(meta.get("tool"), "get_low_stock_alerts")
+        self.assertEqual(meta.get("company_id"), 1)
+        self.assertEqual(meta.get("total_count"), 120)
+        self.assertEqual(meta.get("displayed_count"), 2)
+
 
 if __name__ == "__main__":
     unittest.main()

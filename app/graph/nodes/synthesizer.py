@@ -75,13 +75,19 @@ def _extract_total_count(tool_result: Any, displayed_count: int) -> int:
     return displayed_count
 
 
-def _append_pagination_footer(lines: List[str], displayed_count: int, total_count: int) -> None:
+def _append_pagination_footer(
+    lines: List[str],
+    displayed_count: int,
+    total_count: int,
+    filter_hint: Optional[str] = None,
+) -> None:
     """Append Markdown pagination notice when displayed rows are fewer than total records."""
     if displayed_count > 0 and total_count > displayed_count:
-        lines.append(
-            f"\n*Menampilkan {displayed_count} dari {total_count} data. "
-            f"Gunakan filter periode tanggal atau kata kunci lebih spesifik untuk menelusuri data lainnya.*"
+        hint = (
+            filter_hint
+            or "Gunakan filter periode tanggal atau kata kunci lebih spesifik untuk menelusuri data lainnya."
         )
+        lines.append(f"\n*Menampilkan {displayed_count} dari {total_count} data. {hint}*")
 
 
 def _format_single_tool_presentation(
@@ -89,6 +95,7 @@ def _format_single_tool_presentation(
     tool_result: Any,
     user_query: Optional[str] = None,
     extracted_params: Optional[Dict[str, Any]] = None,
+    default_company_id: Optional[int] = None,
 ) -> str:
     """Format an individual tool's response payload into Markdown."""
     if not tool or not tool_result:
@@ -516,7 +523,12 @@ def _format_single_tool_presentation(
             qty = st_item.get("qty_on_hand") or st_item.get("quantity") or 0.0
             lines.append(f"| `{code}` | {name} | {comp} | {loc} | **{qty} unit** |")
 
-        _append_pagination_footer(lines, len(items), total_count)
+        _append_pagination_footer(
+            lines,
+            len(items),
+            total_count,
+            filter_hint="Gunakan kata kunci SKU/nama produk atau nama gudang lebih spesifik, atau klik **Lihat Full Table** untuk menelusuri seluruh data.",
+        )
 
         # Render breakdown if available (single product multi-location breakdown)
         if isinstance(tool_result, dict) and tool_result.get("breakdown"):
@@ -646,7 +658,12 @@ def _format_single_tool_presentation(
                         cost_val = p.get("default_cost") or p.get("cost")
                         cost_str = _format_rupiah(cost_val) if cost_val is not None else "-"
                         lines.append(f"| {idx} | {p_name} | `{sku}` | {uom_name} | **{_format_rupiah(price_val)}** | {cost_str} |")
-                    _append_pagination_footer(lines, len(products), total_count)
+                    _append_pagination_footer(
+                        lines,
+                        len(products),
+                        total_count,
+                        filter_hint="Gunakan kata kunci nama/SKU produk atau kategori lebih spesifik, atau klik **Lihat Full Table** untuk menelusuri seluruh data.",
+                    )
             else:
                 lines.append("### Informasi Master Produk (Catalog)\n")
                 for p in products:
@@ -667,7 +684,12 @@ def _format_single_tool_presentation(
                         lines.append(f"  - Harga Jual: {_format_rupiah(price_val)}")
                     if p.get("default_cost") is not None:
                         lines.append(f"  - Estimasi HPP: {_format_rupiah(p.get('default_cost'))}")
-                _append_pagination_footer(lines, len(products), total_count)
+                _append_pagination_footer(
+                    lines,
+                    len(products),
+                    total_count,
+                    filter_hint="Gunakan kata kunci nama/SKU produk atau kategori lebih spesifik untuk menelusuri data lainnya.",
+                )
         return "\n".join(lines)
 
     # 5. Locations
@@ -687,7 +709,12 @@ def _format_single_tool_presentation(
                 ltype = (l.get("type") or "-").capitalize()
                 lcat = (l.get("category") or "-").capitalize()
                 lines.append(f"| `{lid}` | {lname} | {wh} | {ltype} | {lcat} |")
-            _append_pagination_footer(lines, len(locs), total_found)
+            _append_pagination_footer(
+                lines,
+                len(locs),
+                total_found,
+                filter_hint="Gunakan kata kunci nama lokasi atau gudang lebih spesifik, atau klik **Lihat Full Table** untuk menelusuri seluruh data.",
+            )
         return "\n".join(lines)
 
     # 6. Stock History (Kartu Stok / Buku Besar Persediaan)
@@ -753,32 +780,59 @@ def _format_single_tool_presentation(
 
     # 8. Low Stock Alerts
     if tool == "get_low_stock_alerts":
+        from app.graph.nodes.extractor import COMPANY_NAME_MAP
+
         alerts = tool_result.get("alerts") if isinstance(tool_result, dict) else (
             tool_result if isinstance(tool_result, list) else [tool_result]
         )
         total_found = _extract_total_count(tool_result, len(alerts))
         exclude_zero = isinstance(tool_result, dict) and bool(tool_result.get("exclude_zero"))
         oos_count = int(tool_result.get("out_of_stock_count") or 0) if isinstance(tool_result, dict) else 0
+        threshold_val = float(tool_result.get("threshold") or 0.0) if isinstance(tool_result, dict) else 0.0
+
+        raw_cid = (
+            (tool_result.get("company_id") if isinstance(tool_result, dict) else None)
+            or (extracted_params.get("company_id") if isinstance(extracted_params, dict) else None)
+            or default_company_id
+        )
+        header_company = (
+            (tool_result.get("company_name") if isinstance(tool_result, dict) else None)
+            or (alerts[0].get("company_name") if alerts and isinstance(alerts[0], dict) else None)
+            or (COMPANY_NAME_MAP.get(int(raw_cid)) if raw_cid is not None else None)
+        )
+        company_suffix = f" — {header_company}" if header_company else ""
 
         if exclude_zero:
-            lines.append(f"### Produk dengan Stok Tersedikit (Stok Positif Terendah — {total_found} Item)\n")
+            lines.append(f"### Produk dengan Stok Tersedikit{company_suffix} (Stok Positif Terendah — {total_found} Item)\n")
             if oos_count > 0:
                 lines.append(f"Terdapat **{oos_count} SKU** lain berstatus habis/minus (<= 0 unit) pada cabang ini.\n")
         else:
-            lines.append(f"### Peringatan Stok Menipis / Kritis ({total_found} Produk Perlu Perhatian)\n")
+            lines.append(f"### Peringatan Stok Menipis / Kritis{company_suffix} ({total_found} Produk Perlu Perhatian)\n")
+            if threshold_val == 0.0:
+                lines.append(
+                    "*Batas minimum default <= 0 unit (stok habis/minus); sebutkan angka seperti 'di bawah 10' untuk menyertakan stok menipis positif.*\n"
+                )
 
         if alerts:
-            lines.append("| No | SKU | Nama Produk | Gudang | Stok Saat Ini | Batas Minimum | Status |")
-            lines.append("|:---|:---|:---|:---|:---|:---|:---|")
+            lines.append("| No | SKU | Nama Produk | Perusahaan | Gudang | Stok Saat Ini | Batas Minimum | Status |")
+            lines.append("|:---|:---|:---|:---|:---|:---|:---|:---|")
             for idx, a in enumerate(alerts, start=1):
                 code = a.get("code") or "-"
                 name = a.get("name") or "-"
+                comp = a.get("company_name") or header_company or "-"
                 wh = a.get("warehouse_name") or "-"
                 qty = a.get("qty_on_hand", 0.0)
                 thresh = a.get("threshold", 0.0)
                 status_label = "HABIS" if qty <= 0 else "MENIPIS"
-                lines.append(f"| {idx} | `{code}` | {name} | {wh} | **{qty:g} unit** | {thresh:g} | **{status_label}** |")
-            _append_pagination_footer(lines, len(alerts), total_found)
+                lines.append(
+                    f"| {idx} | `{code}` | {name} | {comp} | {wh} | **{qty:g} unit** | {thresh:g} | **{status_label}** |"
+                )
+            _append_pagination_footer(
+                lines,
+                len(alerts),
+                total_found,
+                filter_hint="Gunakan kata kunci nama/SKU produk, kategori, atau gudang lebih spesifik, atau klik **Lihat Full Table** untuk menelusuri seluruh data.",
+            )
         elif exclude_zero:
             lines.append("Tidak ditemukan produk dengan stok positif (> 0 unit) yang tersisa pada cabang ini.")
         else:
@@ -849,7 +903,12 @@ def _format_single_tool_presentation(
                 comp = f"Company #{w.get('company_id', 1)}"
                 locs_count = len(w.get("locations") or [])
                 lines.append(f"| `{wid}` | {wname} | `{code}` | {comp} | {locs_count} lokasi |")
-            _append_pagination_footer(lines, len(whs), total_found)
+            _append_pagination_footer(
+                lines,
+                len(whs),
+                total_found,
+                filter_hint="Gunakan kata kunci nama gudang lebih spesifik, atau klik **Lihat Full Table** untuk menelusuri seluruh data.",
+            )
         return "\n".join(lines)
 
     # 12. Product Categories
@@ -868,7 +927,12 @@ def _format_single_tool_presentation(
                 cm = c.get("costing_method") or "-"
                 uom_n = c.get("standard_uom") or "-"
                 lines.append(f"| `{cid}` | {cname} | {cm} | {uom_n} |")
-            _append_pagination_footer(lines, len(cats), total_found)
+            _append_pagination_footer(
+                lines,
+                len(cats),
+                total_found,
+                filter_hint="Gunakan kata kunci nama kategori lebih spesifik, atau klik **Lihat Full Table** untuk menelusuri seluruh data.",
+            )
         return "\n".join(lines)
 
     # 13. Sales: Top Selling Products
@@ -1969,6 +2033,44 @@ def _format_multi_company_presentation(state: AgentState) -> str:
             lines.append(f"| **{c_name}** | {cnt:,} | **{_format_rupiah(tot)}** | `{st}` |")
         lines.append(f"| **TOTAL GABUNGAN** | **{grand_cnt:,}** | **{_format_rupiah(grand_sum)}** | |")
 
+    elif tool == "get_low_stock_alerts":
+        exclude_zero = any(
+            isinstance(r, dict) and bool(r.get("exclude_zero"))
+            for r in mc_results.values()
+        )
+        total_across_branches = sum(
+            _extract_total_count(r, len(r.get("alerts") or []))
+            for r in mc_results.values()
+            if isinstance(r, dict)
+        )
+        if exclude_zero:
+            lines.append(f"### Produk dengan Stok Tersedikit Multi-Cabang ({total_across_branches} Item)\n")
+        else:
+            lines.append(f"### Peringatan Stok Menipis / Kritis Multi-Cabang ({total_across_branches} Produk Perlu Perhatian)\n")
+
+        lines.append("| No | Perusahaan / Cabang | SKU | Nama Produk | Gudang | Stok Saat Ini | Batas Minimum | Status |")
+        lines.append("|:---|:---|:---|:---|:---|:---|:---|:---|")
+        rows_written = 0
+        for cid in sorted(mc_results.keys()):
+            c_name = COMPANY_NAME_MAP.get(cid, f"Cabang {cid}")
+            res = mc_results.get(cid)
+            if not res or not isinstance(res, dict):
+                continue
+            for a in res.get("alerts") or []:
+                rows_written += 1
+                code = a.get("code") or "-"
+                name = a.get("name") or "-"
+                comp = a.get("company_name") or c_name
+                wh = a.get("warehouse_name") or "-"
+                qty = a.get("qty_on_hand", 0.0)
+                thresh = a.get("threshold", 0.0)
+                status_label = "HABIS" if qty <= 0 else "MENIPIS"
+                lines.append(
+                    f"| {rows_written} | {comp} | `{code}` | {name} | {wh} | **{qty:g} unit** | {thresh:g} | **{status_label}** |"
+                )
+        if rows_written == 0:
+            lines.append("| - | - | - | *Tidak ada produk di bawah ambang batas stok.* | - | - | - | - |")
+
     # Generic Fallback for other tools
     else:
         lines.append(f"### Laporan Multi-Perusahaan (`{tool}`)\n")
@@ -2219,7 +2321,13 @@ def format_deterministic_answer(state: AgentState) -> str:
                     res = multi_results[t_name]
 
                 if res and plan.get("status") != "error":
-                    formatted = _format_single_tool_presentation(t_name, res, user_query, plan.get("params"))
+                    formatted = _format_single_tool_presentation(
+                        t_name,
+                        res,
+                        user_query,
+                        plan.get("params"),
+                        default_company_id=state.get("company_id"),
+                    )
                     if formatted:
                         sections.append(formatted)
                 else:
@@ -2246,7 +2354,13 @@ def format_deterministic_answer(state: AgentState) -> str:
             for key, res in multi_results.items():
                 base_tool = key.rsplit("_", 1)[0] if ("_" in key and key.rsplit("_", 1)[1].isdigit()) else key
                 if res:
-                    formatted = _format_single_tool_presentation(base_tool, res, user_query, state.get("extracted_params"))
+                    formatted = _format_single_tool_presentation(
+                        base_tool,
+                        res,
+                        user_query,
+                        state.get("extracted_params"),
+                        default_company_id=state.get("company_id"),
+                    )
                     if formatted:
                         sections.append(formatted)
                 else:
@@ -2264,7 +2378,13 @@ def format_deterministic_answer(state: AgentState) -> str:
             return "\n\n---\n\n".join(sections)
 
     # 5. Single-Tool Valid Data Presentation (Backward Compatibility)
-    return _format_single_tool_presentation(tool, tool_result, user_query, state.get("extracted_params"))
+    return _format_single_tool_presentation(
+        tool,
+        tool_result,
+        user_query,
+        state.get("extracted_params"),
+        default_company_id=state.get("company_id"),
+    )
 
 
 def _clean_label_emojis(label: str) -> str:
@@ -2799,6 +2919,100 @@ def _finalize_followups(
     return valid_chips[:3]
 
 
+_PAGINATED_TABLE_TOOLS_META: Dict[str, str] = {
+    "get_low_stock_alerts": "alerts",
+    "get_product_info": "products",
+    "get_locations": "locations",
+    "get_stock_history": "history",
+    "get_transfers": "transfers",
+    "get_stock_adjustments": "adjustments",
+    "get_scrap_records": "scraps",
+    "get_warehouses": "warehouses",
+    "get_product_categories": "categories",
+    "get_journal_entries": "entries",
+    "get_general_ledger": "accounts",
+    "get_vendor_bills": "bills",
+    "get_sales_orders": "orders",
+    "get_marketplace_orders": "orders",
+}
+
+
+def _build_table_query_meta(state: AgentState) -> Optional[Dict[str, Any]]:
+    """Build lightweight query metadata for remote table pagination/export when rows are truncated."""
+    if state.get("verification_status") != "VALID":
+        return None
+    if state.get("is_multi_company") or state.get("is_multi_tool"):
+        return None
+    active_tools = state.get("active_tools") or []
+    if len(active_tools) > 1:
+        return None
+
+    tool = state.get("detected_tool") or (
+        active_tools[0].get("tool")
+        if active_tools and isinstance(active_tools[0], dict)
+        else None
+    )
+    if not tool:
+        return None
+
+    tool_result = state.get("tool_result")
+    if not isinstance(tool_result, dict):
+        return None
+
+    list_key = _PAGINATED_TABLE_TOOLS_META.get(tool)
+    if tool == "get_stock_level" and tool_result.get("mode") == "location_scan":
+        list_key = "items"
+    if not list_key:
+        return None
+
+    rows = tool_result.get(list_key)
+    if not isinstance(rows, list):
+        return None
+
+    displayed_count = len(rows)
+    total_count = _extract_total_count(tool_result, displayed_count)
+    if displayed_count <= 0 or total_count <= displayed_count:
+        return None
+
+    from app.core.context import sanitize_tool_params
+    from app.schemas.tools import TOOL_DOMAIN_MAP
+
+    raw_params = (
+        (active_tools[0].get("params") if active_tools and isinstance(active_tools[0], dict) else None)
+        or state.get("extracted_params")
+        or {}
+    )
+    clean_params = sanitize_tool_params(raw_params)
+    clean_params.pop("offset", None)
+    clean_params.pop("limit", None)
+    if tool == "get_stock_level":
+        if tool_result.get("location_id") is not None and not clean_params.get("location_id"):
+            clean_params["location_id"] = tool_result["location_id"]
+        if tool_result.get("warehouse_id") is not None and not clean_params.get("warehouse_id"):
+            clean_params["warehouse_id"] = tool_result["warehouse_id"]
+
+    domain = (
+        state.get("detected_domain")
+        or (active_tools[0].get("domain") if active_tools and isinstance(active_tools[0], dict) else None)
+        or TOOL_DOMAIN_MAP.get(tool)
+        or "inventory"
+    )
+    resolved_cid = (
+        tool_result.get("company_id")
+        or clean_params.get("company_id")
+        or state.get("company_id")
+    )
+
+    return {
+        "domain": domain,
+        "tool": tool,
+        "company_id": int(resolved_cid) if resolved_cid is not None else None,
+        "params": clean_params,
+        "total_count": total_count,
+        "displayed_count": displayed_count,
+    }
+
+
 async def asynthesizer_node(
     state: AgentState,
     llm: Optional[BaseChatModel] = None,
@@ -2947,6 +3161,7 @@ async def asynthesizer_node(
         "final_answer": final_text,
         "deterministic_answer": deterministic_answer,
         "suggested_followups": followups,
+        "table_query_meta": _build_table_query_meta(state),
         "messages": [AIMessage(content=final_text)],
     }
     if actual_model:
@@ -3103,6 +3318,7 @@ def synthesizer_node(
         "final_answer": final_text,
         "deterministic_answer": deterministic_answer,
         "suggested_followups": followups,
+        "table_query_meta": _build_table_query_meta(state),
         "messages": [AIMessage(content=final_text)],
     }
     if actual_model:

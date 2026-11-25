@@ -261,6 +261,7 @@ def _build_chat_response(final_state: Dict[str, Any], started_at: float) -> Chat
         resolved_company_ids=resolved_company_ids,
         execution_time_ms=execution_time_ms,
         model_used=model_used,
+        table_query_meta=final_state.get("table_query_meta"),
     )
 
 

@@ -477,10 +477,22 @@ async def _execute_single_tool(
         logger.error(f"Unexpected error in _execute_single_tool for tool '{tool_name}': {exc}", exc_info=True)
         return None, f"Unexpected execution error: {str(exc)}"
 
-    if isinstance(raw_result, dict):
+    if isinstance(raw_result, dict) and raw_result:
         loc_label = clean_params.get("matched_location_name") or clean_params.get("location_name")
         if loc_label and not raw_result.get("location_name"):
             raw_result["location_name"] = loc_label
+        if target_company_id is not None:
+            try:
+                cid_int = int(target_company_id)
+                if raw_result.get("company_id") is None:
+                    raw_result["company_id"] = cid_int
+                if not raw_result.get("company_name"):
+                    from app.graph.nodes.extractor import COMPANY_NAME_MAP
+                    mapped_name = COMPANY_NAME_MAP.get(cid_int)
+                    if mapped_name:
+                        raw_result["company_name"] = mapped_name
+            except (TypeError, ValueError):
+                pass
 
     preserve_keys = {"is_active"} if tool_name == "get_account_health" else None
     final_result = (

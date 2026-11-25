@@ -2,7 +2,7 @@
 Chat schemas for FastPrint ERP LangGraph AI Orchestrator API.
 Provides request and response validation models for the /api/v1/chat endpoint.
 """
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
@@ -85,4 +85,8 @@ class ChatResponse(BaseModel):
     model_used: Optional[str] = Field(
         default=None,
         description="Identifier of the LLM model used for workflow execution and synthesis"
+    )
+    table_query_meta: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Optional paginated tool query metadata for remote full-table inspection and export"
     )
