@@ -17,6 +17,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY app ./app
 COPY data ./data
 COPY prompts ./prompts
+COPY scripts ./scripts
 COPY cli.py .
 
 EXPOSE 8002
