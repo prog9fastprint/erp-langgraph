@@ -5,15 +5,14 @@ services:
       dockerfile: Dockerfile
     container_name: erp-ai-orchestrator
     restart: unless-stopped
-    ports:
-      - "8002:8002"
+    network_mode: "host"
     env_file:
       - .env
     environment:
       - APP_HOST=0.0.0.0
       - APP_PORT=8002
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8002/health"]
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8002/health"]
       interval: 30s
       timeout: 5s
       retries: 3
