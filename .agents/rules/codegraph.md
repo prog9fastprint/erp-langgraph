@@ -10,6 +10,11 @@ This rule governs codebase exploration, impact analysis, and symbol surveying us
   - Answering architectural and flow questions.
   - Surveying symbols, functions, classes, and call hierarchies before making edits.
   - Diagnosing bugs, unexpected behavior, or broken links across the pipeline.
+  - Answering codebase questions during `/grill-me` sessions before asking the user.
+- **Mandatory for `/grill-me`**:
+  - Whenever the agent handles `/grill-me`, the slash command specifies: *"If a question can be answered by exploring the codebase, explore the codebase instead."*
+  - The agent **MUST** execute CodeGraph (`codegraph_explore` MCP tool or `codegraph explore` CLI) to thoroughly survey the codebase, architecture, symbols, schemas, and call flows before querying the user.
+  - Never ask the user questions that can be answered by inspecting the graph via CodeGraph.
 - **Anti-Redundancy**: Source code blocks returned by `codegraph_explore` are current on-disk, line-numbered, and verbatim. Treat them as already read; **never perform redundant file reads** on code blocks already displayed by CodeGraph.
 - **Blast Radius Analysis**: Before modifying or refactoring shared functions (e.g. pipeline nodes, schemas, clients), check the blast radius to determine all callers, callees, and impacted test suites.
 

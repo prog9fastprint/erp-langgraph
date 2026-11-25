@@ -151,6 +151,7 @@ When modifying or adding features to this repository:
    - Do not remove existing docstrings, module headers, or `TASK-X.X` reference tags.
 5. **Code Intelligence with CodeGraph**:
    - For codebase exploration, architectural queries, diagnosing bugs, or surveying symbols before an edit, prioritize using **CodeGraph** (`codegraph_explore` MCP tool or `codegraph explore <query>` CLI).
+   - **Mandatory for `/grill-me`**: When handling `/grill-me`, the agent **must** use CodeGraph first to research and answer design/architecture questions from the codebase before asking the user. Only query the user on high-level preferences, business logic choices, or requirements that cannot be discovered from the code.
    - Use CodeGraph to inspect symbol call paths, blast radius, and affected test files in a single pass instead of broad grep/read loops.
    - Treat code blocks returned by `codegraph_explore` as already read; avoid redundant file reads.
    - Run `codegraph sync` after adding or renaming major symbols to keep the local graph index synchronized.
