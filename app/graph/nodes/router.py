@@ -25,9 +25,9 @@ logger = logging.getLogger("router_node")
 class PlannedToolCall(BaseModel):
     """Structured representation of an individual ERP tool call planned by router."""
     tool: str = Field(..., description="Target ERP tool name.")
-    domain: Literal["accounting", "inventory", "sales", "hr", "purchasing", "general"] = Field(
+    domain: Literal["accounting", "inventory", "sales", "marketplace", "hr", "purchasing", "general"] = Field(
         ...,
-        description="Target ERP domain: 'accounting', 'inventory', or 'sales'."
+        description="Target ERP domain: 'accounting', 'inventory', 'sales', or 'marketplace'."
     )
     sub_query: Optional[str] = Field(
         None,
@@ -50,9 +50,9 @@ class PlannedToolCall(BaseModel):
 
 class RouterDecision(BaseModel):
     """Structured output schema for LLM router fallback."""
-    domain: Literal["accounting", "inventory", "sales", "knowledge", "general", "out_of_scope"] = Field(
+    domain: Literal["accounting", "inventory", "sales", "marketplace", "knowledge", "general", "out_of_scope"] = Field(
         ...,
-        description="Target ERP module domain: 'accounting', 'inventory', 'sales', 'knowledge' (SOPs, specs, policies), 'general' (greetings/help), or 'out_of_scope' (unrelated queries outside ERP)."
+        description="Target ERP module domain: 'accounting', 'inventory', 'sales', 'marketplace', 'knowledge' (SOPs, specs, policies), 'general' (greetings/help), or 'out_of_scope' (unrelated queries outside ERP)."
     )
     query_mode: Literal["live_erp", "vector_rag", "hybrid", "general", "out_of_scope"] = Field(
         "live_erp",
@@ -81,9 +81,9 @@ class RouterDecision(BaseModel):
 
 class MultiRouterDecision(BaseModel):
     """Structured output schema for LLM router supporting multi-intent planning."""
-    domain: Literal["accounting", "inventory", "sales", "knowledge", "general", "out_of_scope"] = Field(
+    domain: Literal["accounting", "inventory", "sales", "marketplace", "knowledge", "general", "out_of_scope"] = Field(
         ...,
-        description="Primary target ERP module domain: 'accounting', 'inventory', 'sales', 'knowledge', 'general', or 'out_of_scope'."
+        description="Primary target ERP module domain: 'accounting', 'inventory', 'sales', 'marketplace', 'knowledge', 'general', or 'out_of_scope'."
     )
     query_mode: Literal["live_erp", "vector_rag", "hybrid", "general", "out_of_scope"] = Field(
         "live_erp",
@@ -125,7 +125,7 @@ class MultiRouterDecision(BaseModel):
             registry = get_tool_registry_service()
             registered = registry.get_tool_by_name(self.tool)
             d = TOOL_DOMAIN_MAP.get(self.tool) or (registered.get("domain") if registered else self.domain)
-            if d in ("accounting", "inventory", "sales"):
+            if d in ("accounting", "inventory", "sales", "marketplace"):
                 self.planned_tools = [PlannedToolCall(tool=self.tool, domain=d)]
 
         return self
@@ -302,6 +302,81 @@ SALES_ORDERS_PATTERNS = [
     r"\bpesanan\s+penjualan\b",
 ]
 
+MARKETPLACE_WRITE_PATTERNS = [
+    r"\b(update|push|sinkron(?:kan)?|ubah|edit|naik(?:kan)?|turun(?:kan)?)\s+(?:data\s+)?(stok|stock|harga|price)\s+(?:ke\s+|di\s+)?(shopee|tiktok(?:\s*shop)?|tokopedia|lazada|marketplace)\b",
+    r"\b(proses|gabung|merge|perbaiki|fix|hapus)\s+(?:order\s*kilat|pesanan\s*kilat|reservasi\s*kilat|handling\s+kilat)\b",
+]
+
+MARKETPLACE_ACCOUNT_HEALTH_PATTERNS = [
+    r"\b(kesehatan\s+akun|account\s+health|cek\s+akun\s+marketplace|status\s+(?:akun|toko)\s+(?:marketplace|shopee|tiktok(?:\s*shop)?|tokopedia|lazada))\b",
+    r"\b(token\s+(?:oauth\s+)?(?:marketplace|shopee|tiktok(?:\s*shop)?|tokopedia|lazada)|token\s+(?:expired|kadaluarsa|habis|akan\s+habis|expiring))\b",
+    r"\b(gagal\s+fetch\s+order|fetch\s+order\s+error|moderasi\s+toko|accountorder|accountproperties)\b",
+    r"\b(akun\s+(?:marketplace|shopee|tiktok(?:\s*shop)?|tokopedia|lazada)\s+(?:mana\s+yang|yang\s+)?(?:bermasalah|error|expired|nonaktif|inactive|gagal))\b",
+]
+
+MARKETPLACE_KILAT_PATTERNS = [
+    r"\b(pesanan\s+kilat|order\s+kilat|kilat\s+shopee|reservasi\s+kilat|no\.?\s*reservasi|no_reservasi|invoice_updated)\b",
+]
+
+MARKETPLACE_ORDERS_PATTERNS = [
+    r"\b(overdue\s+shipping|overdue\s+sla|lewat(?:i)?\s+batas\s+kirim|melewati\s+batas\s+kirim|batas\s+kirim|due\s+soon|missing\s+awb|belum\s+(?:punya|ada)\s+resi(?:\s+awb)?|tanpa\s+resi|status\s+mismatch|selisih\s+status\s+(?:erp|marketplace))\b",
+    r"\b(?:order|pesanan)\s+(?:marketplace|shopee|tiktok(?:\s*shop)?|tokopedia|lazada)\b",
+]
+
+MARKETPLACE_MAPPING_PATTERNS = [
+    r"\b(mapping\s+(?:produk|sku|marketplace)|product\s+mapping|produk\s+(?:marketplace\s+)?(?:yang\s+)?(?:belum|sudah)\s+ter-?mapping|unmapped(?:\s+sku)?|belum\s+(?:di|ter)-?mapping|qty_multiplier|duplikat\s+mapping|exception\s*product|masuk\s+exception)\b",
+]
+
+MARKETPLACE_STOCK_SYNC_SIM_PATTERNS = [
+    r"\b(simulasi\s+(?:update\s+|sinkronisasi\s+|push\s+)?stok|simulasi\s+stok\s+(?:marketplace|shopee|tiktok(?:\s*shop)?|tokopedia|lazada)|determine_stock|shared_stock|shared\s+stock|stok\s+(?:yang\s+)?(?:di-?push|dikirim)\s+ke\s+(?:marketplace|shopee|tiktok(?:\s*shop)?|tokopedia|lazada)|selisih\s+(?:kalkulasi\s+)?stok\s+(?:erp|gudang)\s+(?:vs|dan|dengan)\s+(?:marketplace|shopee|tiktok|log))\b",
+]
+
+MARKETPLACE_SYNC_LOGS_PATTERNS = [
+    r"\b(stockupdatelog|priceupdatelog|inventoryupdatepricelog|pcls\s+price)\b",
+    r"\b(log\s+(?:gagal|error|skip|sukses|eksekusi|update|sinkron(?:isasi)?)\s+(?:stok|stock|harga|price|marketplace|celery))\b",
+    r"\b(?:kenapa|mengapa|cek)\s+(?:update|sinkron(?:isasi)?)\s+(?:stok|stock|harga|price)\s+(?:atau\s+(?:harga|stok)\s+)?(?:marketplace|shopee|tiktok(?:\s*shop)?|tokopedia|lazada)?\s*(?:gagal|error|skip|tidak\s+update)\b",
+    r"\b(?:gagal|error)\s+(?:update|sinkron(?:isasi)?)\s+(?:stok|harga)\s+(?:marketplace|shopee|tiktok(?:\s*shop)?|tokopedia|lazada|celery)\b",
+]
+
+MARKETPLACE_PRICE_COMPARISON_PATTERNS = [
+    r"\b(?:bandingkan|perbandingan|selisih|compare)\s+harga\b.*?\b(?:marketplace|shopee|tiktok(?:\s*shop)?|tokopedia|lazada|pricelist|erp)\b",
+    r"\b(?:cek\s+)?harga\s+(?:sku\s+\S+\s+)?di\s+(?:shopee|tiktok(?:\s*shop)?|tokopedia|lazada|marketplace)\b.*?\b(?:vs|dibanding|terhadap|pricelist|erp)\b",
+    r"\b(?:harga\s+erp\s+vs\s+(?:harga\s+)?(?:shopee|tiktok(?:\s*shop)?|tokopedia|lazada|marketplace)|wholesalemp|harga\s+grosir\s+marketplace)\b",
+]
+
+MARKETPLACE_FEE_ANOMALIES_PATTERNS = [
+    r"\b(anomali\s+(?:potongan|fee|biaya|escrow)|high_fee|negative_fee|zero_income|erp_mp_mismatch|seller_expected_income|expected\s+income\s*(?:nol|0|minus|negatif))\b",
+    r"\b(potongan\s+(?:marketplace|shopee|tiktok(?:\s*shop)?|tokopedia|lazada)\s+(?:di\s*atas|lebih\s+dari|>=?|>)\s*\d+\s*%)\b",
+]
+
+MARKETPLACE_DEDUCTION_SETTLEMENT_PATTERNS = [
+    r"\b(?:rekap(?:itulasi)?|ringkasan|total|laporan|berapa)\s+(?:potongan(?:\s+fee)?|deduction|komisi|biaya\s+layanan)\s+(?:marketplace|shopee|tiktok(?:\s*shop)?|tokopedia|lazada)\b",
+    r"\b(settlement\s+(?:marketplace\s+)?(?:mana\s+yang\s+)?belum\s+(?:ter-?)?posting|unposted\s+journal|revenue\s+history|gross\s+vs\s+nett)\b",
+]
+
+MARKETPLACE_CASHFLOW_BALANCE_PATTERNS = [
+    r"\b(saldo\s+(?:dompet|wallet|seller|escrow)|pending\s+escrow|pending\s+balance|available\s+balance|balance\s+snapshot|penarikan\s+dana|withdrawal\s+(?:marketplace|shopee|tiktok)|cashflow\s+(?:marketplace|shopee|tiktok))\b",
+    r"\b(?:saldo|dompet)\s+(?:toko\s+|akun\s+)?(?:shopee|tiktok(?:\s*shop)?|tokopedia|lazada)\b",
+]
+
+MARKETPLACE_COMPETITOR_PATTERNS = [
+    r"\b(kompetitor|competitor|pesaing|inspect\s+kompetitor|velocity\s+(?:penjualan\s+)?kompetitor|audit\s+kompetitor|belum\s+di-?audit|stale\s+audit|delta_sold_qty)\b",
+]
+
+ALL_MARKETPLACE_PATTERN_GROUPS = (
+    MARKETPLACE_ACCOUNT_HEALTH_PATTERNS
+    + MARKETPLACE_KILAT_PATTERNS
+    + MARKETPLACE_ORDERS_PATTERNS
+    + MARKETPLACE_MAPPING_PATTERNS
+    + MARKETPLACE_STOCK_SYNC_SIM_PATTERNS
+    + MARKETPLACE_SYNC_LOGS_PATTERNS
+    + MARKETPLACE_PRICE_COMPARISON_PATTERNS
+    + MARKETPLACE_FEE_ANOMALIES_PATTERNS
+    + MARKETPLACE_DEDUCTION_SETTLEMENT_PATTERNS
+    + MARKETPLACE_CASHFLOW_BALANCE_PATTERNS
+    + MARKETPLACE_COMPETITOR_PATTERNS
+)
+
 INVENTORY_PRODUCT_PATTERNS = [
     r"\bproduk(nya)?\b",
     r"\bproduct\b",
@@ -437,6 +512,7 @@ def classify_query_rule_based(query: str) -> Optional[Dict[str, Any]]:
             or _match_any(INVENTORY_STOCK_PATTERNS, cleaned)
             or _match_any(INVENTORY_LOCATION_PATTERNS, cleaned)
             or _match_any(INVENTORY_PRODUCT_PATTERNS, cleaned)
+            or _match_any(ALL_MARKETPLACE_PATTERN_GROUPS, cleaned)
             or has_vendor
             or has_purchase_invoice
             or is_rag
@@ -453,8 +529,13 @@ def classify_query_rule_based(query: str) -> Optional[Dict[str, Any]]:
                 "active_tools": [],
             }
 
-    # 0.1 Fast-Path Out-of-Scope Guardrail
-    if _match_any(OUT_OF_SCOPE_PATTERNS, cleaned):
+    # 0.1 Fast-Path Out-of-Scope Guardrail (including direct marketplace write attempts)
+    is_mp_diagnostic_q = bool(
+        re.search(r"\b(kenapa|mengapa|apa\s+penyebab|log|riwayat|history|simulasi|kapan|gagal|error|status)\b", cleaned)
+    )
+    if _match_any(OUT_OF_SCOPE_PATTERNS, cleaned) or (
+        _match_any(MARKETPLACE_WRITE_PATTERNS, cleaned) and not is_mp_diagnostic_q
+    ):
         return {
             "detected_domain": "out_of_scope",
             "detected_tool": None,
@@ -619,8 +700,62 @@ def classify_query_rule_based(query: str) -> Optional[Dict[str, Any]]:
     if m_sales_orders and not m_top_sales and not m_sales_summary and not m_sales_detail:
         candidates.append(("get_sales_orders", "sales", m_sales_orders.start()))
 
+    # Marketplace Domain: 11 Specialized Operational & Financial Diagnostic Tools
+    mp_tool_matches = [
+        ("get_account_health", _find_first_match(MARKETPLACE_ACCOUNT_HEALTH_PATTERNS, cleaned)),
+        ("get_kilat_order_diagnostics", _find_first_match(MARKETPLACE_KILAT_PATTERNS, cleaned)),
+        ("get_marketplace_orders", _find_first_match(MARKETPLACE_ORDERS_PATTERNS, cleaned)),
+        ("get_product_mapping_status", _find_first_match(MARKETPLACE_MAPPING_PATTERNS, cleaned)),
+        ("get_stock_sync_simulation", _find_first_match(MARKETPLACE_STOCK_SYNC_SIM_PATTERNS, cleaned)),
+        ("get_sync_execution_logs", _find_first_match(MARKETPLACE_SYNC_LOGS_PATTERNS, cleaned)),
+        ("get_price_comparison", _find_first_match(MARKETPLACE_PRICE_COMPARISON_PATTERNS, cleaned)),
+        ("get_fee_and_escrow_anomalies", _find_first_match(MARKETPLACE_FEE_ANOMALIES_PATTERNS, cleaned)),
+        ("get_deduction_and_settlement_summary", _find_first_match(MARKETPLACE_DEDUCTION_SETTLEMENT_PATTERNS, cleaned)),
+        ("get_cashflow_and_balance_summary", _find_first_match(MARKETPLACE_CASHFLOW_BALANCE_PATTERNS, cleaned)),
+        ("get_competitor_insights", _find_first_match(MARKETPLACE_COMPETITOR_PATTERNS, cleaned)),
+    ]
+    matched_mp_tools = set()
+    for mp_tname, mp_m in mp_tool_matches:
+        if mp_m:
+            matched_mp_tools.add(mp_tname)
+            candidates.append((mp_tname, "marketplace", mp_m.start()))
+
+    # Collision suppression when marketplace-specific signals are present
+    if matched_mp_tools:
+        has_explicit_coa_cue = bool(
+            re.search(r"\b(coa|chart\s+of\s+accounts|kode\s+akun|buku\s+besar|rekening\s+bank|kas\s+kecil|1[0-9]{3,7})\b", cleaned)
+        )
+        suppressed_tools = set()
+        if not has_explicit_coa_cue and matched_mp_tools & {
+            "get_cashflow_and_balance_summary",
+            "get_account_health",
+            "get_deduction_and_settlement_summary",
+            "get_fee_and_escrow_anomalies",
+        }:
+            suppressed_tools.add("get_account_balance")
+        if "get_deduction_and_settlement_summary" in matched_mp_tools and not re.search(
+            r"\b(entri\s+jurnal|jurnal\s+umum|debit\s+kredit)\b", cleaned
+        ):
+            suppressed_tools.add("get_journal_entries")
+        if matched_mp_tools & {"get_stock_sync_simulation", "get_sync_execution_logs", "get_product_mapping_status"}:
+            if not re.search(r"\b(cek\s+stok\s+(?:gudang|fisik|rak)|stok\s+(?:gudang|rak))\b", cleaned):
+                suppressed_tools.add("get_stock_level")
+        if matched_mp_tools & {"get_marketplace_orders", "get_kilat_order_diagnostics"}:
+            suppressed_tools.update({"get_sales_orders", "get_sales_order_detail"})
+        if "get_price_comparison" in matched_mp_tools:
+            suppressed_tools.add("get_product_info")
+        if suppressed_tools:
+            candidates = [c for c in candidates if c[0] not in suppressed_tools]
+
     # Inventory: Product info
-    if not is_rag and not m_top_sales and not m_sales_summary and not m_sales_detail and not m_sales_orders:
+    if (
+        not is_rag
+        and not m_top_sales
+        and not m_sales_summary
+        and not m_sales_detail
+        and not m_sales_orders
+        and "get_price_comparison" not in matched_mp_tools
+    ):
         # If stock level pattern matched, only add product_info if explicit product catalog detail terms are present
         # (avoid treating "stok produk ...", "sku ...", or "barcode ..." as a separate product_info tool call)
         if m_stock:
@@ -659,7 +794,7 @@ def classify_query_rule_based(query: str) -> Optional[Dict[str, Any]]:
     # 1. Negative Guardrail: Customer Invoice / Billing Inquiries
     has_customer_billing = has_customer and (
         any(term in cleaned for term in CUSTOMER_BILLING_TERMS)
-        or (bool(candidates) and all(c[1] not in ("inventory", "sales") for c in candidates))
+        or (bool(candidates) and all(c[1] not in ("inventory", "sales", "marketplace") for c in candidates))
         or not candidates
     )
     if has_customer_billing and not has_vendor and not has_purchase_invoice and not is_rag:
@@ -900,7 +1035,7 @@ def _router_node_impl(
             if is_short_followup:
                 try:
                     prior_result = classify_query_rule_based(prior_q)
-                    if prior_result is not None and prior_result.get("detected_domain") in ("accounting", "inventory"):
+                    if prior_result is not None and prior_result.get("detected_domain") in ("accounting", "inventory", "sales", "marketplace"):
                         effective_sub = user_query if is_branch_mention else prior_q
                         if is_branch_mention:
                             sanitized_prior = strip_company_scope_keywords(prior_q)
@@ -945,7 +1080,7 @@ def _router_node_impl(
             if len(clean_uq.split()) <= 6 and not has_new_domain_intent:
                 try:
                     prior_result = classify_query_rule_based(prior_q)
-                    if prior_result is not None and prior_result.get("detected_domain") in ("accounting", "inventory"):
+                    if prior_result is not None and prior_result.get("detected_domain") in ("accounting", "inventory", "sales", "marketplace"):
                         if is_branch_mention:
                             sanitized_prior = strip_company_scope_keywords(prior_q)
                             effective_sub = f"{sanitized_prior} {user_query}".strip() if sanitized_prior else user_query
@@ -989,7 +1124,7 @@ def _router_node_impl(
         try:
             system_prompt = (
                 "You are a Supervisor Agent and Multi-Domain Tool Router for FastPrint ERP.\n"
-                "Classify user inquiries into target module domains ('accounting', 'inventory', 'knowledge', 'general', 'out_of_scope') "
+                "Classify user inquiries into target module domains ('accounting', 'inventory', 'sales', 'marketplace', 'knowledge', 'general', 'out_of_scope') "
                 "and determine the execution query_mode ('live_erp', 'vector_rag', 'hybrid', 'general', 'out_of_scope').\n\n"
                 "MULTI-INTENT & MULTI-TOOL PLANNING:\n"
                 "- If the user inquiry asks for multiple pieces of ERP data spanning one or more domains "
@@ -999,10 +1134,10 @@ def _router_node_impl(
                 "- If only a single tool is required, include it in both 'tool' and 'planned_tools'.\n\n"
                 "ROUTING RULES:\n"
                 "1. 'vector_rag' / domain='knowledge': Qualitative questions about SOPs, return policies, product technical specifications (GSM, size), warranty, or contract terms. tool=null, planned_tools=[].\n"
-                "2. 'live_erp': Numerical / real-time operational inquiries about stock on hand, cash balances, journal ledger, or vendor bills/invoices.\n"
+                "2. 'live_erp': Numerical / real-time operational inquiries about stock on hand, cash balances, journal ledger, vendor bills/invoices, sales orders/revenue, or marketplace operations/diagnostics.\n"
                 "3. 'hybrid': Combined queries asking about both SOP/specs rules AND live ERP numbers/stock. Plan live ERP tool(s) in planned_tools and set rag_query.\n"
                 "4. 'general': Pure greetings, polite chitchat, or asking about bot capabilities. tool=null, planned_tools=[].\n"
-                "5. 'out_of_scope': Inquiries unrelated to FastPrint ERP data or operations. tool=null, planned_tools=[].\n\n"
+                "5. 'out_of_scope': Inquiries unrelated to FastPrint ERP data or write/mutation requests (e.g., pushing stock/price to Shopee/TikTok or merging Kilat orders). tool=null, planned_tools=[].\n\n"
                 "CONTEXT AWARENESS:\n"
                 "Evaluate user query in context of conversational history.\n"
                 "If user asks to retry or follow up, infer intended domain and target ERP tools from history.\n\n"
@@ -1014,10 +1149,28 @@ def _router_node_impl(
                 "- 'get_vendor_bills': Vendor bills, faktur pembelian, hutang vendor, tagihan jatuh tempo, AP aging.\n"
                 "- 'get_account_balance': Chart of accounts balances, saldo kas/bank/akun periode tertentu.\n"
                 "- 'get_journal_entries': General journal vouchers/entries, memorial entries.\n\n"
+                "SALES TOOLS GUIDE:\n"
+                "- 'get_top_selling_products': Top selling products by volume or revenue.\n"
+                "- 'get_sales_orders': Sales order & quotation list.\n"
+                "- 'get_sales_order_detail': Single SO detail, lines, and AWB/courier.\n"
+                "- 'get_sales_summary': Executive revenue/omzet summary and channel breakdown.\n\n"
+                "MARKETPLACE TOOLS GUIDE (All READ-ONLY):\n"
+                "- 'get_account_health': Store readiness, OAuth token expiry, shop moderation status, missing configs, fetch errors.\n"
+                "- 'get_marketplace_orders': Shipping SLA (overdue/due_soon), missing AWB, cancellations, ERP vs marketplace status mismatch.\n"
+                "- 'get_kilat_order_diagnostics': Shopee Pesanan Kilat stuck reservations (invoice_updated=false) & duplicate collisions.\n"
+                "- 'get_product_mapping_status': Unmapped SKUs, bundle qty_multiplier, duplicate mappings, ExceptionProduct.\n"
+                "- 'get_stock_sync_simulation': Dry-run determine_stock() simulation, shared_stock_companies, vs last StockUpdateLog.\n"
+                "- 'get_sync_execution_logs': StockUpdateLog, PriceUpdateLog, and PCLS price sync failures/skips.\n"
+                "- 'get_price_comparison': ERP Pricelist/Wholesale vs marketplace listing prices.\n"
+                "- 'get_fee_and_escrow_anomalies': Negative fee, high fee %, zero expected income, ERP vs MP total mismatch.\n"
+                "- 'get_deduction_and_settlement_summary': Fee deduction breakdown by category, gross vs nett, unposted settlement journals.\n"
+                "- 'get_cashflow_and_balance_summary': Marketplace seller wallet (available vs pending escrow), snapshots, settlements/withdrawals.\n"
+                "- 'get_competitor_insights': Competitor price drops, sold velocity, and stale audits.\n\n"
                 "CRITICAL GUARDRAILS:\n"
                 "- References to specific ERP transaction document numbers (e.g., 'PC/...', 'JE/...', 'INV/...') must be routed to domain='accounting' (fetch_vendor_invoices or get_journal_entries).\n"
                 "- Customer / pelanggan inquiries targeting invoices, billing, or accounts receivable must NOT be routed to 'fetch_vendor_invoices'. Set domain='general', tool=null, planned_tools=[].\n"
                 "- Customer / pelanggan inquiries asking about inventory stock, warehouse locations, or product details must be routed to domain='inventory'.\n"
+                "- Requests to push/update marketplace stock/price or merge/process Kilat orders are write operations: set domain='out_of_scope', query_mode='out_of_scope', tool=null, planned_tools=[].\n"
                 "- Whenever domain is 'general' or 'out_of_scope', tool MUST be null and planned_tools MUST be empty."
             )
             raw_history = (state.get("messages") or [])[:-1]
@@ -1050,7 +1203,7 @@ def _router_node_impl(
                     pt_tool = pt.tool if hasattr(pt, "tool") else pt.get("tool")
                     pt_domain = pt.domain if hasattr(pt, "domain") else pt.get("domain", TOOL_DOMAIN_MAP.get(pt_tool, detected_domain))
                     pt_sub_query = (pt.sub_query if hasattr(pt, "sub_query") else pt.get("sub_query")) or user_query
-                    if pt_tool and pt_domain in ("accounting", "inventory"):
+                    if pt_tool and pt_domain in ("accounting", "inventory", "sales", "marketplace"):
                         active_tools.append({
                             "tool": pt_tool,
                             "domain": pt_domain,
@@ -1059,7 +1212,7 @@ def _router_node_impl(
                             "status": "pending",
                         })
 
-            if not active_tools and detected_tool and detected_domain in ("accounting", "inventory"):
+            if not active_tools and detected_tool and detected_domain in ("accounting", "inventory", "sales", "marketplace"):
                 active_tools.append({
                     "tool": detected_tool,
                     "domain": detected_domain,

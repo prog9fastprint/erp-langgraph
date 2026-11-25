@@ -114,6 +114,21 @@ _PAGINATED_COLLECTION_KEYS: Set[str] = {
     "alerts",
     "adjustments",
     "scraps",
+    "orders",
+    "records",
+    "mappings",
+    "exceptions",
+    "simulations",
+    "stock_logs",
+    "price_logs",
+    "pcls_logs",
+    "anomalies",
+    "by_deduction_category",
+    "by_store",
+    "cashflow_logs",
+    "competitors",
+    "log_entry_candidates",
+    "quotation_note_candidates",
 }
 
 _TOTAL_FOUND_COLLECTION_KEYS: Set[str] = {"locations", "alerts"}
@@ -153,7 +168,11 @@ def _compute_bills_calculations(bills: List[Any]) -> Dict[str, Any]:
     }
 
 
-def sanitize_erp_payload(data: Any, max_records: int = 50) -> Any:
+def sanitize_erp_payload(
+    data: Any,
+    max_records: int = 50,
+    preserve_fields: Optional[Set[str]] = None,
+) -> Any:
     """
     Recursively sanitize and prune ERP data payloads from Django Core.
 
@@ -164,6 +183,7 @@ def sanitize_erp_payload(data: Any, max_records: int = 50) -> Any:
     Args:
         data: Raw data structure (dict, list, or primitive) from ERP client.
         max_records: Maximum items allowed in large record lists (default: 50).
+        preserve_fields: Optional field names exempted from DJANGO_TECHNICAL_FIELDS stripping.
 
     Returns:
         Cleaned and pruned data structure.
@@ -171,9 +191,11 @@ def sanitize_erp_payload(data: Any, max_records: int = 50) -> Any:
     if data is None:
         return None
 
+    preserved = preserve_fields or set()
+
     if isinstance(data, list):
         sanitized_list = [
-            sanitize_erp_payload(item, max_records=max_records)
+            sanitize_erp_payload(item, max_records=max_records, preserve_fields=preserved)
             for item in data[:max_records]
             if item is not None
         ]
@@ -184,8 +206,8 @@ def sanitize_erp_payload(data: Any, max_records: int = 50) -> Any:
         pre_truncation_count: Optional[tuple[str, int]] = None
 
         for key, value in data.items():
-            # 1. Skip technical Django fields
-            if key in DJANGO_TECHNICAL_FIELDS or key.startswith("_"):
+            # 1. Skip technical Django fields unless explicitly preserved for the tool
+            if (key in DJANGO_TECHNICAL_FIELDS or key.startswith("_")) and key not in preserved:
                 continue
 
             # 2. Skip null, empty string, or whitespace-only values
@@ -206,9 +228,15 @@ def sanitize_erp_payload(data: Any, max_records: int = 50) -> Any:
 
             # 3. Recursively sanitize nested structures
             if isinstance(value, (dict, list)):
-                cleaned_val = sanitize_erp_payload(value, max_records=max_records)
+                cleaned_val = sanitize_erp_payload(value, max_records=max_records, preserve_fields=preserved)
                 # Keep calculations, summary, and explicitly track collection keys even if empty
-                if cleaned_val or key in ("calculations", "summary", "totals", "accounts", "entries", "lines", "items", "products", "bills", "breakdown", "net_balance_check"):
+                if cleaned_val or key in (
+                    "calculations", "summary", "totals", "accounts", "entries", "lines", "items",
+                    "products", "bills", "breakdown", "net_balance_check", "stock_summary", "price_summary",
+                    "orders", "records", "mappings", "exceptions", "simulations", "stock_logs", "price_logs",
+                    "pcls_logs", "anomalies", "by_deduction_category", "by_store", "cashflow_logs",
+                    "competitors", "unassigned_company_errors", "log_entry_candidates", "quotation_note_candidates",
+                ):
                     sanitized_dict[key] = cleaned_val
             else:
                 sanitized_dict[key] = value
@@ -300,10 +328,10 @@ _STRICT_DOC_ID_RE = re.compile(r"\b(?:[A-Za-z0-9_\-]+/)+\d{4}/\d+\b")
 
 
 def has_strict_document_identifier(params: Optional[Dict[str, Any]]) -> bool:
-    """Return True if params target a specific ERP document number (e.g. JE/2026/001)."""
+    """Return True if params target a specific ERP document or Kilat reservation identifier."""
     if not isinstance(params, dict):
         return False
-    if params.get("entry_number"):
+    if params.get("entry_number") or params.get("reference"):
         return True
     search_val = params.get("search")
     return bool(search_val and _STRICT_DOC_ID_RE.search(str(search_val)))
@@ -383,9 +411,44 @@ def resolve_tool_record_count(tool_result: Any) -> int:
             val = tool_result.get(count_key)
             if val is not None:
                 try:
-                    return int(val)
+                    c_int = int(val)
+                    if c_int > 0:
+                        return c_int
+                    summary_blk = tool_result.get("summary")
+                    if isinstance(summary_blk, dict) and summary_blk:
+                        if any(
+                            int(summary_blk.get(sk) or 0) > 0
+                            for sk in (
+                                "total_accounts",
+                                "total_evaluated",
+                                "total_kilat_scanned",
+                                "total_lines",
+                                "total_orders",
+                                "active_competitors",
+                            )
+                        ) or ("total_anomalies" in summary_blk and ("date_window" in tool_result or "filters" in tool_result)):
+                            return 1
+                    return 0
                 except (ValueError, TypeError):
                     pass
+        log_totals = [
+            tool_result.get(k)
+            for k in ("stock_logs_total", "price_logs_total", "pcls_logs_total", "cashflow_logs_total")
+            if tool_result.get(k) is not None
+        ]
+        if log_totals:
+            try:
+                log_sum = sum(int(v) for v in log_totals)
+                if log_sum > 0:
+                    return log_sum
+                if any(
+                    isinstance(tool_result.get(sk), dict) and int(tool_result[sk].get("total") or 0) > 0
+                    for sk in ("stock_summary", "price_summary")
+                ):
+                    return 1
+                return 0
+            except (ValueError, TypeError):
+                pass
         for list_key in (
             "entries",
             "items",
@@ -396,10 +459,23 @@ def resolve_tool_record_count(tool_result: Any) -> int:
             "lines",
             "warehouses",
             "categories",
+            "orders",
+            "mappings",
+            "exceptions",
+            "simulations",
+            "stock_logs",
+            "price_logs",
+            "pcls_logs",
+            "anomalies",
+            "by_store",
+            "cashflow_logs",
+            "competitors",
         ):
             collection = tool_result.get(list_key)
             if isinstance(collection, list):
                 return len(collection)
+        if any(isinstance(tool_result.get(k), dict) and tool_result[k] for k in ("summary", "stock_summary", "price_summary")):
+            return 1
         return 1 if tool_result else 0
     return 1
 

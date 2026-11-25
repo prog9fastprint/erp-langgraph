@@ -37,6 +37,17 @@ from app.schemas.tools import (
     SalesOrdersFilterSchema,
     SalesOrderDetailFilterSchema,
     SalesSummaryFilterSchema,
+    AccountHealthFilterSchema,
+    MarketplaceOrdersFilterSchema,
+    KilatOrderDiagnosticsFilterSchema,
+    ProductMappingStatusFilterSchema,
+    StockSyncSimulationFilterSchema,
+    SyncExecutionLogsFilterSchema,
+    PriceComparisonFilterSchema,
+    FeeAndEscrowAnomaliesFilterSchema,
+    DeductionAndSettlementSummaryFilterSchema,
+    CashflowAndBalanceSummaryFilterSchema,
+    CompetitorInsightsFilterSchema,
 )
 
 logger = logging.getLogger("django_client")
@@ -839,6 +850,175 @@ class DjangoCoreClient:
         return await self.execute_tool(
             domain="sales",
             tool_name="get_sales_summary",
+            params=_clean_params(params),
+            company_id=company_id,
+            user_token=user_token,
+        )
+
+    # ==========================================================================
+    # Marketplace Domain Helper Methods (11 Read-Only Tools)
+    # ==========================================================================
+
+    async def fetch_account_health(
+        self,
+        params: Optional[Union[AccountHealthFilterSchema, Dict[str, Any]]] = None,
+        user_token: Optional[str] = None,
+        company_id: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Call marketplace.get_account_health tool."""
+        return await self.execute_tool(
+            domain="marketplace",
+            tool_name="get_account_health",
+            params=_clean_params(params),
+            company_id=company_id,
+            user_token=user_token,
+        )
+
+    async def fetch_marketplace_orders(
+        self,
+        params: Optional[Union[MarketplaceOrdersFilterSchema, Dict[str, Any]]] = None,
+        user_token: Optional[str] = None,
+        company_id: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Call marketplace.get_marketplace_orders tool."""
+        return await self.execute_tool(
+            domain="marketplace",
+            tool_name="get_marketplace_orders",
+            params=_clean_params(params),
+            company_id=company_id,
+            user_token=user_token,
+        )
+
+    async def fetch_kilat_order_diagnostics(
+        self,
+        params: Optional[Union[KilatOrderDiagnosticsFilterSchema, Dict[str, Any]]] = None,
+        user_token: Optional[str] = None,
+        company_id: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Call marketplace.get_kilat_order_diagnostics tool."""
+        return await self.execute_tool(
+            domain="marketplace",
+            tool_name="get_kilat_order_diagnostics",
+            params=_clean_params(params),
+            company_id=company_id,
+            user_token=user_token,
+        )
+
+    async def fetch_product_mapping_status(
+        self,
+        params: Optional[Union[ProductMappingStatusFilterSchema, Dict[str, Any]]] = None,
+        user_token: Optional[str] = None,
+        company_id: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Call marketplace.get_product_mapping_status tool."""
+        return await self.execute_tool(
+            domain="marketplace",
+            tool_name="get_product_mapping_status",
+            params=_clean_params(params),
+            company_id=company_id,
+            user_token=user_token,
+        )
+
+    async def fetch_stock_sync_simulation(
+        self,
+        params: Optional[Union[StockSyncSimulationFilterSchema, Dict[str, Any]]] = None,
+        user_token: Optional[str] = None,
+        company_id: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Call marketplace.get_stock_sync_simulation tool."""
+        return await self.execute_tool(
+            domain="marketplace",
+            tool_name="get_stock_sync_simulation",
+            params=_clean_params(params),
+            company_id=company_id,
+            user_token=user_token,
+        )
+
+    async def fetch_sync_execution_logs(
+        self,
+        params: Optional[Union[SyncExecutionLogsFilterSchema, Dict[str, Any]]] = None,
+        user_token: Optional[str] = None,
+        company_id: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Call marketplace.get_sync_execution_logs tool."""
+        return await self.execute_tool(
+            domain="marketplace",
+            tool_name="get_sync_execution_logs",
+            params=_clean_params(params),
+            company_id=company_id,
+            user_token=user_token,
+        )
+
+    async def fetch_price_comparison(
+        self,
+        params: Optional[Union[PriceComparisonFilterSchema, Dict[str, Any]]] = None,
+        user_token: Optional[str] = None,
+        company_id: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Call marketplace.get_price_comparison tool."""
+        return await self.execute_tool(
+            domain="marketplace",
+            tool_name="get_price_comparison",
+            params=_clean_params(params),
+            company_id=company_id,
+            user_token=user_token,
+        )
+
+    async def fetch_fee_and_escrow_anomalies(
+        self,
+        params: Optional[Union[FeeAndEscrowAnomaliesFilterSchema, Dict[str, Any]]] = None,
+        user_token: Optional[str] = None,
+        company_id: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Call marketplace.get_fee_and_escrow_anomalies tool."""
+        return await self.execute_tool(
+            domain="marketplace",
+            tool_name="get_fee_and_escrow_anomalies",
+            params=_clean_params(params),
+            company_id=company_id,
+            user_token=user_token,
+        )
+
+    async def fetch_deduction_and_settlement_summary(
+        self,
+        params: Optional[Union[DeductionAndSettlementSummaryFilterSchema, Dict[str, Any]]] = None,
+        user_token: Optional[str] = None,
+        company_id: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Call marketplace.get_deduction_and_settlement_summary tool."""
+        return await self.execute_tool(
+            domain="marketplace",
+            tool_name="get_deduction_and_settlement_summary",
+            params=_clean_params(params),
+            company_id=company_id,
+            user_token=user_token,
+        )
+
+    async def fetch_cashflow_and_balance_summary(
+        self,
+        params: Optional[Union[CashflowAndBalanceSummaryFilterSchema, Dict[str, Any]]] = None,
+        user_token: Optional[str] = None,
+        company_id: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Call marketplace.get_cashflow_and_balance_summary tool."""
+        return await self.execute_tool(
+            domain="marketplace",
+            tool_name="get_cashflow_and_balance_summary",
+            params=_clean_params(params),
+            company_id=company_id,
+            user_token=user_token,
+        )
+
+    async def fetch_competitor_insights(
+        self,
+        params: Optional[Union[CompetitorInsightsFilterSchema, Dict[str, Any]]] = None,
+        user_token: Optional[str] = None,
+        company_id: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Call marketplace.get_competitor_insights tool."""
+        return await self.execute_tool(
+            domain="marketplace",
+            tool_name="get_competitor_insights",
             params=_clean_params(params),
             company_id=company_id,
             user_token=user_token,

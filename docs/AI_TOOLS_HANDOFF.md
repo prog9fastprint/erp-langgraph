@@ -29,10 +29,32 @@ FastPrint ERP menyediakan gateway API khusus AI (`/ai/tools/`) yang memisahkan e
 │       └── Domain Registries                  │
 │            ├── accounting                    │
 │            │    ├── get_account_balance      │
-│            │    └── get_journal_entries      │
-│            └── inventory                     │
-│                 ├── get_stock_level          │
-│                 └── get_product_info         │
+│            │    ├── get_journal_entries      │
+│            │    ├── get_general_ledger       │
+│            │    ├── get_profit_and_loss      │
+│            │    ├── get_balance_sheet        │
+│            │    ├── get_vendor_bills         │
+│            │    └── get_bank_reconciliation_summary │
+│            ├── inventory                     │
+│            │    ├── get_stock_level          │
+│            │    └── get_product_info         │
+│            ├── sales                         │
+│            │    ├── get_top_selling_products │
+│            │    ├── get_sales_orders         │
+│            │    ├── get_sales_order_detail   │
+│            │    └── get_sales_summary        │
+│            └── marketplace                   │
+│                 ├── get_account_health       │
+│                 ├── get_marketplace_orders   │
+│                 ├── get_kilat_order_diagnostics │
+│                 ├── get_product_mapping_status │
+│                 ├── get_stock_sync_simulation │
+│                 ├── get_sync_execution_logs  │
+│                 ├── get_price_comparison     │
+│                 ├── get_fee_and_escrow_anomalies │
+│                 ├── get_deduction_and_settlement_summary │
+│                 ├── get_cashflow_and_balance_summary │
+│                 └── get_competitor_insights  │
 └──────────────────────────────────────────────┘
 ```
 
@@ -328,9 +350,34 @@ Saat mengintegrasikan LLM dengan ERP ini, sertakan panduan domain berikut di Sys
    - `5xxx` = Beban Pokok Penjualan (HPP / COGS) -> Bertambah di Debit.
    - `6xxx` = Beban Operasional & Administrasi -> Bertambah di Debit.
 3. **Format Tanggal**: Selalu gunakan format tanggal ISO `YYYY-MM-DD`.
-4. **Perbedaan Stok**:
-   - `quantity`: Jumlah fisik nyata yang tersimpan di gudang.
-   - `available_quantity`: Jumlah fisik dikurangi kuantitas yang sedang di-booking/direservasi pesanan belum selesai.
+- **Perbedaan Stok**:
+  - `quantity`: Jumlah fisik nyata yang tersimpan di gudang.
+  - `available_quantity`: Jumlah fisik dikurangi kuantitas yang sedang di-booking/direservasi pesanan belum selesai.
+
+---
+
+### 6.3 Domain: Marketplace (`is_write: false`)
+
+Semua 11 tool pada domain `marketplace` bersifat read-only dan mendukung parameter opsional `company_ids: list[int]` untuk konsolidasi multi-cabang (ERP mengembalikan HTTP 403 `PERMISSION_DENIED` jika ada ID cabang di `company_ids` yang tidak diizinkan untuk user tersebut):
+
+| Tool Name | Endpoint | Fungsi Utama |
+|---|---|---|
+| `get_account_health` | `POST /ai/tools/marketplace/get_account_health/` | Cek kesiapan akun toko, token OAuth (tanpa secret), konfigurasi `AccountOrder`/`AccountProperties`, status toko, dan error fetch Celery |
+| `get_marketplace_orders` | `POST /ai/tools/marketplace/get_marketplace_orders/` | Monitoring order marketplace, SLA kirim (`overdue_shipping`, `due_soon`), resi AWB kosong, pembatalan, dan selisih status ERP vs platform |
+| `get_kilat_order_diagnostics` | `POST /ai/tools/marketplace/get_kilat_order_diagnostics/` | Diagnosa read-only Pesanan Kilat Shopee (`invoice_updated=false`), duplikat `QuotationMarketplaceModel`, dan kandidat `LogEntry` |
+| `get_product_mapping_status` | `POST /ai/tools/marketplace/get_product_mapping_status/` | Audit SKU unmapped, aturan `qty_multiplier`, duplikat mapping aktif, dan `ExceptionProduct` |
+| `get_stock_sync_simulation` | `POST /ai/tools/marketplace/get_stock_sync_simulation/` | Simulasi dry-run `determine_stock()` dengan pooling `shared_stock_companies` (masked jika cabang tidak berhak) vs `StockUpdateLog` |
+| `get_sync_execution_logs` | `POST /ai/tools/marketplace/get_sync_execution_logs/` | Log eksekusi `StockUpdateLog`, `PriceUpdateLog`, dan `InventoryUpdatePriceLog` (error ternormalisasi, header/secret ter-redaksi) |
+| `get_price_comparison` | `POST /ai/tools/marketplace/get_price_comparison/` | Perbandingan harga ERP Pricelist/Wholesale vs listing marketplace (`include_live=false` default, maks 20 SKU saat live; butuh `account_id` atau `pricelist_id`) |
+| `get_fee_and_escrow_anomalies` | `POST /ai/tools/marketplace/get_fee_and_escrow_anomalies/` | Deteksi `negative_fee`, `high_fee`, `zero_income`, dan selisih total ERP vs marketplace |
+| `get_deduction_and_settlement_summary` | `POST /ai/tools/marketplace/get_deduction_and_settlement_summary/` | Rekap potongan fee per kategori kanonik, settlement belum ter-posting ke `JournalEntry`, dan validasi selisih gross vs nett |
+| `get_cashflow_and_balance_summary` | `POST /ai/tools/marketplace/get_cashflow_and_balance_summary/` | Ringkasan `MarketplaceBalanceSnapshot`, mutasi `MarketplaceCashflowLog`, dan opsi `include_live=true` read-only untuk Shopee & TikTok Shop |
+| `get_competitor_insights` | `POST /ai/tools/marketplace/get_competitor_insights/` | Analisis penurunan harga kompetitor, velocity `delta_sold_qty`, resolusi BOM varian, dan audit stale |
+
+Kode error khusus domain `marketplace`:
+- `MISSING_PRICELIST_OR_ACCOUNT` / `MISSING_PRICELIST_ID` (saat `get_price_comparison` tidak memiliki `account_id` maupun `pricelist_id`)
+- `INVALID_COMPANY_IDS` (format `company_ids` bukan list integer)
+- `ACCOUNT_NOT_FOUND` / `PRICELIST_NOT_FOUND`
 
 ---
 

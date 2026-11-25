@@ -414,6 +414,283 @@ class SalesSummaryFilterSchema(BaseModel):
         return _validate_date_str(v, "date_to")
 
 
+class AccountHealthFilterSchema(BaseModel):
+    """Input filter schema for marketplace.get_account_health."""
+    company_id: Optional[int] = Field(None, description="Company ID")
+    company_ids: Optional[List[int]] = Field(None, description="Optional additional authorized company IDs for multi-branch summary")
+    marketplace: Optional[str] = Field(None, description="Optional platform filter (e.g. 'Shopee', 'TikTok Shop', 'Tokopedia', 'Lazada')")
+    account_id: Optional[int] = Field(None, description="Optional single MarketplaceAccount ID")
+    only_issues: bool = Field(False, description="Return only accounts with expired/expiring tokens, missing configs, inactive shops, or sync errors")
+    error_window_hours: int = Field(24, ge=1, le=168, description="Lookback window in hours (1-168) for SystemLogEvent fetch errors")
+
+
+class MarketplaceOrdersFilterSchema(BaseModel):
+    """Input filter schema for marketplace.get_marketplace_orders."""
+    company_id: Optional[int] = Field(None, description="Company ID")
+    company_ids: Optional[List[int]] = Field(None, description="Optional additional authorized company IDs")
+    marketplace: Optional[str] = Field(None, description="Optional platform filter (e.g. 'Shopee', 'TikTok Shop', 'Tokopedia', 'Lazada')")
+    account_id: Optional[int] = Field(None, description="Optional MarketplaceAccount ID")
+    mp_status: Optional[str] = Field("all", description="Status group ('processing', 'completed', 'cancelled', 'all') or exact platform status")
+    sla_status: Literal["all", "overdue_shipping", "due_soon", "missing_awb", "status_mismatch"] = Field(
+        "all", description="SLA/diagnostic filter: 'all', 'overdue_shipping', 'due_soon', 'missing_awb', 'status_mismatch'"
+    )
+    date_from: Optional[str] = Field(None, description="Optional start quotation_date (YYYY-MM-DD)")
+    date_to: Optional[str] = Field(None, description="Optional end quotation_date (YYYY-MM-DD)")
+    search: Optional[str] = Field(None, description="Search mp_invoice_number, SO number, AWB, no_reservasi, or buyer_name")
+    limit: int = Field(20, ge=1, le=100, description="Max rows (1-100)")
+    offset: int = Field(0, ge=0, description="Pagination offset")
+
+    @field_validator("date_from")
+    @classmethod
+    def validate_date_from(cls, v: Optional[str]) -> Optional[str]:
+        return _validate_date_str(v, "date_from")
+
+    @field_validator("date_to")
+    @classmethod
+    def validate_date_to(cls, v: Optional[str]) -> Optional[str]:
+        return _validate_date_str(v, "date_to")
+
+
+class KilatOrderDiagnosticsFilterSchema(BaseModel):
+    """Input filter schema for marketplace.get_kilat_order_diagnostics."""
+    company_id: Optional[int] = Field(None, description="Company ID")
+    company_ids: Optional[List[int]] = Field(None, description="Optional additional authorized company IDs")
+    account_id: Optional[int] = Field(None, description="Optional MarketplaceAccount ID")
+    reference: Optional[str] = Field(None, description="Optional reservation code, Shopee invoice, or pasted '(No. Reservasi: ...)' string")
+    issue_type: Literal["all", "unupdated_invoice", "duplicate_collision", "missing_so_link"] = Field(
+        "all", description="Filter: 'all', 'unupdated_invoice', 'duplicate_collision', or 'missing_so_link'"
+    )
+    date_from: Optional[str] = Field(None, description="Optional start quotation_date (YYYY-MM-DD)")
+    date_to: Optional[str] = Field(None, description="Optional end quotation_date (YYYY-MM-DD)")
+    limit: int = Field(20, ge=1, le=100, description="Max rows (1-100)")
+    offset: int = Field(0, ge=0, description="Pagination offset")
+
+    @field_validator("date_from")
+    @classmethod
+    def validate_date_from(cls, v: Optional[str]) -> Optional[str]:
+        return _validate_date_str(v, "date_from")
+
+    @field_validator("date_to")
+    @classmethod
+    def validate_date_to(cls, v: Optional[str]) -> Optional[str]:
+        return _validate_date_str(v, "date_to")
+
+
+class ProductMappingStatusFilterSchema(BaseModel):
+    """Input filter schema for marketplace.get_product_mapping_status."""
+    company_id: Optional[int] = Field(None, description="Company ID")
+    company_ids: Optional[List[int]] = Field(None, description="Optional additional authorized company IDs")
+    marketplace: Optional[str] = Field(None, description="Optional platform filter")
+    account_id: Optional[int] = Field(None, description="Optional MarketplaceAccount ID")
+    mapping_status: Literal[
+        "all",
+        "mapped",
+        "unmapped",
+        "unmapped_by_system",
+        "unmapped_by_user",
+        "exceptions",
+        "multipliers_only",
+        "duplicates",
+    ] = Field(
+        "all",
+        description="Filter: 'all', 'mapped', 'unmapped', 'unmapped_by_system', 'unmapped_by_user', 'exceptions', 'multipliers_only', 'duplicates'",
+    )
+    search: Optional[str] = Field(None, description="Search ERP SKU, ERP product name, marketplace SKU, or listing name")
+    include_deleted: bool = Field(False, description="Include soft-deleted mapping lines (is_delete=True)")
+    limit: int = Field(30, ge=1, le=100, description="Max rows (1-100)")
+    offset: int = Field(0, ge=0, description="Pagination offset")
+
+
+class StockSyncSimulationFilterSchema(BaseModel):
+    """Input filter schema for marketplace.get_stock_sync_simulation."""
+    company_id: Optional[int] = Field(None, description="Company ID")
+    account_id: Optional[int] = Field(None, description="Optional MarketplaceAccount ID")
+    marketplace: Optional[str] = Field(None, description="Optional platform filter (e.g. 'Shopee')")
+    company_ids: Optional[List[int]] = Field(None, description="Optional additional authorized company IDs")
+    sku: Optional[str] = Field(None, description="Optional ERP SKU or marketplace SKU filter")
+    product_id: Optional[int] = Field(None, description="Optional ProductVariant ID filter")
+    only_discrepancies: bool = Field(
+        False,
+        description="Return only items where simulated push qty differs from last StockUpdateLog or has config warnings",
+    )
+    limit: int = Field(20, ge=1, le=50, description="Max items (1-50)")
+    offset: int = Field(0, ge=0, description="Pagination offset")
+
+
+class SyncExecutionLogsFilterSchema(BaseModel):
+    """Input filter schema for marketplace.get_sync_execution_logs."""
+    company_id: Optional[int] = Field(None, description="Company ID")
+    log_type: Literal["all", "stock", "price", "pcls_price"] = Field(
+        "all", description="Log stream: 'all', 'stock', 'price', or 'pcls_price'"
+    )
+    company_ids: Optional[List[int]] = Field(None, description="Optional additional authorized company IDs")
+    account_id: Optional[int] = Field(None, description="Optional MarketplaceAccount ID")
+    marketplace: Optional[str] = Field(None, description="Optional platform filter")
+    status: Literal["FAILED", "SKIPPED", "SUCCESS", "all"] = Field(
+        "FAILED", description="Status filter: 'FAILED' (default), 'SKIPPED', 'SUCCESS', or 'all'"
+    )
+    trigger_source: Optional[str] = Field(
+        None,
+        description="Optional StockUpdateLog trigger source ('CELERY_BEAT', 'MANUAL_BULK', 'MANUAL_SELECTIVE', 'MANUAL_API', 'SYSTEM')",
+    )
+    sku: Optional[str] = Field(None, description="Optional SKU or product name keyword")
+    date_from: Optional[str] = Field(None, description="Start date (YYYY-MM-DD). Defaults to 7 days ago")
+    date_to: Optional[str] = Field(None, description="End date (YYYY-MM-DD). Defaults to today")
+    include_summary: bool = Field(True, description="Include aggregate success/failed/skipped summary")
+    limit: int = Field(20, ge=1, le=100, description="Max rows per log stream (1-100)")
+    offset: int = Field(0, ge=0, description="Pagination offset")
+
+    @field_validator("date_from")
+    @classmethod
+    def validate_date_from(cls, v: Optional[str]) -> Optional[str]:
+        return _validate_date_str(v, "date_from")
+
+    @field_validator("date_to")
+    @classmethod
+    def validate_date_to(cls, v: Optional[str]) -> Optional[str]:
+        return _validate_date_str(v, "date_to")
+
+
+class PriceComparisonFilterSchema(BaseModel):
+    """Input filter schema for marketplace.get_price_comparison."""
+    company_id: Optional[int] = Field(None, description="Company ID")
+    pricelist_id: Optional[int] = Field(None, description="ERP PricelistModel ID. Auto-resolved from account_id AccountOrder if omitted")
+    account_id: Optional[int] = Field(None, description="MarketplaceAccount ID to compare")
+    company_ids: Optional[List[int]] = Field(None, description="Optional additional authorized company IDs")
+    search: Optional[str] = Field(None, description="SKU or product name search")
+    filter_status: Literal["all", "mismatch", "match", "missing_mp_price", "missing_erp_price"] = Field(
+        "mismatch", description="Filter: 'all', 'mismatch' (default), 'match', 'missing_mp_price', 'missing_erp_price'"
+    )
+    min_diff_pct: Optional[float] = Field(None, description="Optional minimum absolute variance percentage filter")
+    include_wholesales: bool = Field(False, description="Include WholesaleMPModel / multi-qty PricelistLineModel tier rules")
+    include_live: bool = Field(False, description="Fetch live Shopee/TikTok prices for returned page (capped at 20 SKUs, read-only)")
+    limit: int = Field(20, ge=1, le=50, description="Max rows (1-50, clamped to 20 when include_live=True)")
+    offset: int = Field(0, ge=0, description="Pagination offset")
+
+    @model_validator(mode="after")
+    def clamp_live_limit(self) -> "PriceComparisonFilterSchema":
+        if self.include_live and self.limit > 20:
+            self.limit = 20
+        return self
+
+
+class FeeAndEscrowAnomaliesFilterSchema(BaseModel):
+    """Input filter schema for marketplace.get_fee_and_escrow_anomalies."""
+    company_id: Optional[int] = Field(None, description="Company ID")
+    company_ids: Optional[List[int]] = Field(None, description="Optional additional authorized company IDs")
+    marketplace: Optional[str] = Field(None, description="Optional platform filter")
+    account_id: Optional[int] = Field(None, description="Optional MarketplaceAccount ID")
+    category: Literal["all", "negative_fee", "high_fee", "zero_income", "erp_mp_mismatch"] = Field(
+        "all", description="Filter: 'all', 'negative_fee', 'high_fee', 'zero_income', or 'erp_mp_mismatch'"
+    )
+    min_pct: float = Field(20.0, description="Minimum fee % threshold for high_fee")
+    max_pct: Optional[float] = Field(None, description="Optional maximum fee % bound")
+    mp_status: Optional[str] = Field(None, description="Optional platform order status filter")
+    exclude_cancelled: bool = Field(True, description="Exclude cancelled orders (which naturally have 0 expected income)")
+    date_from: Optional[str] = Field(None, description="Start date (YYYY-MM-DD). Defaults to 30 days ago")
+    date_to: Optional[str] = Field(None, description="End date (YYYY-MM-DD). Defaults to today")
+    order_by: Literal[
+        "-fee_percentage",
+        "fee_percentage",
+        "-fee_difference",
+        "fee_difference",
+        "-mp_total",
+        "-date",
+    ] = Field("-fee_percentage", description="Sort key")
+    limit: int = Field(20, ge=1, le=100, description="Max rows (1-100)")
+    offset: int = Field(0, ge=0, description="Pagination offset")
+
+    @field_validator("date_from")
+    @classmethod
+    def validate_date_from(cls, v: Optional[str]) -> Optional[str]:
+        return _validate_date_str(v, "date_from")
+
+    @field_validator("date_to")
+    @classmethod
+    def validate_date_to(cls, v: Optional[str]) -> Optional[str]:
+        return _validate_date_str(v, "date_to")
+
+
+class DeductionAndSettlementSummaryFilterSchema(BaseModel):
+    """Input filter schema for marketplace.get_deduction_and_settlement_summary."""
+    company_id: Optional[int] = Field(None, description="Company ID")
+    company_ids: Optional[List[int]] = Field(None, description="Optional additional authorized company IDs")
+    marketplace: Optional[str] = Field(None, description="Optional platform filter")
+    account_id: Optional[int] = Field(None, description="Optional MarketplaceAccount ID")
+    date_from: Optional[str] = Field(None, description="Start date (YYYY-MM-DD). Defaults to start of current month")
+    date_to: Optional[str] = Field(None, description="End date (YYYY-MM-DD). Defaults to today")
+    date_field: Literal["received_date", "created_at", "order_date"] = Field(
+        "received_date", description="Date field to filter: 'received_date' (default), 'created_at', or 'order_date'"
+    )
+    deduction_category: Optional[str] = Field(None, description="Optional category name filter (e.g. 'Komisi Platform', 'Biaya Layanan')")
+    only_unposted_journals: bool = Field(False, description="Filter orders missing an active posted JournalEntry")
+    include_order_details: bool = Field(False, description="Include paginated settlement rows alongside executive totals")
+    limit: int = Field(20, ge=1, le=100, description="Max detail rows (1-100)")
+    offset: int = Field(0, ge=0, description="Pagination offset")
+
+    @field_validator("date_from")
+    @classmethod
+    def validate_date_from(cls, v: Optional[str]) -> Optional[str]:
+        return _validate_date_str(v, "date_from")
+
+    @field_validator("date_to")
+    @classmethod
+    def validate_date_to(cls, v: Optional[str]) -> Optional[str]:
+        return _validate_date_str(v, "date_to")
+
+
+class CashflowAndBalanceSummaryFilterSchema(BaseModel):
+    """Input filter schema for marketplace.get_cashflow_and_balance_summary."""
+    company_id: Optional[int] = Field(None, description="Company ID")
+    company_ids: Optional[List[int]] = Field(None, description="Optional additional authorized company IDs")
+    marketplace: Optional[str] = Field(None, description="Optional platform filter (e.g. 'Shopee', 'TikTok Shop')")
+    account_id: Optional[int] = Field(None, description="Optional MarketplaceAccount ID")
+    date_from: Optional[str] = Field(None, description="Start cashflow date (YYYY-MM-DD). Defaults to 30 days ago")
+    date_to: Optional[str] = Field(None, description="End cashflow date (YYYY-MM-DD). Defaults to today")
+    include_cashflow_logs: bool = Field(False, description="Include paginated SETTLEMENT/WITHDRAWAL/ADJUSTMENT log rows")
+    include_live: bool = Field(False, description="Query live Shopee/TikTok wallet balances without writing to DB snapshots")
+    limit: int = Field(30, ge=1, le=100, description="Max cashflow log rows (1-100)")
+    offset: int = Field(0, ge=0, description="Pagination offset")
+
+    @field_validator("date_from")
+    @classmethod
+    def validate_date_from(cls, v: Optional[str]) -> Optional[str]:
+        return _validate_date_str(v, "date_from")
+
+    @field_validator("date_to")
+    @classmethod
+    def validate_date_to(cls, v: Optional[str]) -> Optional[str]:
+        return _validate_date_str(v, "date_to")
+
+
+class CompetitorInsightsFilterSchema(BaseModel):
+    """Input filter schema for marketplace.get_competitor_insights."""
+    company_id: Optional[int] = Field(None, description="Company ID")
+    company_ids: Optional[List[int]] = Field(None, description="Optional additional authorized company IDs")
+    group_id: Optional[int] = Field(None, description="Optional MarketplaceCompetitorGroup ID")
+    product_id: Optional[int] = Field(None, description="Optional internal ERP ProductVariant ID")
+    sku: Optional[str] = Field(None, description="Optional internal ERP SKU")
+    marketplace: Optional[str] = Field(None, description="Optional platform filter (e.g. 'Shopee', 'TikTok Shop')")
+    date_from: Optional[str] = Field(None, description="Start inspection_date (YYYY-MM-DD). Defaults to 30 days ago")
+    date_to: Optional[str] = Field(None, description="End inspection_date (YYYY-MM-DD). Defaults to today")
+    focus: Literal["overview", "price_drops", "top_velocity", "stale_audits"] = Field(
+        "overview", description="View focus: 'overview', 'price_drops', 'top_velocity', or 'stale_audits'"
+    )
+    stale_days: int = Field(7, ge=1, le=365, description="Threshold days without audit to flag active competitors as stale")
+    limit: int = Field(20, ge=1, le=100, description="Max rows (1-100)")
+    offset: int = Field(0, ge=0, description="Pagination offset")
+
+    @field_validator("date_from")
+    @classmethod
+    def validate_date_from(cls, v: Optional[str]) -> Optional[str]:
+        return _validate_date_str(v, "date_from")
+
+    @field_validator("date_to")
+    @classmethod
+    def validate_date_to(cls, v: Optional[str]) -> Optional[str]:
+        return _validate_date_str(v, "date_to")
+
+
 class VendorInvoiceFilterSchema(BaseModel):
     """Input filter schema for vendor bills & invoices (TASK-4.2)."""
     vendor_name: Optional[str] = Field(None, description="Nama lengkap atau alias vendor / supplier (e.g. 'PT Sumber Makmur')")
@@ -977,5 +1254,16 @@ TOOL_DOMAIN_MAP: Dict[str, str] = {
     "get_sales_orders": "sales",
     "get_sales_order_detail": "sales",
     "get_sales_summary": "sales",
+    "get_account_health": "marketplace",
+    "get_marketplace_orders": "marketplace",
+    "get_kilat_order_diagnostics": "marketplace",
+    "get_product_mapping_status": "marketplace",
+    "get_stock_sync_simulation": "marketplace",
+    "get_sync_execution_logs": "marketplace",
+    "get_price_comparison": "marketplace",
+    "get_fee_and_escrow_anomalies": "marketplace",
+    "get_deduction_and_settlement_summary": "marketplace",
+    "get_cashflow_and_balance_summary": "marketplace",
+    "get_competitor_insights": "marketplace",
 }
 

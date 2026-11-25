@@ -76,7 +76,7 @@ def decide_after_router(state: AgentState) -> str:
         isinstance(tool_call, dict) and bool(tool_call.get("tool"))
         for tool_call in active_tools
     )
-    has_scalar_tool = bool(detected_tool) and detected_domain in ("accounting", "inventory")
+    has_scalar_tool = bool(detected_tool) and detected_domain in ("accounting", "inventory", "sales", "marketplace")
 
     if has_active_tools or has_scalar_tool:
         return "extractor"

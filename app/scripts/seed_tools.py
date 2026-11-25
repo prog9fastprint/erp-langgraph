@@ -28,7 +28,7 @@ async def main() -> int:
         "--domain",
         type=str,
         default=None,
-        help="Filter tools by domain (e.g. 'accounting', 'inventory', 'sales').",
+        help="Filter tools by domain (e.g. 'accounting', 'inventory', 'sales', 'marketplace').",
     )
     parser.add_argument(
         "--dry-run",

@@ -18,12 +18,197 @@ from app.core.context import (
     should_preserve_plan_on_retry,
 )
 from app.graph.state import AgentState
+from app.schemas.tools import TOOL_DOMAIN_MAP
 from app.services.django_client import (
     DjangoCoreClient,
     DjangoCoreClientError,
+    DjangoPermissionError,
 )
 
 logger = logging.getLogger("tool_node")
+
+MAX_PRICE_COMPARISON_ACCOUNTS = 5
+
+
+def _is_permission_error(err: Optional[str]) -> bool:
+    """Return True if an error message represents HTTP 403 / company access denial."""
+    if not err:
+        return False
+    err_lower = str(err).lower()
+    return any(
+        k in err_lower
+        for k in ("403", "tidak memiliki akses", "akses ditolak", "permission_denied", "permission", "unauthorized", "forbidden")
+    )
+
+
+def _match_marketplace_accounts(
+    accounts: List[Dict[str, Any]],
+    user_query: str = "",
+    marketplace_filter: Optional[str] = None,
+    require_order_config: bool = False,
+) -> List[Dict[str, Any]]:
+    """Filter active marketplace accounts by optional store name mention or platform."""
+    candidates = [
+        a for a in accounts
+        if isinstance(a, dict)
+        and a.get("account_id") is not None
+        and a.get("is_active", True)
+        and (not require_order_config or a.get("has_order_config", False))
+    ]
+    if marketplace_filter:
+        mp_low = marketplace_filter.strip().lower()
+        plat_matched = [a for a in candidates if mp_low in str(a.get("marketplace") or "").lower()]
+        if plat_matched:
+            candidates = plat_matched
+
+    q_low = (user_query or "").lower()
+    if q_low and candidates:
+        name_matched = [
+            a for a in candidates
+            if a.get("account_name") and str(a["account_name"]).strip().lower() in q_low
+        ]
+        if name_matched:
+            return name_matched
+    return candidates
+
+
+async def _resolve_and_execute_price_comparison(
+    clean_params: Dict[str, Any],
+    erp_client: DjangoCoreClient,
+    user_token: Optional[str],
+    target_company_id: Optional[int],
+    user_query: str = "",
+) -> Tuple[Any, Optional[str]]:
+    """
+    Pre-resolve account_id via get_account_health when both account_id and pricelist_id
+    are omitted on get_price_comparison, supporting single-match injection or bounded
+    multi-account fan-out across matching active accounts with AccountOrder.
+    """
+    health_params: Dict[str, Any] = {}
+    if clean_params.get("company_ids"):
+        health_params["company_ids"] = clean_params["company_ids"]
+    mp_hint = clean_params.pop("marketplace", None)
+    if not mp_hint:
+        q_low = (user_query or "").lower()
+        if "tiktok" in q_low:
+            mp_hint = "TikTok Shop"
+        elif "shopee" in q_low:
+            mp_hint = "Shopee"
+        elif "tokopedia" in q_low:
+            mp_hint = "Tokopedia"
+        elif "lazada" in q_low:
+            mp_hint = "Lazada"
+    if mp_hint:
+        health_params["marketplace"] = mp_hint
+
+    try:
+        health_res = await erp_client.fetch_account_health(
+            params=health_params,
+            user_token=user_token,
+            company_id=target_company_id,
+        )
+    except DjangoCoreClientError as err:
+        return None, str(err)
+
+    accounts = health_res.get("accounts", []) if isinstance(health_res, dict) else []
+    matched = _match_marketplace_accounts(
+        accounts,
+        user_query=user_query,
+        marketplace_filter=mp_hint,
+        require_order_config=True,
+    )
+    if not matched:
+        return (
+            None,
+            "MISSING_PRICELIST_OR_ACCOUNT: Tidak ditemukan akun marketplace aktif yang memiliki "
+            "konfigurasi AccountOrder/Pricelist. Mohon sertakan 'account_id' atau 'pricelist_id' secara spesifik.",
+        )
+
+    if len(matched) == 1:
+        single_params = dict(clean_params)
+        single_params["account_id"] = matched[0]["account_id"]
+        try:
+            res = await erp_client.fetch_price_comparison(
+                params=single_params,
+                user_token=user_token,
+                company_id=matched[0].get("company_id") or target_company_id,
+            )
+            return res, None
+        except DjangoCoreClientError as err:
+            return None, str(err)
+
+    # Bounded fan-out across matched active accounts (max 5)
+    selected = matched[:MAX_PRICE_COMPARISON_ACCOUNTS]
+
+    async def _call_acc(acc: Dict[str, Any]) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]], Optional[str]]:
+        p = dict(clean_params)
+        p["account_id"] = acc["account_id"]
+        try:
+            res = await erp_client.fetch_price_comparison(
+                params=p,
+                user_token=user_token,
+                company_id=acc.get("company_id") or target_company_id,
+            )
+            return acc, res, None
+        except DjangoCoreClientError as err:
+            return acc, None, str(err)
+
+    outcomes = await asyncio.gather(*[_call_acc(a) for a in selected])
+    successes = [(acc, res) for acc, res, err in outcomes if res is not None]
+    errors = [err for _, res, err in outcomes if err]
+
+    if not successes:
+        return None, errors[0] if errors else "MISSING_PRICELIST_ID: Tidak ada akun dengan Pricelist valid."
+
+    if len(successes) == 1:
+        return successes[0][1], None
+
+    merged_summary = {
+        "total_evaluated": 0,
+        "match_count": 0,
+        "mismatch_count": 0,
+        "missing_mp_price": 0,
+        "missing_erp_price": 0,
+    }
+    merged_items: List[Dict[str, Any]] = []
+    merged_live_errors: Dict[str, Any] = {}
+    merged_pricelists: List[Dict[str, Any]] = []
+    accounts_compared: List[Dict[str, Any]] = []
+    total_count_sum = 0
+
+    for acc, res in successes:
+        s = res.get("summary") or {}
+        for k in merged_summary:
+            merged_summary[k] += int(s.get(k) or 0)
+        total_count_sum += int(res.get("total_count") or 0)
+        merged_items.extend(res.get("items") or [])
+        if res.get("pricelist"):
+            merged_pricelists.append(res["pricelist"])
+        accounts_compared.append({
+            "account_id": acc["account_id"],
+            "account_name": acc.get("account_name"),
+            "marketplace": acc.get("marketplace"),
+        })
+        if isinstance(res.get("live_fallback_errors"), dict):
+            for ek, ev in res["live_fallback_errors"].items():
+                merged_live_errors[str(ek)] = ev
+
+    limit_val = int(clean_params.get("limit") or 20)
+    first_res = successes[0][1]
+    return {
+        "company_ids": first_res.get("company_ids") or ([target_company_id] if target_company_id else []),
+        "pricelist": first_res.get("pricelist"),
+        "pricelists": merged_pricelists,
+        "accounts_compared": accounts_compared,
+        "filter_status": first_res.get("filter_status", "mismatch"),
+        "include_live": bool(clean_params.get("include_live", False)),
+        "live_fallback_errors": merged_live_errors or None,
+        "summary": merged_summary,
+        "total_count": total_count_sum,
+        "limit": limit_val,
+        "offset": int(clean_params.get("offset") or 0),
+        "items": merged_items[:limit_val],
+    }, None
 
 
 async def _execute_single_tool(
@@ -66,10 +251,13 @@ async def _execute_single_tool(
         if "product_code" in clean_params and not clean_params.get("code"):
             clean_params["code"] = clean_params["product_code"]
 
-    # Sanitize product identifier fields across inventory and product tools
-    for k in ("code", "search", "sku", "product_code"):
+    # Sanitize product identifier fields across inventory and product/SKU tools
+    for k in ("code", "sku", "product_code"):
         if k in clean_params and isinstance(clean_params[k], str):
             clean_params[k] = clean_product_identifier(clean_params[k])
+    if "search" in clean_params and isinstance(clean_params["search"], str):
+        if tool_name in ("get_product_info", "get_stock_level", "get_stock_history", "get_product_mapping_status", "get_price_comparison"):
+            clean_params["search"] = clean_product_identifier(clean_params["search"])
     if "codes" in clean_params and isinstance(clean_params["codes"], list):
         clean_params["codes"] = [
             clean_product_identifier(c) for c in clean_params["codes"] if c and isinstance(c, str)
@@ -171,6 +359,57 @@ async def _execute_single_tool(
                 clean_params["search"] = raw_code.strip()
             clean_params.pop("code", None)
 
+    # Pre-resolve account_id for get_price_comparison when both account_id and pricelist_id are omitted
+    if tool_name == "get_price_comparison" and not clean_params.get("account_id") and not clean_params.get("pricelist_id"):
+        raw_result, pre_err = await _resolve_and_execute_price_comparison(
+            clean_params=clean_params,
+            erp_client=erp_client,
+            user_token=user_token,
+            target_company_id=target_company_id,
+            user_query=user_query,
+        )
+        if pre_err:
+            return None, pre_err
+        final_result = (
+            sanitize_erp_payload(raw_result)
+            if settings.ENABLE_PAYLOAD_SANITIZATION
+            else raw_result
+        )
+        return final_result, None
+
+    # Pre-resolve explicit store/account name hint -> account_id on other marketplace tools if needed
+    if (
+        TOOL_DOMAIN_MAP.get(tool_name) == "marketplace"
+        and tool_name != "get_account_health"
+        and not clean_params.get("account_id")
+        and user_query
+        and re.search(r"\b(?:akun|toko)\s+(?!(?:marketplace|shopee|tiktok|tokopedia|lazada|yang|mana|ini|itu)\b)[A-Za-z0-9]", user_query, re.IGNORECASE)
+    ):
+        try:
+            hp: Dict[str, Any] = {}
+            if clean_params.get("company_ids"):
+                hp["company_ids"] = clean_params["company_ids"]
+            if clean_params.get("marketplace"):
+                hp["marketplace"] = clean_params["marketplace"]
+            h_res = await erp_client.fetch_account_health(
+                params=hp,
+                user_token=user_token,
+                company_id=target_company_id,
+            )
+            h_accounts = h_res.get("accounts", []) if isinstance(h_res, dict) else []
+            q_low = user_query.lower()
+            explicit_matches = [
+                a for a in h_accounts
+                if isinstance(a, dict)
+                and a.get("account_id") is not None
+                and a.get("account_name")
+                and str(a["account_name"]).strip().lower() in q_low
+            ]
+            if len(explicit_matches) == 1:
+                clean_params["account_id"] = explicit_matches[0]["account_id"]
+        except Exception as acc_err:
+            logger.debug("Optional store-name pre-lookup skipped: %s", acc_err)
+
     handler = dispatch_map.get(tool_name)
     if not handler:
         return None, f"Tool '{tool_name}' not registered in dispatch map"
@@ -193,8 +432,9 @@ async def _execute_single_tool(
         if loc_label and not raw_result.get("location_name"):
             raw_result["location_name"] = loc_label
 
+    preserve_keys = {"is_active"} if tool_name == "get_account_health" else None
     final_result = (
-        sanitize_erp_payload(raw_result)
+        sanitize_erp_payload(raw_result, preserve_fields=preserve_keys)
         if settings.ENABLE_PAYLOAD_SANITIZATION
         else raw_result
     )
@@ -244,6 +484,17 @@ async def tool_node(
             "get_sales_orders": erp_client.fetch_sales_orders,
             "get_sales_order_detail": erp_client.fetch_sales_order_detail,
             "get_sales_summary": erp_client.fetch_sales_summary,
+            "get_account_health": erp_client.fetch_account_health,
+            "get_marketplace_orders": erp_client.fetch_marketplace_orders,
+            "get_kilat_order_diagnostics": erp_client.fetch_kilat_order_diagnostics,
+            "get_product_mapping_status": erp_client.fetch_product_mapping_status,
+            "get_stock_sync_simulation": erp_client.fetch_stock_sync_simulation,
+            "get_sync_execution_logs": erp_client.fetch_sync_execution_logs,
+            "get_price_comparison": erp_client.fetch_price_comparison,
+            "get_fee_and_escrow_anomalies": erp_client.fetch_fee_and_escrow_anomalies,
+            "get_deduction_and_settlement_summary": erp_client.fetch_deduction_and_settlement_summary,
+            "get_cashflow_and_balance_summary": erp_client.fetch_cashflow_and_balance_summary,
+            "get_competitor_insights": erp_client.fetch_competitor_insights,
         }
 
         active_tools = state.get("active_tools")
@@ -252,7 +503,7 @@ async def tool_node(
         is_multi_company = bool(state.get("is_multi_company") or len(target_company_ids) > 1)
 
         # ------------------------------------------------------------------
-        # Path MC: Multi-Company Parallel Fan-Out (Bounded Concurrency)
+        # Path MC: Multi-Company Execution
         # ------------------------------------------------------------------
         if is_multi_company and len(target_company_ids) > 1:
             tool_name = (
@@ -265,6 +516,49 @@ async def tool_node(
                 or state.get("extracted_params")
                 or {}
             )
+
+            # Marketplace tools natively accept params.company_ids in a single call;
+            # fall back to per-branch fan-out if any branch triggers HTTP 403.
+            if TOOL_DOMAIN_MAP.get(tool_name) == "marketplace":
+                primary_cid = target_company_ids[0]
+                native_params = dict(base_params)
+                native_params["company_ids"] = target_company_ids
+                native_params["company_id"] = primary_cid
+                native_res, native_err = await _execute_single_tool(
+                    tool_name=tool_name,
+                    params=native_params,
+                    erp_client=erp_client,
+                    user_token=user_token,
+                    default_company_id=primary_cid,
+                    dispatch_map=dispatch_map,
+                    user_query=state.get("user_query") or "",
+                )
+                if not native_err:
+                    return {
+                        "company_id": primary_cid,
+                        "company_ids": target_company_ids,
+                        "is_multi_company": True,
+                        "multi_company_results": {},
+                        "unauthorized_companies": [],
+                        "tool_result": native_res,
+                        "multi_tool_results": {tool_name: native_res},
+                        "multi_verification_status": {tool_name: "VALID"},
+                        "verification_status": "VALID",
+                        "error_message": None,
+                    }
+                if not _is_permission_error(native_err):
+                    return {
+                        "company_id": primary_cid,
+                        "company_ids": target_company_ids,
+                        "is_multi_company": True,
+                        "multi_company_results": {},
+                        "tool_result": None,
+                        "multi_tool_results": {tool_name: None},
+                        "verification_status": "ERROR",
+                        "error_message": native_err,
+                    }
+                # HTTP 403 fallback: strip company_ids and fan out per branch to isolate unauthorized IDs
+                base_params.pop("company_ids", None)
 
             concurrency_limit = getattr(settings, "ERP_MULTI_COMPANY_CONCURRENCY", 5)
             semaphore = asyncio.Semaphore(concurrency_limit)

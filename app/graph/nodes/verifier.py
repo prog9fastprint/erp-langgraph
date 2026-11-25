@@ -48,7 +48,25 @@ def _calculate_records_count(tool_result: Any) -> int:
 
         # Check explicit count fields
         if "total_count" in tool_result and isinstance(tool_result["total_count"], (int, float)):
-            return int(tool_result["total_count"])
+            cnt_val = int(tool_result["total_count"])
+            if cnt_val > 0:
+                return cnt_val
+            # Clean-audit check: 0 issues/mismatches/anomalies when summary scanned > 0
+            summary_blk = tool_result.get("summary")
+            if isinstance(summary_blk, dict) and summary_blk:
+                scanned_keys = (
+                    "total_accounts",
+                    "total_evaluated",
+                    "total_kilat_scanned",
+                    "total_lines",
+                    "total_orders",
+                    "active_competitors",
+                )
+                if any(int(summary_blk.get(sk) or 0) > 0 for sk in scanned_keys):
+                    return 1
+                if "total_anomalies" in summary_blk and ("date_window" in tool_result or "filters" in tool_result):
+                    return 1
+            return 0
 
         if "count" in tool_result and isinstance(tool_result["count"], (int, float)):
             return int(tool_result["count"])
@@ -56,14 +74,47 @@ def _calculate_records_count(tool_result: Any) -> int:
         if "total_products" in tool_result and isinstance(tool_result["total_products"], (int, float)):
             return int(tool_result["total_products"])
 
+        # Marketplace sync execution logs totals & summaries (get_sync_execution_logs)
+        if any(k in tool_result for k in ("stock_logs_total", "price_logs_total", "pcls_logs_total", "stock_summary", "price_summary")):
+            log_row_total = sum(
+                int(tool_result.get(k) or 0)
+                for k in ("stock_logs_total", "price_logs_total", "pcls_logs_total")
+                if isinstance(tool_result.get(k), (int, float))
+            )
+            if log_row_total > 0:
+                return log_row_total
+            for sum_k in ("stock_summary", "price_summary"):
+                s_blk = tool_result.get(sum_k)
+                if isinstance(s_blk, dict) and int(s_blk.get("total") or 0) > 0:
+                    return 1
+            return 0
+
         # Check common collection list keys
         for list_key in (
             "entries", "accounts", "products", "items", "records", "lines", "locations",
             "transfers", "history", "adjustments", "scraps", "warehouses", "categories", "alerts", "bills", "orders",
+            "mappings", "exceptions", "simulations", "stock_logs", "price_logs", "pcls_logs",
+            "anomalies", "by_store", "by_deduction_category", "cashflow_logs", "competitors",
         ):
             val = tool_result.get(list_key)
             if isinstance(val, list):
-                return len(val)
+                if len(val) > 0:
+                    return len(val)
+                # Empty list with valid non-zero scanned summary -> clean audit
+                summary_blk = tool_result.get("summary")
+                if isinstance(summary_blk, dict) and any(
+                    int(summary_blk.get(sk) or 0) > 0
+                    for sk in (
+                        "total_accounts",
+                        "total_evaluated",
+                        "total_kilat_scanned",
+                        "total_lines",
+                        "total_orders",
+                        "active_competitors",
+                    )
+                ):
+                    return 1
+                return 0
 
         # Check financial report summary or totals blocks (e.g. P&L, Balance Sheet, Bank Recon, Account Totals, Sales Summary)
         if isinstance(tool_result.get("summary"), dict) and tool_result["summary"]:
@@ -348,9 +399,33 @@ def verifier_node(state: AgentState) -> Dict[str, Any]:
         and isinstance(extracted_params, dict)
         and bool(extracted_params.get("code") or extracted_params.get("search") or extracted_params.get("product_id"))
     )
+    is_strict_marketplace_lookup = (
+        isinstance(extracted_params, dict)
+        and (
+            (tool == "get_kilat_order_diagnostics" and bool(extracted_params.get("reference")))
+            or (
+                tool in (
+                    "get_account_health",
+                    "get_marketplace_orders",
+                    "get_product_mapping_status",
+                    "get_stock_sync_simulation",
+                    "get_sync_execution_logs",
+                    "get_price_comparison",
+                    "get_fee_and_escrow_anomalies",
+                    "get_deduction_and_settlement_summary",
+                    "get_cashflow_and_balance_summary",
+                )
+                and extracted_params.get("account_id") is not None
+            )
+        )
+    )
 
-    if has_strict_document_identifier(extracted_params) or is_strict_product_search:
-        guard_type = "Strict Product Guard" if is_strict_product_search else "Strict Identifier Guard"
+    if has_strict_document_identifier(extracted_params) or is_strict_product_search or is_strict_marketplace_lookup:
+        guard_type = (
+            "Strict Product Guard"
+            if is_strict_product_search
+            else ("Strict Marketplace Guard" if is_strict_marketplace_lookup else "Strict Identifier Guard")
+        )
         logger.info(f"Specific query returned 0 records -> EMPTY ({guard_type}).")
         return {
             "verification_status": "EMPTY",

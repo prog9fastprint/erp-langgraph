@@ -36,6 +36,17 @@ from app.schemas.tools import (
     SalesOrderDetailFilterSchema,
     SalesSummaryFilterSchema,
     VendorInvoiceFilterSchema,
+    AccountHealthFilterSchema,
+    MarketplaceOrdersFilterSchema,
+    KilatOrderDiagnosticsFilterSchema,
+    ProductMappingStatusFilterSchema,
+    StockSyncSimulationFilterSchema,
+    SyncExecutionLogsFilterSchema,
+    PriceComparisonFilterSchema,
+    FeeAndEscrowAnomaliesFilterSchema,
+    DeductionAndSettlementSummaryFilterSchema,
+    CashflowAndBalanceSummaryFilterSchema,
+    CompetitorInsightsFilterSchema,
 )
 from app.services.vector_service import VectorService, vector_service as global_vector_service
 
@@ -242,6 +253,105 @@ CORE_TOOL_DEFINITIONS: List[Dict[str, Any]] = [
         "required_permission": None,
         "is_write": False,
     },
+    {
+        "tool_name": "get_account_health",
+        "domain": "marketplace",
+        "description": "Pengecekan kesehatan akun toko marketplace, masa berlaku token OAuth (expired/expiring soon tanpa membocorkan secret), status moderasi toko, kelengkapan konfigurasi AccountOrder dan AccountProperties, serta log error fetch order Celery di Shopee, TikTok Shop, Tokopedia, dan Lazada.",
+        "schema_cls": AccountHealthFilterSchema,
+        "keywords": ["kesehatan akun", "account health", "token expired", "token marketplace", "gagal fetch order", "toko marketplace", "oauth marketplace"],
+        "required_permission": None,
+        "is_write": False,
+    },
+    {
+        "tool_name": "get_marketplace_orders",
+        "domain": "marketplace",
+        "description": "Pemeriksaan order marketplace untuk monitoring batas kirim SLA (overdue_shipping, due_soon), resi AWB kosong, alasan pembatalan, dan selisih status antara Sales Order ERP dan status platform Shopee/TikTok/Tokopedia.",
+        "schema_cls": MarketplaceOrdersFilterSchema,
+        "keywords": ["order marketplace", "sla pengiriman", "overdue shipping", "belum ada resi", "missing awb", "status mismatch", "batas kirim"],
+        "required_permission": None,
+        "is_write": False,
+    },
+    {
+        "tool_name": "get_kilat_order_diagnostics",
+        "domain": "marketplace",
+        "description": "Diagnosa read-only Pesanan Kilat Shopee untuk melacak nomor reservasi yang invoice-nya belum ter-update (invoice_updated=false), deteksi duplikasi QuotationMarketplace/Draft, serta kandidat SO dari LogEntry dan catatan quotation.",
+        "schema_cls": KilatOrderDiagnosticsFilterSchema,
+        "keywords": ["pesanan kilat", "order kilat", "no reservasi", "reservasi kilat", "invoice_updated", "kilat shopee"],
+        "required_permission": None,
+        "is_write": False,
+    },
+    {
+        "tool_name": "get_product_mapping_status",
+        "domain": "marketplace",
+        "description": "Audit status mapping produk marketplace ke master ERP, daftar SKU yang belum ter-mapping (unmapped), aturan kelipatan paket (qty_multiplier), duplikat mapping aktif, dan daftar pengecualian ExceptionProduct.",
+        "schema_cls": ProductMappingStatusFilterSchema,
+        "keywords": ["mapping produk", "unmapped sku", "belum mapping", "qty_multiplier", "exception product", "duplikat mapping"],
+        "required_permission": None,
+        "is_write": False,
+    },
+    {
+        "tool_name": "get_stock_sync_simulation",
+        "domain": "marketplace",
+        "description": "Simulasi dry-run perhitungan stok sinkronisasi marketplace (Onhand, Forecast, Split Onhand, Split Forecast, Forecast Sales) beserta pooling shared_stock_companies, konversi qty_multiplier, dan perbandingan dengan StockUpdateLog terakhir.",
+        "schema_cls": StockSyncSimulationFilterSchema,
+        "keywords": ["simulasi stok", "push stok", "determine stock", "shared stock", "selisih stok marketplace", "stock sync"],
+        "required_permission": None,
+        "is_write": False,
+    },
+    {
+        "tool_name": "get_sync_execution_logs",
+        "domain": "marketplace",
+        "description": "Inspeksi log eksekusi update stok (StockUpdateLog), update harga (PriceUpdateLog), dan harga PCLS (InventoryUpdatePriceLog) termasuk status gagal/skip, trigger Celery Beat vs manual, serta kode error marketplace yang sudah dinormalisasi.",
+        "schema_cls": SyncExecutionLogsFilterSchema,
+        "keywords": ["log update stok", "log update harga", "sync log", "celery gagal", "priceupdatelog", "stockupdatelog", "pcls price"],
+        "required_permission": None,
+        "is_write": False,
+    },
+    {
+        "tool_name": "get_price_comparison",
+        "domain": "marketplace",
+        "description": "Perbandingan harga jual ERP Pricelist dan tier grosir WholesaleMP terhadap harga listing di Shopee, TikTok Shop, dan Tokopedia untuk mendeteksi selisih margin atau SKU tanpa harga, dengan opsi live read-only maksimal 20 SKU.",
+        "schema_cls": PriceComparisonFilterSchema,
+        "keywords": ["perbandingan harga", "bandingkan harga", "selisih harga", "pricelist marketplace", "harga shopee vs erp", "wholesale mp"],
+        "required_permission": None,
+        "is_write": False,
+    },
+    {
+        "tool_name": "get_fee_and_escrow_anomalies",
+        "domain": "marketplace",
+        "description": "Deteksi anomali potongan fee dan escrow pada order marketplace: negative_fee, high_fee di atas persentase ambang batas, zero_income saat mp_total positif, dan erp_mp_mismatch antara total SO ERP dan mp_total.",
+        "schema_cls": FeeAndEscrowAnomaliesFilterSchema,
+        "keywords": ["anomali fee", "anomali potongan", "high fee", "negative fee", "zero income", "escrow anomaly", "potongan di atas"],
+        "required_permission": None,
+        "is_write": False,
+    },
+    {
+        "tool_name": "get_deduction_and_settlement_summary",
+        "domain": "marketplace",
+        "description": "Rekapitulasi pendapatan kotor (gross), potongan biaya marketplace per kategori kanonik (Komisi Platform, Biaya Layanan, Ongkir, Voucher Penjual, Pajak), pendapatan bersih (nett), settlement belum ter-posting ke jurnal, dan validasi aritmatika.",
+        "schema_cls": DeductionAndSettlementSummaryFilterSchema,
+        "keywords": ["potongan fee", "rekap deduction", "komisi marketplace", "settlement belum posting", "unposted journal", "revenue history"],
+        "required_permission": None,
+        "is_write": False,
+    },
+    {
+        "tool_name": "get_cashflow_and_balance_summary",
+        "domain": "marketplace",
+        "description": "Ringkasan saldo dompet seller marketplace (available_balance vs pending_balance escrow), kesegaran snapshot saldo, mutasi kas masuk settlement dan penarikan dana withdrawal (MarketplaceCashflowLog), dengan opsi pengecekan live read-only.",
+        "schema_cls": CashflowAndBalanceSummaryFilterSchema,
+        "keywords": ["saldo dompet", "pending escrow", "wallet balance", "withdrawal marketplace", "cashflow marketplace", "balance snapshot"],
+        "required_permission": None,
+        "is_write": False,
+    },
+    {
+        "tool_name": "get_competitor_insights",
+        "domain": "marketplace",
+        "description": "Analisis pergerakan harga kompetitor, kecepatan penjualan (delta_sold_qty velocity), penurunan harga kompetitor, resolusi BOM varian produk, serta daftar kompetitor yang audit hariannya sudah usang (stale).",
+        "schema_cls": CompetitorInsightsFilterSchema,
+        "keywords": ["kompetitor", "competitor", "pesaing", "penurunan harga kompetitor", "velocity kompetitor", "audit stale"],
+        "required_permission": None,
+        "is_write": False,
+    },
 ]
 
 
@@ -429,7 +539,7 @@ class ToolRegistryService:
 
         Args:
             query: User input query text.
-            domain: Optional ERP domain filter ('accounting', 'inventory', 'sales').
+            domain: Optional ERP domain filter ('accounting', 'inventory', 'sales', 'marketplace').
             user_roles: Optional list of user roles/permissions.
             top_k: Maximum candidate tools to return (defaults to settings.TOOL_RETRIEVAL_TOP_K).
             distance_threshold: Maximum cosine distance cutoff (defaults to settings.TOOL_RETRIEVAL_DISTANCE_THRESHOLD).
