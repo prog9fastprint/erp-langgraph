@@ -39,6 +39,7 @@ jobs:
     name: Deploy to VPS
     needs: lint-and-test
     runs-on: ubuntu-latest
+    environment: CI_CD
     if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main'
     steps:
       - name: Execute Remote SSH Commands
