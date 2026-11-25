@@ -22,14 +22,32 @@ class ToolCallPlan(TypedDict, total=False):
         tool: Specific ERP tool name (e.g., 'get_stock_level', 'get_account_balance').
         domain: ERP domain classification ('inventory', 'accounting', etc.).
         sub_query: Focused user query fragment for this subagent execution.
+        question_index: Zero-based index of the decomposed user sub-question.
+        question_text: Original sub-question text for aligned multi-question synthesis.
         params: Extracted and validated parameter dictionary for the tool schema.
+        company_id: Optional per-plan target ERP company ID.
+        company_ids: Optional per-plan list of target company IDs (multi-company plan).
+        is_multi_company: Optional flag indicating this plan spans multiple companies.
+        multi_company_results: Optional per-company execution payloads for this plan.
+        unauthorized_companies: Optional list of company IDs returning HTTP 403 for this plan.
         status: Execution lifecycle state ('pending', 'success', 'error').
+        result: Cached/executed tool payload for this plan.
+        error: Error message if this plan failed execution.
     """
     tool: str
     domain: str
     sub_query: Optional[str]
+    question_index: Optional[int]
+    question_text: Optional[str]
     params: Optional[Dict[str, Any]]
+    company_id: Optional[int]
+    company_ids: Optional[List[int]]
+    is_multi_company: Optional[bool]
+    multi_company_results: Optional[Dict[int, Any]]
+    unauthorized_companies: Optional[List[int]]
     status: Optional[str]
+    result: Optional[Any]
+    error: Optional[str]
 
 
 class AgentState(TypedDict, total=False):
@@ -90,8 +108,14 @@ class AgentState(TypedDict, total=False):
     # 8. RAG Knowledge & Retrieval Context
     query_mode: Optional[QueryMode]
     rag_query: Optional[str]
+    rag_queries: Optional[List[str]]
     rag_context: Optional[List[Dict[str, Any]]]
     rag_sources: Optional[List[str]]
+    rag_results_by_query: Optional[List[Dict[str, Any]]]
+
+    # 9. Multi-Question Decomposition & Non-Tool Responses
+    sub_questions: Optional[List[str]]
+    non_tool_questions: Optional[List[Dict[str, Any]]]
 
 
 def create_initial_state(
@@ -158,8 +182,12 @@ def create_initial_state(
         "conversation_summary": None,
         "query_mode": "live_erp",
         "rag_query": None,
+        "rag_queries": [],
         "rag_context": None,
         "rag_sources": None,
+        "rag_results_by_query": [],
+        "sub_questions": [],
+        "non_tool_questions": [],
         # Multi-tool orchestration state extensions
         "is_multi_tool": is_multi_tool if is_multi_tool is not None else False,
         "active_model": active_model or get_default_model_name(),

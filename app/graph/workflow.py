@@ -8,6 +8,7 @@ import atexit
 import asyncio
 from collections import OrderedDict
 import concurrent.futures
+import contextlib
 import logging
 import re
 import threading
@@ -63,16 +64,19 @@ def decide_after_router(state: AgentState) -> str:
     detected_tool = state.get("detected_tool")
     detected_domain = state.get("detected_domain")
     active_tools = state.get("active_tools") or []
+    rag_queries = state.get("rag_queries") or []
+    sub_questions = state.get("sub_questions") or []
+    non_tool_questions = state.get("non_tool_questions") or []
 
-    # 1. Vector RAG route for SOPs, specs, and qualitative knowledge
-    if query_mode == "vector_rag" or detected_domain == "knowledge":
-        return "rag_node"
-
-    # 2. Guardrail: general & out_of_scope inquiries NEVER invoke tool extraction
-    if detected_domain in ("general", "out_of_scope"):
+    # 1. Pure single-question guardrail: general & out_of_scope inquiries NEVER invoke tool extraction
+    if (
+        detected_domain in ("general", "out_of_scope")
+        and not non_tool_questions
+        and len(sub_questions) <= 1
+    ):
         return "synthesizer"
 
-    # 3. Active ERP tools check (supporting multi-tool active_tools & scalar detected_tool)
+    # 2. Active ERP tools check (handles single-tool, multi-tool, and mixed ERP + non-tool prompts)
     has_active_tools = any(
         isinstance(tool_call, dict) and bool(tool_call.get("tool"))
         for tool_call in active_tools
@@ -81,6 +85,10 @@ def decide_after_router(state: AgentState) -> str:
 
     if has_active_tools or has_scalar_tool:
         return "extractor"
+
+    # 3. Vector RAG route for SOPs, specs, and qualitative knowledge (including multi-RAG)
+    if query_mode == "vector_rag" or detected_domain == "knowledge" or bool(rag_queries):
+        return "rag_node"
 
     return "synthesizer"
 
@@ -503,6 +511,34 @@ async def _prepare_workflow_execution(
     return active_graph, config, initial_state, is_ephemeral, effective_thread_id
 
 
+_THREAD_LOCKS_BY_LOOP: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, Dict[str, asyncio.Lock]]" = (
+    weakref.WeakKeyDictionary()
+)
+_THREAD_LOCKS_GUARD = threading.Lock()
+
+
+def _get_thread_lock(thread_id: str) -> asyncio.Lock:
+    """Return a loop-scoped asyncio.Lock for serializing concurrent turns on the same thread_id."""
+    loop = asyncio.get_running_loop()
+    with _THREAD_LOCKS_GUARD:
+        loop_locks = _THREAD_LOCKS_BY_LOOP.get(loop)
+        if loop_locks is None:
+            loop_locks = {}
+            _THREAD_LOCKS_BY_LOOP[loop] = loop_locks
+        lock = loop_locks.get(thread_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            loop_locks[thread_id] = lock
+        return lock
+
+
+def _resolve_thread_lock_ctx(thread_id: Optional[str]):
+    """Return an async lock context manager for explicit non-empty thread_ids, else nullcontext."""
+    if isinstance(thread_id, str) and thread_id.strip():
+        return _get_thread_lock(thread_id.strip())
+    return contextlib.nullcontext()
+
+
 async def arun_workflow(
     user_query: str,
     user_token: Optional[str] = None,
@@ -536,35 +572,36 @@ async def arun_workflow(
     Returns:
         Final resulting AgentState dictionary.
     """
-    active_graph, config, initial_state, is_ephemeral, effective_thread_id = (
-        await _prepare_workflow_execution(
-            user_query=user_query,
-            user_token=user_token,
-            company_id=company_id,
-            company_ids=company_ids,
-            thread_id=thread_id,
-            graph=graph,
-            history=history,
-            company_id_explicit=company_id_explicit,
-            auth_token=auth_token,
-            user_id=user_id,
-            user_roles=user_roles,
-            **kwargs,
-        )
-    )
-
-    try:
-        final_state = await active_graph.ainvoke(initial_state, config=config)
-        return final_state
-    finally:
-        if is_ephemeral:
-            _cleanup_ephemeral_thread(active_graph, effective_thread_id)
-        else:
-            _enforce_checkpoint_lru_bound(
-                active_graph,
-                effective_thread_id,
-                max_threads=settings.MAX_CHECKPOINT_THREADS,
+    async with _resolve_thread_lock_ctx(thread_id):
+        active_graph, config, initial_state, is_ephemeral, effective_thread_id = (
+            await _prepare_workflow_execution(
+                user_query=user_query,
+                user_token=user_token,
+                company_id=company_id,
+                company_ids=company_ids,
+                thread_id=thread_id,
+                graph=graph,
+                history=history,
+                company_id_explicit=company_id_explicit,
+                auth_token=auth_token,
+                user_id=user_id,
+                user_roles=user_roles,
+                **kwargs,
             )
+        )
+
+        try:
+            final_state = await active_graph.ainvoke(initial_state, config=config)
+            return final_state
+        finally:
+            if is_ephemeral:
+                _cleanup_ephemeral_thread(active_graph, effective_thread_id)
+            else:
+                _enforce_checkpoint_lru_bound(
+                    active_graph,
+                    effective_thread_id,
+                    max_threads=settings.MAX_CHECKPOINT_THREADS,
+                )
 
 
 async def astream_workflow_steps(
@@ -585,39 +622,40 @@ async def astream_workflow_steps(
     Asynchronously stream individual node completion events from the workflow StateGraph.
     Yields tuples of (node_name, node_update_dict, accumulated_state_dict).
     """
-    active_graph, config, initial_state, is_ephemeral, effective_thread_id = (
-        await _prepare_workflow_execution(
-            user_query=user_query,
-            user_token=user_token,
-            company_id=company_id,
-            company_ids=company_ids,
-            thread_id=thread_id,
-            graph=graph,
-            history=history,
-            company_id_explicit=company_id_explicit,
-            auth_token=auth_token,
-            user_id=user_id,
-            user_roles=user_roles,
-            **kwargs,
-        )
-    )
-    accumulated_state = dict(initial_state)
-
-    try:
-        async for chunk in active_graph.astream(initial_state, config=config, stream_mode="updates"):
-            for node_name, update in chunk.items():
-                if isinstance(update, dict):
-                    accumulated_state.update(update)
-                yield (node_name, update, accumulated_state)
-    finally:
-        if is_ephemeral:
-            _cleanup_ephemeral_thread(active_graph, effective_thread_id)
-        else:
-            _enforce_checkpoint_lru_bound(
-                active_graph,
-                effective_thread_id,
-                max_threads=settings.MAX_CHECKPOINT_THREADS,
+    async with _resolve_thread_lock_ctx(thread_id):
+        active_graph, config, initial_state, is_ephemeral, effective_thread_id = (
+            await _prepare_workflow_execution(
+                user_query=user_query,
+                user_token=user_token,
+                company_id=company_id,
+                company_ids=company_ids,
+                thread_id=thread_id,
+                graph=graph,
+                history=history,
+                company_id_explicit=company_id_explicit,
+                auth_token=auth_token,
+                user_id=user_id,
+                user_roles=user_roles,
+                **kwargs,
             )
+        )
+        accumulated_state = dict(initial_state)
+
+        try:
+            async for chunk in active_graph.astream(initial_state, config=config, stream_mode="updates"):
+                for node_name, update in chunk.items():
+                    if isinstance(update, dict):
+                        accumulated_state.update(update)
+                    yield (node_name, update, accumulated_state)
+        finally:
+            if is_ephemeral:
+                _cleanup_ephemeral_thread(active_graph, effective_thread_id)
+            else:
+                _enforce_checkpoint_lru_bound(
+                    active_graph,
+                    effective_thread_id,
+                    max_threads=settings.MAX_CHECKPOINT_THREADS,
+                )
 
 
 async def astream_workflow_events(
@@ -772,163 +810,164 @@ async def astream_workflow_events(
         return
 
     # Native True Streaming via LangGraph astream_events (version="v2")
-    active_graph, config, initial_state, is_ephemeral, effective_thread_id = (
-        await _prepare_workflow_execution(
-            user_query=user_query,
-            user_token=user_token,
-            company_id=company_id,
-            company_ids=company_ids,
-            thread_id=thread_id,
-            graph=graph,
-            history=history,
-            company_id_explicit=company_id_explicit,
-            auth_token=auth_token,
-            user_id=user_id,
-            user_roles=user_roles,
-            **kwargs,
+    async with _resolve_thread_lock_ctx(thread_id):
+        active_graph, config, initial_state, is_ephemeral, effective_thread_id = (
+            await _prepare_workflow_execution(
+                user_query=user_query,
+                user_token=user_token,
+                company_id=company_id,
+                company_ids=company_ids,
+                thread_id=thread_id,
+                graph=graph,
+                history=history,
+                company_id_explicit=company_id_explicit,
+                auth_token=auth_token,
+                user_id=user_id,
+                user_roles=user_roles,
+                **kwargs,
+            )
         )
-    )
-    accumulated_state = dict(initial_state)
-    streamed_tokens: List[str] = []
+        accumulated_state = dict(initial_state)
+        streamed_tokens: List[str] = []
 
-    try:
-        async for ev in active_graph.astream_events(initial_state, config=config, version="v2"):
-            kind = ev.get("event")
-            name = ev.get("name")
-            meta = ev.get("metadata") or {}
-            lg_node = meta.get("langgraph_node")
-            node_elapsed_ms = round((time.perf_counter() - started_at) * 1000.0, 2)
-            curr_model = accumulated_state.get("active_model") or active_model
+        try:
+            async for ev in active_graph.astream_events(initial_state, config=config, version="v2"):
+                kind = ev.get("event")
+                name = ev.get("name")
+                meta = ev.get("metadata") or {}
+                lg_node = meta.get("langgraph_node")
+                node_elapsed_ms = round((time.perf_counter() - started_at) * 1000.0, 2)
+                curr_model = accumulated_state.get("active_model") or active_model
 
-            # 1. Capture custom token event (instant deterministic ERP table from asynthesizer_node)
-            if kind == "on_custom_event" and name == "token":
-                c = (ev.get("data") or {}).get("content", "")
-                if c:
-                    streamed_tokens.append(c)
-                    yield ("token", {"content": c})
-                    if token_delay_sec > 0:
-                        await asyncio.sleep(token_delay_sec)
-                continue
-
-            # 2. Capture live LLM token stream
-            if kind == "on_chat_model_stream" and lg_node == "synthesizer":
-                chunk = (ev.get("data") or {}).get("chunk")
-                c = getattr(chunk, "content", "") if chunk else ""
-                if c:
-                    streamed_tokens.append(c)
-                    yield ("token", {"content": c})
-                    if token_delay_sec > 0:
-                        await asyncio.sleep(token_delay_sec)
-                continue
-
-            # 3. Capture node completion
-            if kind == "on_chain_end" and lg_node and lg_node == name:
-                node_output = (ev.get("data") or {}).get("output")
-                if isinstance(node_output, dict):
-                    accumulated_state.update(node_output)
-                    curr_model = accumulated_state.get("active_model") or active_model
-
-                if lg_node == "extractor":
-                    yield ("step", {
-                        "node": "extractor",
-                        "status": "completed",
-                        "elapsed_ms": node_elapsed_ms,
-                        "model": curr_model,
-                    })
-                    active_tools = accumulated_state.get("active_tools") or []
-                    det_tool = accumulated_state.get("detected_tool")
-                    det_params = accumulated_state.get("extracted_params") or {}
-                    pending_tool_starts.clear()
-                    if active_tools and len(active_tools) > 1:
-                        for t in active_tools:
-                            t_name = t.get("tool")
-                            t_params = sanitize_tool_params(t.get("params") or {})
-                            if t_name:
-                                pending_tool_starts.append(t_name)
-                                yield ("tool_start", {"tool": t_name, "input": t_params})
-                    elif det_tool:
-                        pending_tool_starts.append(det_tool)
-                        yield ("tool_start", {"tool": det_tool, "input": sanitize_tool_params(det_params)})
-                    tool_started_at = time.perf_counter()
+                # 1. Capture custom token event (instant deterministic ERP table from asynthesizer_node)
+                if kind == "on_custom_event" and name == "token":
+                    c = (ev.get("data") or {}).get("content", "")
+                    if c:
+                        streamed_tokens.append(c)
+                        yield ("token", {"content": c})
+                        if token_delay_sec > 0:
+                            await asyncio.sleep(token_delay_sec)
                     continue
 
-                if lg_node == "tool_node":
-                    tool_elapsed_ms = round((time.perf_counter() - tool_started_at) * 1000.0, 2)
-                    is_error = accumulated_state.get("verification_status") == "ERROR"
-                    status_str = "error" if is_error else "success"
-                    active_tools = accumulated_state.get("active_tools") or []
-                    det_tool = accumulated_state.get("detected_tool")
-                    m_results = accumulated_state.get("multi_tool_results") or {}
+                # 2. Capture live LLM token stream
+                if kind == "on_chat_model_stream" and lg_node == "synthesizer":
+                    chunk = (ev.get("data") or {}).get("chunk")
+                    c = getattr(chunk, "content", "") if chunk else ""
+                    if c:
+                        streamed_tokens.append(c)
+                        yield ("token", {"content": c})
+                        if token_delay_sec > 0:
+                            await asyncio.sleep(token_delay_sec)
+                    continue
 
-                    if pending_tool_starts:
-                        for t_name in pending_tool_starts:
-                            t_res = m_results.get(t_name) if m_results else accumulated_state.get("tool_result")
+                # 3. Capture node completion
+                if kind == "on_chain_end" and lg_node and lg_node == name:
+                    node_output = (ev.get("data") or {}).get("output")
+                    if isinstance(node_output, dict):
+                        accumulated_state.update(node_output)
+                        curr_model = accumulated_state.get("active_model") or active_model
+
+                    if lg_node == "extractor":
+                        yield ("step", {
+                            "node": "extractor",
+                            "status": "completed",
+                            "elapsed_ms": node_elapsed_ms,
+                            "model": curr_model,
+                        })
+                        active_tools = accumulated_state.get("active_tools") or []
+                        det_tool = accumulated_state.get("detected_tool")
+                        det_params = accumulated_state.get("extracted_params") or {}
+                        pending_tool_starts.clear()
+                        if active_tools and len(active_tools) > 1:
+                            for t in active_tools:
+                                t_name = t.get("tool")
+                                t_params = sanitize_tool_params(t.get("params") or {})
+                                if t_name:
+                                    pending_tool_starts.append(t_name)
+                                    yield ("tool_start", {"tool": t_name, "input": t_params})
+                        elif det_tool:
+                            pending_tool_starts.append(det_tool)
+                            yield ("tool_start", {"tool": det_tool, "input": sanitize_tool_params(det_params)})
+                        tool_started_at = time.perf_counter()
+                        continue
+
+                    if lg_node == "tool_node":
+                        tool_elapsed_ms = round((time.perf_counter() - tool_started_at) * 1000.0, 2)
+                        is_error = accumulated_state.get("verification_status") == "ERROR"
+                        status_str = "error" if is_error else "success"
+                        active_tools = accumulated_state.get("active_tools") or []
+                        det_tool = accumulated_state.get("detected_tool")
+                        m_results = accumulated_state.get("multi_tool_results") or {}
+
+                        if pending_tool_starts:
+                            for t_name in pending_tool_starts:
+                                t_res = m_results.get(t_name) if m_results else accumulated_state.get("tool_result")
+                                rec_count = resolve_tool_record_count(t_res)
+                                yield ("tool_end", {
+                                    "tool": t_name,
+                                    "status": status_str,
+                                    "elapsed_ms": tool_elapsed_ms,
+                                    "records_found": rec_count,
+                                })
+                            pending_tool_starts.clear()
+                        elif det_tool:
+                            t_res = accumulated_state.get("tool_result")
                             rec_count = resolve_tool_record_count(t_res)
                             yield ("tool_end", {
-                                "tool": t_name,
+                                "tool": det_tool,
                                 "status": status_str,
                                 "elapsed_ms": tool_elapsed_ms,
                                 "records_found": rec_count,
                             })
-                        pending_tool_starts.clear()
-                    elif det_tool:
-                        t_res = accumulated_state.get("tool_result")
-                        rec_count = resolve_tool_record_count(t_res)
-                        yield ("tool_end", {
-                            "tool": det_tool,
-                            "status": status_str,
-                            "elapsed_ms": tool_elapsed_ms,
-                            "records_found": rec_count,
+
+                        yield ("step", {
+                            "node": "tool_node",
+                            "status": "completed",
+                            "elapsed_ms": node_elapsed_ms,
+                            "model": curr_model,
                         })
+                        continue
 
+                    if lg_node == "synthesizer":
+                        final_ans = accumulated_state.get("final_answer", "")
+                        if final_ans and not streamed_tokens:
+                            chunks = chunk_text_for_streaming(final_ans)
+                            for c in chunks:
+                                streamed_tokens.append(c)
+                                yield ("token", {"content": c})
+                                if token_delay_sec > 0:
+                                    await asyncio.sleep(token_delay_sec)
+
+                        yield ("step", {
+                            "node": "synthesizer",
+                            "status": "completed",
+                            "elapsed_ms": node_elapsed_ms,
+                            "model": curr_model,
+                        })
+                        continue
+
+                    # General step for other nodes (summarizer, router, verifier, rag_node)
                     yield ("step", {
-                        "node": "tool_node",
+                        "node": lg_node,
                         "status": "completed",
                         "elapsed_ms": node_elapsed_ms,
                         "model": curr_model,
                     })
-                    continue
 
-                if lg_node == "synthesizer":
-                    final_ans = accumulated_state.get("final_answer", "")
-                    if final_ans and not streamed_tokens:
-                        chunks = chunk_text_for_streaming(final_ans)
-                        for c in chunks:
-                            streamed_tokens.append(c)
-                            yield ("token", {"content": c})
-                            if token_delay_sec > 0:
-                                await asyncio.sleep(token_delay_sec)
-
-                    yield ("step", {
-                        "node": "synthesizer",
-                        "status": "completed",
-                        "elapsed_ms": node_elapsed_ms,
-                        "model": curr_model,
-                    })
-                    continue
-
-                # General step for other nodes (summarizer, router, verifier, rag_node)
-                yield ("step", {
-                    "node": lg_node,
-                    "status": "completed",
-                    "elapsed_ms": node_elapsed_ms,
-                    "model": curr_model,
-                })
-
-        yield ("complete", accumulated_state)
-    except Exception as exc:
-        logger.exception("Error in astream_workflow_events (v2): %s", exc)
-        yield ("error", {"detail": str(exc)})
-        raise
-    finally:
-        if is_ephemeral:
-            _cleanup_ephemeral_thread(active_graph, effective_thread_id)
-        else:
-            _enforce_checkpoint_lru_bound(
-                active_graph,
-                effective_thread_id,
-                max_threads=settings.MAX_CHECKPOINT_THREADS,
-            )
+            yield ("complete", accumulated_state)
+        except Exception as exc:
+            logger.exception("Error in astream_workflow_events (v2): %s", exc)
+            yield ("error", {"detail": str(exc)})
+            raise
+        finally:
+            if is_ephemeral:
+                _cleanup_ephemeral_thread(active_graph, effective_thread_id)
+            else:
+                _enforce_checkpoint_lru_bound(
+                    active_graph,
+                    effective_thread_id,
+                    max_threads=settings.MAX_CHECKPOINT_THREADS,
+                )
 
 
 _WORKFLOW_EXECUTOR: Optional[concurrent.futures.ThreadPoolExecutor] = None

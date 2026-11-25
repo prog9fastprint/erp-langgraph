@@ -503,6 +503,122 @@ async def _execute_single_tool(
     return final_result, None
 
 
+async def _execute_tool_multi_company(
+    tool_name: str,
+    base_params: Dict[str, Any],
+    target_company_ids: List[int],
+    erp_client: DjangoCoreClient,
+    user_token: Optional[str],
+    dispatch_map: Dict[str, Any],
+    user_query: str = "",
+    default_company_id: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Execute one ERP tool across multiple companies (native company_ids or per-branch fan-out)."""
+    params_copy = dict(base_params or {})
+    supports_native_mc = (
+        TOOL_DOMAIN_MAP.get(tool_name) == "marketplace"
+        or tool_name in ("get_contacts", "get_sales_orders")
+    )
+    if supports_native_mc:
+        primary_cid = target_company_ids[0]
+        native_params = dict(params_copy)
+        native_params["company_ids"] = target_company_ids
+        native_params["company_id"] = primary_cid
+        native_res, native_err = await _execute_single_tool(
+            tool_name=tool_name,
+            params=native_params,
+            erp_client=erp_client,
+            user_token=user_token,
+            default_company_id=primary_cid,
+            dispatch_map=dispatch_map,
+            user_query=user_query,
+        )
+        if not native_err:
+            return {
+                "company_id": primary_cid,
+                "company_ids": target_company_ids,
+                "is_multi_company": True,
+                "multi_company_results": {},
+                "unauthorized_companies": [],
+                "tool_result": native_res,
+                "verification_status": "VALID",
+                "error_message": None,
+            }
+        if not _is_permission_error(native_err):
+            return {
+                "company_id": primary_cid,
+                "company_ids": target_company_ids,
+                "is_multi_company": True,
+                "multi_company_results": {},
+                "unauthorized_companies": [],
+                "tool_result": None,
+                "verification_status": "ERROR",
+                "error_message": native_err,
+            }
+        # HTTP 403 fallback: strip company_ids and fan out per branch to isolate unauthorized IDs
+        params_copy.pop("company_ids", None)
+
+    concurrency_limit = getattr(settings, "ERP_MULTI_COMPANY_CONCURRENCY", 5)
+    semaphore = asyncio.Semaphore(concurrency_limit)
+    multi_company_results: Dict[int, Any] = {}
+    unauthorized_companies: List[int] = []
+    errors: List[str] = []
+
+    async def _fetch_company_tool(cid: int):
+        params_for_cid = dict(params_copy)
+        params_for_cid["company_id"] = cid
+        async with semaphore:
+            try:
+                res, err = await _execute_single_tool(
+                    tool_name=tool_name,
+                    params=params_for_cid,
+                    erp_client=erp_client,
+                    user_token=user_token,
+                    default_company_id=cid,
+                    dispatch_map=dispatch_map,
+                    user_query=user_query,
+                    allow_empty_stock_params=True,
+                )
+                if err:
+                    err_lower = str(err).lower()
+                    if any(k in err_lower for k in ("403", "tidak memiliki akses", "akses ditolak", "permission", "unauthorized")):
+                        unauthorized_companies.append(cid)
+                        multi_company_results[cid] = None
+                    else:
+                        errors.append(f"Company {cid}: {err}")
+                        multi_company_results[cid] = None
+                else:
+                    multi_company_results[cid] = res
+            except Exception as exc:
+                exc_str = str(exc)
+                exc_lower = exc_str.lower()
+                if any(k in exc_lower for k in ("403", "tidak memiliki akses", "akses ditolak", "permission", "unauthorized")):
+                    unauthorized_companies.append(cid)
+                else:
+                    errors.append(f"Company {cid}: {exc_str}")
+                multi_company_results[cid] = None
+
+    await asyncio.gather(*[_fetch_company_tool(cid) for cid in target_company_ids], return_exceptions=True)
+
+    primary_res = next((r for r in multi_company_results.values() if r is not None), None)
+    valid_companies = [cid for cid, r in multi_company_results.items() if r is not None]
+    has_success = len(valid_companies) > 0
+    all_failed = not has_success and len(target_company_ids) > 0
+    v_status = "VALID" if has_success else ("ERROR" if errors else "EMPTY")
+    err_msg = "; ".join(errors) if (all_failed and errors) else (errors[0] if (all_failed and errors) else None)
+
+    return {
+        "company_id": default_company_id or target_company_ids[0],
+        "company_ids": target_company_ids,
+        "is_multi_company": True,
+        "tool_result": primary_res,
+        "multi_company_results": multi_company_results,
+        "unauthorized_companies": sorted(unauthorized_companies),
+        "verification_status": v_status,
+        "error_message": err_msg,
+    }
+
+
 async def tool_node(
     state: AgentState,
     client: Optional[DjangoCoreClient] = None,
@@ -566,191 +682,104 @@ async def tool_node(
         is_multi_company = bool(state.get("is_multi_company") or len(target_company_ids) > 1)
 
         # ------------------------------------------------------------------
-        # Path MC: Multi-Company Execution
-        # ------------------------------------------------------------------
-        if is_multi_company and len(target_company_ids) > 1:
-            tool_name = (
-                state.get("detected_tool")
-                or (active_tools[0].get("tool") if active_tools else None)
-                or "fetch_vendor_invoices"
-            )
-            base_params = dict(
-                (active_tools[0].get("params") if active_tools else None)
-                or state.get("extracted_params")
-                or {}
-            )
-
-            # Marketplace tools and multi-company sales tools natively accept params.company_ids
-            # in a single call; fall back to per-branch fan-out if any branch triggers HTTP 403.
-            supports_native_mc = (
-                TOOL_DOMAIN_MAP.get(tool_name) == "marketplace"
-                or tool_name in ("get_contacts", "get_sales_orders")
-            )
-            if supports_native_mc:
-                primary_cid = target_company_ids[0]
-                native_params = dict(base_params)
-                native_params["company_ids"] = target_company_ids
-                native_params["company_id"] = primary_cid
-                native_res, native_err = await _execute_single_tool(
-                    tool_name=tool_name,
-                    params=native_params,
-                    erp_client=erp_client,
-                    user_token=user_token,
-                    default_company_id=primary_cid,
-                    dispatch_map=dispatch_map,
-                    user_query=state.get("user_query") or "",
-                )
-                if not native_err:
-                    return {
-                        "company_id": primary_cid,
-                        "company_ids": target_company_ids,
-                        "is_multi_company": True,
-                        "multi_company_results": {},
-                        "unauthorized_companies": [],
-                        "tool_result": native_res,
-                        "multi_tool_results": {tool_name: native_res},
-                        "multi_verification_status": {tool_name: "VALID"},
-                        "verification_status": "VALID",
-                        "error_message": None,
-                    }
-                if not _is_permission_error(native_err):
-                    return {
-                        "company_id": primary_cid,
-                        "company_ids": target_company_ids,
-                        "is_multi_company": True,
-                        "multi_company_results": {},
-                        "tool_result": None,
-                        "multi_tool_results": {tool_name: None},
-                        "verification_status": "ERROR",
-                        "error_message": native_err,
-                    }
-                # HTTP 403 fallback: strip company_ids and fan out per branch to isolate unauthorized IDs
-                base_params.pop("company_ids", None)
-
-            concurrency_limit = getattr(settings, "ERP_MULTI_COMPANY_CONCURRENCY", 5)
-            semaphore = asyncio.Semaphore(concurrency_limit)
-            multi_company_results: Dict[int, Any] = {}
-            unauthorized_companies: List[int] = []
-            errors: List[str] = []
-
-            async def _fetch_company_tool(cid: int):
-                params_for_cid = dict(base_params)
-                params_for_cid["company_id"] = cid
-                async with semaphore:
-                    try:
-                        res, err = await _execute_single_tool(
-                            tool_name=tool_name,
-                            params=params_for_cid,
-                            erp_client=erp_client,
-                            user_token=user_token,
-                            default_company_id=cid,
-                            dispatch_map=dispatch_map,
-                            user_query=state.get("user_query") or "",
-                            allow_empty_stock_params=True,
-                        )
-                        if err:
-                            err_lower = str(err).lower()
-                            if any(k in err_lower for k in ("403", "tidak memiliki akses", "akses ditolak", "permission", "unauthorized")):
-                                unauthorized_companies.append(cid)
-                                multi_company_results[cid] = None
-                            else:
-                                errors.append(f"Company {cid}: {err}")
-                                multi_company_results[cid] = None
-                        else:
-                            multi_company_results[cid] = res
-                    except Exception as exc:
-                        exc_str = str(exc)
-                        exc_lower = exc_str.lower()
-                        if any(k in exc_lower for k in ("403", "tidak memiliki akses", "akses ditolak", "permission", "unauthorized")):
-                            unauthorized_companies.append(cid)
-                        else:
-                            errors.append(f"Company {cid}: {exc_str}")
-                        multi_company_results[cid] = None
-
-            await asyncio.gather(*[_fetch_company_tool(cid) for cid in target_company_ids], return_exceptions=True)
-
-            primary_res = next((r for r in multi_company_results.values() if r is not None), None)
-            valid_companies = [cid for cid, r in multi_company_results.items() if r is not None]
-            has_success = len(valid_companies) > 0
-            all_failed = not has_success and len(target_company_ids) > 0
-
-            multi_tool_results_compat: Dict[str, Any] = {}
-            for cid, r in multi_company_results.items():
-                multi_tool_results_compat[f"{tool_name}_{cid}"] = r
-            if primary_res is not None:
-                multi_tool_results_compat[tool_name] = primary_res
-
-            v_status = "VALID" if has_success else ("ERROR" if errors else "EMPTY")
-            err_msg = "; ".join(errors) if (all_failed and errors) else (errors[0] if (all_failed and errors) else None)
-
-            return {
-                "company_id": state.get("company_id") or target_company_ids[0],
-                "company_ids": target_company_ids,
-                "is_multi_company": True,
-                "tool_result": primary_res,
-                "multi_company_results": multi_company_results,
-                "unauthorized_companies": sorted(unauthorized_companies),
-                "multi_tool_results": multi_tool_results_compat,
-                "verification_status": v_status,
-                "error_message": err_msg,
-            }
-
-        # ------------------------------------------------------------------
-        # Path A: Multi-Tool Execution via asyncio.gather (Milestone 3)
+        # Path A: Multi-Tool Execution via asyncio.gather (supports per-plan multi-company)
         # ------------------------------------------------------------------
         if is_multi_tool and active_tools:
             tool_counts = compute_multi_tool_counts(active_tools)
             retry_count = int(state.get("retry_count") or 0)
             prev_multi_status = state.get("multi_verification_status") or {}
 
-            async def _reuse_cached_result(cached_res: Any) -> Tuple[Any, Optional[str]]:
-                return cached_res, None
-
-            tasks = []
-            for idx, plan in enumerate(active_tools):
+            async def _run_plan(idx: int, plan: Dict[str, Any]) -> Tuple[str, Any, Optional[str], Optional[Dict[str, Any]]]:
                 t_name = plan.get("tool", "unnamed_tool")
                 key = get_multi_tool_key(t_name, idx, tool_counts)
                 if (
                     retry_count > 0
                     and plan.get("status") == "success"
-                    and plan.get("result") is not None
+                    and (plan.get("result") is not None or plan.get("multi_company_results"))
                     and should_preserve_plan_on_retry(plan, key, prev_multi_status)
                 ):
-                    tasks.append(_reuse_cached_result(plan.get("result")))
-                else:
-                    tasks.append(
-                        _execute_single_tool(
-                            tool_name=plan.get("tool", "fetch_vendor_invoices"),
-                            params=plan.get("params") or {},
-                            erp_client=erp_client,
-                            user_token=user_token,
-                            default_company_id=state.get("company_id"),
-                            dispatch_map=dispatch_map,
-                            user_query=plan.get("sub_query") or state.get("user_query") or "",
-                            allow_empty_stock_params=not bool(plan.get("sub_query")),
-                        )
+                    mc_meta = (
+                        {
+                            "is_multi_company": True,
+                            "company_ids": plan.get("company_ids"),
+                            "multi_company_results": plan.get("multi_company_results"),
+                            "unauthorized_companies": plan.get("unauthorized_companies", []),
+                        }
+                        if plan.get("multi_company_results")
+                        else None
                     )
-            results = await asyncio.gather(*tasks, return_exceptions=True)
+                    return "single", plan.get("result"), None, mc_meta
+
+                plan_params = dict(plan.get("params") or {})
+                plan_cids = [int(c) for c in (plan.get("company_ids") or []) if c]
+                if not plan_cids:
+                    if plan.get("company_id") is not None:
+                        plan_cids = [int(plan["company_id"])]
+                    elif plan_params.get("company_id") is not None:
+                        plan_cids = [int(plan_params["company_id"])]
+                    elif target_company_ids:
+                        plan_cids = list(target_company_ids)
+
+                plan_is_mc = bool(plan.get("is_multi_company")) or len(plan_cids) > 1
+                plan_user_query = plan.get("sub_query") or plan.get("question_text") or state.get("user_query") or ""
+
+                if plan_is_mc and len(plan_cids) > 1:
+                    mc_out = await _execute_tool_multi_company(
+                        tool_name=t_name,
+                        base_params=plan_params,
+                        target_company_ids=plan_cids,
+                        erp_client=erp_client,
+                        user_token=user_token,
+                        dispatch_map=dispatch_map,
+                        user_query=plan_user_query,
+                        default_company_id=plan.get("company_id") or plan_cids[0],
+                    )
+                    if mc_out.get("verification_status") == "ERROR":
+                        return "mc", None, mc_out.get("error_message") or "Multi-company tool error", mc_out
+                    return "mc", mc_out.get("tool_result"), None, mc_out
+
+                single_cid = plan_cids[0] if plan_cids else state.get("company_id")
+                res, err = await _execute_single_tool(
+                    tool_name=plan.get("tool", "fetch_vendor_invoices"),
+                    params=plan_params,
+                    erp_client=erp_client,
+                    user_token=user_token,
+                    default_company_id=single_cid,
+                    dispatch_map=dispatch_map,
+                    user_query=plan_user_query,
+                    allow_empty_stock_params=not bool(plan.get("sub_query")),
+                )
+                return "single", res, err, None
+
+            outcomes = await asyncio.gather(
+                *[_run_plan(idx, plan) for idx, plan in enumerate(active_tools)],
+                return_exceptions=True,
+            )
 
             multi_tool_results: Dict[str, Any] = {}
             multi_verification_status: Dict[str, str] = {}
             updated_active_tools: List[Dict[str, Any]] = []
             errors: List[str] = []
 
-            for idx, (plan, res) in enumerate(zip(active_tools, results)):
+            for idx, (plan, outcome) in enumerate(zip(active_tools, outcomes)):
                 p_copy = dict(plan)
                 t_name = p_copy.get("tool", "unnamed_tool")
                 key = get_multi_tool_key(t_name, idx, tool_counts)
 
-                if isinstance(res, Exception):
-                    err_msg = str(res)
+                if isinstance(outcome, Exception):
+                    err_msg = str(outcome)
                     multi_tool_results[key] = None
                     multi_verification_status[key] = "ERROR"
                     p_copy["status"] = "error"
                     p_copy["error"] = err_msg
                     errors.append(f"{t_name}: {err_msg}")
                 else:
-                    final_res, err = res
+                    mode_tag, final_res, err, mc_meta = outcome
+                    if mc_meta:
+                        p_copy["is_multi_company"] = True
+                        p_copy["company_ids"] = mc_meta.get("company_ids")
+                        p_copy["multi_company_results"] = mc_meta.get("multi_company_results") or {}
+                        p_copy["unauthorized_companies"] = mc_meta.get("unauthorized_companies") or []
                     if err:
                         multi_tool_results[key] = None
                         multi_verification_status[key] = "ERROR"
@@ -774,6 +803,7 @@ async def tool_node(
 
             has_success = any(st == "VALID" for st in multi_verification_status.values())
             all_failed = not has_success and len(multi_verification_status) > 0
+            any_mc = any(bool(p.get("is_multi_company")) for p in updated_active_tools)
 
             return {
                 "active_tools": updated_active_tools,
@@ -782,9 +812,61 @@ async def tool_node(
                 "tool_result": primary_result,
                 "verification_status": "ERROR" if all_failed else "VALID",
                 "error_message": "; ".join(errors) if all_failed else (errors[0] if errors else None),
-                "is_multi_company": False,
+                "is_multi_company": any_mc,
                 "multi_company_results": {},
             }
+
+        # ------------------------------------------------------------------
+        # Path MC: Single-Tool Multi-Company Execution
+        # ------------------------------------------------------------------
+        if is_multi_company and len(target_company_ids) > 1:
+            tool_name = (
+                state.get("detected_tool")
+                or (active_tools[0].get("tool") if active_tools else None)
+                or "fetch_vendor_invoices"
+            )
+            base_params = dict(
+                (active_tools[0].get("params") if active_tools else None)
+                or state.get("extracted_params")
+                or {}
+            )
+            mc_out = await _execute_tool_multi_company(
+                tool_name=tool_name,
+                base_params=base_params,
+                target_company_ids=target_company_ids,
+                erp_client=erp_client,
+                user_token=user_token,
+                dispatch_map=dispatch_map,
+                user_query=state.get("user_query") or "",
+                default_company_id=state.get("company_id") or target_company_ids[0],
+            )
+            mc_results_dict = mc_out.get("multi_company_results") or {}
+            primary_res = mc_out.get("tool_result")
+            multi_tool_results_compat: Dict[str, Any] = {}
+            if mc_results_dict:
+                for cid, r in mc_results_dict.items():
+                    multi_tool_results_compat[f"{tool_name}_{cid}"] = r
+                if primary_res is not None:
+                    multi_tool_results_compat[tool_name] = primary_res
+            else:
+                multi_tool_results_compat[tool_name] = primary_res
+
+            res_payload: Dict[str, Any] = {
+                "company_id": mc_out["company_id"],
+                "company_ids": mc_out["company_ids"],
+                "is_multi_company": True,
+                "tool_result": primary_res,
+                "multi_company_results": mc_results_dict,
+                "unauthorized_companies": mc_out.get("unauthorized_companies", []),
+                "multi_tool_results": multi_tool_results_compat,
+                "verification_status": mc_out["verification_status"],
+                "error_message": mc_out.get("error_message"),
+            }
+            if not mc_results_dict:
+                res_payload["multi_verification_status"] = {
+                    tool_name: "ERROR" if mc_out["verification_status"] == "ERROR" else "VALID"
+                }
+            return res_payload
 
         # ------------------------------------------------------------------
         # Path B: Single-Tool Legacy Execution (Full Backward Compatibility)

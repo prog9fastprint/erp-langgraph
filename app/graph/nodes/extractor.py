@@ -422,11 +422,12 @@ def is_accounting_term(name: Optional[str]) -> bool:
     return any(t in cleaned for t in ("faktur", "tagihan", "invoice", "jurnal", "saldo", "rekening", "neraca"))
 
 
-ANAPHORA_TOKENS = {"itu", "tersebut", "tadi", "ini", "terkait", "dia", "nya"}
+ANAPHORA_TOKENS = {"itu", "tersebut", "tadi", "ini", "terkait", "dia", "nya", "sana", "situ"}
 ANAPHORIC_CLITICS = (
     "stoknya", "harganya", "barangnya", "produknya", "saldonya",
     "tagihannya", "fakturnya", "invoicenya", "lokasinya", "detailnya",
-    "transaksinya", "jurnalnya",
+    "transaksinya", "jurnalnya", "omzetnya", "omsetnya", "ruginya",
+    "labanya", "neracanya", "kasnya", "sisanya",
 )
 
 
@@ -584,6 +585,35 @@ def _fallback_extract_stock_level(
         params["codes"] = extracted_multi_skus
         return params
 
+    # Batch multi-product name extraction (e.g., 'Cek sisa stok kertas A4 dan cek stok tinta hitam')
+    if re.search(r"\b(?:dan|serta)\b|,", cleaned, re.IGNORECASE) and not params.get("location_name"):
+        clause_parts = re.split(r"\s*(?:\b(?:dan|serta)\b|,)\s*", cleaned, flags=re.IGNORECASE)
+        if len(clause_parts) > 1:
+            multi_names: List[str] = []
+            for part in clause_parts:
+                p_clean = part.strip()
+                if not p_clean:
+                    continue
+                if any(kw in p_clean.lower() for kw in ("faktur", "tagihan", "invoice", "saldo", "jurnal", "omzet", "omset")):
+                    continue
+                m_sub = re.search(
+                    r"(?:(?:stok|stock|sisa|barang|produk|product|item)\s+)+(?:untuk\s+|terkait\s+|dari\s+|tentang\s+)?"
+                    r"(?!di\b|pada\b|ke\b|gudang\b|lokasi\b|faktur\b|tagihan\b|saldo\b|jurnal\b|customer\b|pelanggan\b)"
+                    r"([A-Za-z0-9\-\_\.\+\/\&\(\)\%\s]+?)$",
+                    p_clean,
+                    re.IGNORECASE,
+                )
+                if m_sub:
+                    tok = clean_product_identifier(m_sub.group(1).strip().rstrip("?!.,; '\""))
+                    words = [w for w in tok.split() if w.lower() not in STOCK_STOPWORDS]
+                    cand = " ".join(words)
+                    if words and _is_valid_product_identifier(cand) and not _is_pure_branch_token(cand) and not is_vendor_name(cand):
+                        if cand not in multi_names:
+                            multi_names.append(cand)
+            if len(multi_names) > 1:
+                params["codes"] = multi_names
+                return params
+
     pattern = re.compile(
         r"(?:(?:stok|stock|sisa|barang|produk|product|item)\s+)+(?:untuk\s+|terkait\s+|dari\s+|tentang\s+)?"
         r"(?!di\b|pada\b|ke\b|gudang\b|lokasi\b|faktur\b|tagihan\b|saldo\b|jurnal\b|customer\b|pelanggan\b)"
@@ -700,7 +730,7 @@ def _fallback_extract_product_info(
 ) -> Dict[str, Any]:
     """Deterministic heuristic extraction for product info inquiries."""
     params: Dict[str, Any] = {}
-    cleaned = query.strip()
+    cleaned = re.sub(r"[^\w\)]+$", "", (query or "").strip(), flags=re.UNICODE).strip()
 
     tokens = re.findall(r"\b([A-Z0-9]+(?:-[A-Z0-9]+)+|\d{4,8})\b", cleaned)
     if tokens:
@@ -1968,6 +1998,10 @@ def _extract_single_tool_params(
     tool_name = plan.get("tool")
     domain = plan.get("domain") or TOOL_DOMAIN_MAP.get(tool_name, "general")
     sub_query = (plan.get("sub_query") or user_query).strip()
+    is_decomposed_clause = len(state.get("sub_questions") or []) > 1 and sub_query != user_query
+    allow_global_backfill = (sub_query != user_query) and (
+        not is_decomposed_clause or has_anaphoric_reference(sub_query)
+    )
 
     target_schema = TOOL_SCHEMA_REGISTRY.get(tool_name)
     if target_schema is None:
@@ -1980,7 +2014,7 @@ def _extract_single_tool_params(
     rel_date_from, rel_date_to = None, None
     if supports_dates:
         rel_date_from, rel_date_to = resolve_relative_dates(sub_query, today)
-        if not rel_date_from and not rel_date_to and sub_query != user_query:
+        if not rel_date_from and not rel_date_to and allow_global_backfill:
             rel_date_from, rel_date_to = resolve_relative_dates(user_query, today)
 
     extracted_dict: Optional[Dict[str, Any]] = None
@@ -2060,7 +2094,7 @@ def _extract_single_tool_params(
                 max_messages=settings.MAX_WINDOW_MESSAGES,
             )
 
-            effective_query = user_query if has_anaphoric_reference(sub_query) else sub_query
+            effective_query = user_query if (has_anaphoric_reference(sub_query) and not is_decomposed_clause) else sub_query
 
             messages = [
                 SystemMessage(content=system_prompt),
@@ -2162,9 +2196,16 @@ def _extract_single_tool_params(
                 if rel_date_to:
                     extracted_dict["date_to"] = rel_date_to
 
+    # Pre-clean invalid superlative/interrogative phrases before peer/history harvesting
+    if tool_name in ("get_stock_level", "get_product_info"):
+        for k in ("code", "search"):
+            val = extracted_dict.get(k)
+            if isinstance(val, str) and not _is_valid_product_identifier(val):
+                extracted_dict.pop(k, None)
+
     # 3. 3-Tier Entity Resolution & Anaphora Handling
     if tool_name == "get_stock_level":
-        if not extracted_dict.get("code") and not extracted_dict.get("product_id"):
+        if not extracted_dict.get("code") and not extracted_dict.get("codes") and not extracted_dict.get("product_id"):
             # Tier 1: Peer harvesting (Inventory domain)
             for peer in all_plans:
                 if peer is plan:
@@ -2179,8 +2220,8 @@ def _extract_single_tool_params(
                     if peer_cand and not is_vendor_name(peer_cand) and not is_account_code_or_name(peer_cand) and not is_accounting_term(peer_cand):
                         extracted_dict["code"] = peer_cand
                         break
-            # Tier 2: Global user_query inspection
-            if not extracted_dict.get("code") and sub_query != user_query:
+            # Tier 2: Global user_query inspection (guarded on decomposed non-anaphoric clauses)
+            if not extracted_dict.get("code") and allow_global_backfill:
                 u_ext = _fallback_extract_product_info(user_query, state.get("messages"))
                 cand = u_ext.get("code") or u_ext.get("search")
                 if not cand:
@@ -2220,13 +2261,18 @@ def _extract_single_tool_params(
                         break
 
         if not extracted_dict.get("location_name"):
-            u_stock = _fallback_extract_stock_level(user_query, state.get("messages"))
-            if u_stock.get("location_name"):
-                extracted_dict["location_name"] = u_stock["location_name"]
-            elif sub_query != user_query:
+            if is_decomposed_clause:
                 s_stock = _fallback_extract_stock_level(sub_query, state.get("messages"))
                 if s_stock.get("location_name"):
                     extracted_dict["location_name"] = s_stock["location_name"]
+            else:
+                u_stock = _fallback_extract_stock_level(user_query, state.get("messages"))
+                if u_stock.get("location_name"):
+                    extracted_dict["location_name"] = u_stock["location_name"]
+                elif sub_query != user_query:
+                    s_stock = _fallback_extract_stock_level(sub_query, state.get("messages"))
+                    if s_stock.get("location_name"):
+                        extracted_dict["location_name"] = s_stock["location_name"]
 
     elif tool_name == "get_product_info":
         if not extracted_dict.get("code") and not extracted_dict.get("search") and not extracted_dict.get("product_id"):
@@ -2244,8 +2290,8 @@ def _extract_single_tool_params(
                     if peer_cand and not is_vendor_name(peer_cand) and not is_account_code_or_name(peer_cand) and not is_accounting_term(peer_cand):
                         extracted_dict["search"] = peer_cand
                         break
-            # Tier 2: Global user_query inspection
-            if not extracted_dict.get("code") and not extracted_dict.get("search") and sub_query != user_query:
+            # Tier 2: Global user_query inspection (guarded on decomposed non-anaphoric clauses)
+            if not extracted_dict.get("code") and not extracted_dict.get("search") and allow_global_backfill:
                 u_ext = _fallback_extract_product_info(user_query, state.get("messages"))
                 if u_ext.get("code") and not is_vendor_name(u_ext["code"]) and not is_account_code_or_name(u_ext["code"]) and not is_accounting_term(u_ext["code"]):
                     extracted_dict["code"] = u_ext["code"]
@@ -2296,7 +2342,7 @@ def _extract_single_tool_params(
                         extracted_dict["vendor_name"] = peer_vendor
                         break
             # Tier 2: Global user_query inspection
-            if not extracted_dict.get("vendor_name") and sub_query != user_query:
+            if not extracted_dict.get("vendor_name") and allow_global_backfill:
                 v_ext = _fallback_extract_vendor_invoice(user_query, today)
                 if v_ext.get("vendor_name") and is_vendor_name(v_ext["vendor_name"]):
                     extracted_dict["vendor_name"] = v_ext["vendor_name"]
@@ -2304,20 +2350,20 @@ def _extract_single_tool_params(
                     extracted_dict["status"] = v_ext["status"]
 
     elif tool_name == "get_account_balance":
-        if not extracted_dict.get("account_code") and not extracted_dict.get("account_id") and sub_query != user_query:
+        if not extracted_dict.get("account_code") and not extracted_dict.get("account_id") and allow_global_backfill:
             b_ext = _fallback_extract_account_balance(user_query, today)
             if b_ext.get("account_code"):
                 extracted_dict["account_code"] = b_ext["account_code"]
 
     elif tool_name == "get_journal_entries":
-        if not extracted_dict.get("entry_number") and not extracted_dict.get("status") and not extracted_dict.get("search") and sub_query != user_query:
+        if not extracted_dict.get("entry_number") and not extracted_dict.get("status") and not extracted_dict.get("search") and allow_global_backfill:
             j_ext = _fallback_extract_journal_entries(user_query, today)
             for k in ("entry_number", "status", "search"):
                 if j_ext.get(k):
                     extracted_dict[k] = j_ext[k]
 
     elif tool_name == "get_locations":
-        if not extracted_dict.get("search") and sub_query != user_query:
+        if not extracted_dict.get("search") and allow_global_backfill:
             l_ext = _fallback_extract_locations(user_query)
             if l_ext.get("search"):
                 extracted_dict["search"] = l_ext["search"]
@@ -2333,17 +2379,28 @@ def _extract_single_tool_params(
 
     # Strict date enforcement: if query mentions no explicit dates or temporal keywords, drop hallucinated dates
     # Exception: referential sales follow-ups inheriting dates from prior turn (e.g. 'di wa itu contactnya siapa saja').
-    if supports_dates and not has_inherited_dates and not has_temporal_expression(sub_query) and not has_temporal_expression(user_query):
+    has_explicit_anaphora = bool(
+        any(clitic in sub_query.lower() for clitic in ANAPHORIC_CLITICS)
+        or any(re.search(rf"\b{re.escape(token)}\b", sub_query.lower()) for token in ANAPHORA_TOKENS)
+    )
+    has_scope_temporal = has_temporal_expression(sub_query) or (
+        (not is_decomposed_clause or has_explicit_anaphora) and has_temporal_expression(user_query)
+    )
+    if supports_dates and not has_inherited_dates and not has_scope_temporal:
         extracted_dict.pop("date_from", None)
         extracted_dict.pop("date_to", None)
 
     # Marketplace include_live guardrail: enforce False unless explicit live intent in query
     if "include_live" in target_schema.model_fields:
-        extracted_dict["include_live"] = _has_live_marketplace_intent(sub_query) or _has_live_marketplace_intent(user_query)
+        extracted_dict["include_live"] = _has_live_marketplace_intent(sub_query) or (
+            not is_decomposed_clause and _has_live_marketplace_intent(user_query)
+        )
 
     # Marketplace platform backfill if LLM omitted it
     if "marketplace" in target_schema.model_fields and not extracted_dict.get("marketplace"):
-        mp_plat = _extract_mp_platform(sub_query) or _extract_mp_platform(user_query)
+        mp_plat = _extract_mp_platform(sub_query) or (
+            None if is_decomposed_clause else _extract_mp_platform(user_query)
+        )
         if mp_plat:
             extracted_dict["marketplace"] = mp_plat
 
@@ -2356,8 +2413,12 @@ def _extract_single_tool_params(
             else:
                 extracted_dict.pop("status", None)
 
-    # Branch entity resolution into company_id (authoritative over default guess)
-    detected_branch = resolve_branch_company_id(sub_query) or resolve_branch_company_id(user_query)
+    # Branch entity resolution into company_id (per-clause isolated when decomposed)
+    detected_branch = (
+        plan.get("company_id")
+        or resolve_branch_company_id(sub_query)
+        or (None if is_decomposed_clause else resolve_branch_company_id(user_query))
+    )
     if detected_branch:
         extracted_dict["company_id"] = detected_branch
     elif state.get("company_id"):
@@ -2633,6 +2694,30 @@ def extractor_node(
         "active_tools": working_active_tools,
         "extracted_params": primary_params,
     }
+
+    has_per_clause_scoping = len(state.get("sub_questions") or []) > 1 or any(
+        p.get("company_id") is not None or p.get("is_multi_company") is not None
+        for p in working_active_tools
+    )
+    if has_per_clause_scoping:
+        for plan_item in working_active_tools:
+            plan_params = plan_item.setdefault("params", {})
+            eff_cid = plan_item.get("company_id") or plan_params.get("company_id") or state.get("company_id") or settings.DEFAULT_COMPANY_ID
+            plan_params["company_id"] = eff_cid
+            if plan_item.get("company_id") is None:
+                plan_item["company_id"] = eff_cid
+            if not plan_item.get("company_ids"):
+                plan_item["company_ids"] = state.get("company_ids") if state.get("is_multi_company") else [eff_cid]
+            if plan_item.get("is_multi_company") is None:
+                plan_item["is_multi_company"] = len(plan_item["company_ids"]) > 1
+
+        first_plan = working_active_tools[0]
+        result_update["company_id"] = first_plan.get("company_id") or state.get("company_id") or settings.DEFAULT_COMPANY_ID
+        result_update["company_ids"] = first_plan.get("company_ids") or [result_update["company_id"]]
+        result_update["is_multi_company"] = bool(first_plan.get("is_multi_company"))
+        if not result_update["is_multi_company"]:
+            result_update["multi_company_results"] = {}
+        return result_update
 
     multi_cids, is_all = resolve_all_branch_company_ids(user_query)
     explicit_branch = resolve_branch_company_id(user_query)

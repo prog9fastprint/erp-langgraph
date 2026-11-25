@@ -2260,6 +2260,263 @@ def _format_multi_company_presentation(state: AgentState) -> str:
     return "\n".join(lines)
 
 
+def _format_empty_plan_notice(
+    plan: Dict[str, Any],
+    default_company_id: Optional[int] = None,
+) -> str:
+    """Format a concise per-question empty-data notice for multi-question responses."""
+    from app.graph.nodes.extractor import COMPANY_NAME_MAP
+
+    t_name = plan.get("tool") or "erp_tool"
+    params = plan.get("params") or {}
+    cid = plan.get("company_id") or params.get("company_id") or default_company_id
+    c_label = COMPANY_NAME_MAP.get(cid, f"Cabang {cid}") if cid else None
+
+    hints: List[str] = []
+    if params.get("code"):
+        hints.append(f"Produk/SKU: `{params['code']}`")
+    elif params.get("codes"):
+        hints.append(f"Produk/SKU: {', '.join(f'`{c}`' for c in params['codes'][:5])}")
+    if params.get("account_code"):
+        hints.append(f"Kode Akun: `{params['account_code']}`")
+    if params.get("vendor_name"):
+        hints.append(f"Vendor: **{params['vendor_name']}**")
+    if params.get("customer_name"):
+        hints.append(f"Pelanggan: **{params['customer_name']}**")
+    if params.get("order_ref"):
+        hints.append(f"No. SO: `{params['order_ref']}`")
+    if params.get("location_name"):
+        hints.append(f"Lokasi: **{params['location_name']}**")
+    if params.get("date_from") or params.get("date_to"):
+        hints.append(f"Periode: **{params.get('date_from', '-')} s/d {params.get('date_to', '-')}**")
+    if c_label:
+        hints.append(f"Cabang: **{c_label}**")
+
+    hint_str = f" ({', '.join(hints)})" if hints else ""
+    return (
+        f"### Data Tidak Ditemukan (`{t_name}`)\n\n"
+        f"Tidak ada catatan atau transaksi ERP yang sesuai untuk permintaan ini{hint_str}."
+    )
+
+
+def _format_non_tool_item_notice(
+    item: Dict[str, Any],
+    llm_general_answers: Optional[Dict[int, str]] = None,
+) -> str:
+    """Format a single general / out_of_scope / guardrail sub-question response block."""
+    cat = item.get("category") or "general"
+    q_idx = int(item.get("question_index") or 0)
+
+    if llm_general_answers and q_idx in llm_general_answers and llm_general_answers[q_idx].strip():
+        return llm_general_answers[q_idx].strip()
+
+    if cat == "customer_billing":
+        return (
+            "### Informasi Tagihan Pelanggan (Customer) & Panduan Faktur\n\n"
+            "Sistem AI Orchestrator saat ini dikhususkan untuk **tagihan vendor / pemasok** (Hutang Usaha), "
+            "buku jurnal, saldo akun kas, dan inventaris barang.\n\n"
+            "- **Tagihan / Piutang Pelanggan**: Silakan periksa modul **Penjualan (Sales / Invoicing)** atau POS di FastPrint ERP.\n"
+            "- **Jika Rekanan adalah Vendor**: Sertakan kata `'vendor'` pada permintaan Anda."
+        )
+    if cat == "marketplace_write":
+        return (
+            "### Operasi Tulis Marketplace Dibatasi (Read-Only)\n\n"
+            "Asisten AI hanya mendukung penelusuran data dan simulasi read-only untuk modul Marketplace. "
+            "Perubahan stok/harga langsung atau penggabungan Pesanan Kilat wajib dilakukan melalui antarmuka resmi ERP (`/marketplace/`)."
+        )
+    if cat == "out_of_scope":
+        return (
+            "### Pertanyaan di Luar Cakupan Operasional ERP\n\n"
+            "Pertanyaan tersebut berada di luar cakupan operasional dan data FastPrint ERP (Akuntansi, Inventaris, Penjualan, Marketplace, dan SOP Internal)."
+        )
+    return (
+        "Saya dapat membantu memeriksa data Akuntansi, Inventaris/Stok Gudang, Penjualan, "
+        "Marketplace, serta SOP dan spesifikasi produk FastPrint ERP."
+    )
+
+
+def _format_rag_question_section(
+    q_text: str,
+    rag_entry: Dict[str, Any],
+) -> str:
+    """Format a single RAG sub-question result section."""
+    chunks = rag_entry.get("chunks") or []
+    sources = rag_entry.get("sources") or []
+    err = rag_entry.get("error")
+    if err and not chunks:
+        return (
+            f"### Kendala Pencarian Pengetahuan\n\n"
+            f"> [!WARNING]\n"
+            f"> Gagal mengambil dokumen SOP/spesifikasi: {err}"
+        )
+    if chunks:
+        return _format_rag_section(chunks, sources)
+    return (
+        "### Informasi Pengetahuan Tidak Ditemukan\n\n"
+        f"Dokumen SOP, kebijakan, atau spesifikasi terkait pertanyaan *\"{q_text}\"* belum terdaftar dalam basis data pengetahuan FastPrint ERP."
+    )
+
+
+def _build_question_ordered_answer(
+    state: AgentState,
+    llm_general_answers: Optional[Dict[int, str]] = None,
+) -> Optional[str]:
+    """
+    Assemble multi-question responses in original user question order across
+    ERP plans, RAG sub-queries, and general/guardrail sub-questions.
+    Returns None when standard single-tool or legacy multi-tool layout applies.
+    """
+    sub_questions = state.get("sub_questions") or []
+    non_tool_questions = state.get("non_tool_questions") or []
+    rag_queries = state.get("rag_queries") or []
+    rag_results_by_query = state.get("rag_results_by_query") or {}
+    active_tools = state.get("active_tools") or []
+    multi_results = state.get("multi_tool_results") or {}
+    multi_status = state.get("multi_verification_status") or {}
+    user_query = state.get("user_query") or ""
+
+    is_multi_q = (
+        len(sub_questions) > 1
+        or bool(non_tool_questions)
+        or len(rag_queries) > 1
+        or (bool(rag_queries) and len(active_tools) >= 1)
+    )
+    if not is_multi_q:
+        return None
+
+    tool_counts: Dict[str, int] = {}
+    for p in active_tools:
+        if isinstance(p, dict):
+            tn = p.get("tool", "unnamed_tool")
+            tool_counts[tn] = tool_counts.get(tn, 0) + 1
+
+    # Map question_index -> rendered sections
+    buckets: Dict[int, List[str]] = {}
+    q_labels: Dict[int, str] = {}
+
+    for sq in sub_questions:
+        if isinstance(sq, dict) and "question_index" in sq:
+            idx = int(sq["question_index"])
+            if sq.get("text"):
+                q_labels[idx] = sq["text"]
+
+    for idx, plan in enumerate(active_tools):
+        if not isinstance(plan, dict):
+            continue
+        t_name = plan.get("tool")
+        if not t_name:
+            continue
+        q_idx = int(plan.get("question_index") if plan.get("question_index") is not None else idx)
+        if plan.get("question_text") and q_idx not in q_labels:
+            q_labels[q_idx] = plan["question_text"]
+        elif plan.get("sub_query") and q_idx not in q_labels:
+            q_labels[q_idx] = plan["sub_query"]
+
+        key = f"{t_name}_{idx}" if tool_counts.get(t_name, 0) > 1 else t_name
+        plan_mc_results = plan.get("multi_company_results")
+
+        if isinstance(plan_mc_results, dict) and plan_mc_results:
+            plan_unauth = plan.get("unauthorized_companies") or []
+            if len(plan_unauth) == len(plan_mc_results) and len(plan_unauth) > 0:
+                rendered = (
+                    f"### Kendala Akses Multi-Cabang (`{t_name}`)\n\n"
+                    f"> [!WARNING]\n"
+                    f"> Akses ditolak ke seluruh cabang yang diminta (HTTP 403): {plan_unauth}"
+                )
+            else:
+                plan_state: Dict[str, Any] = {
+                    **state,
+                    "detected_tool": t_name,
+                    "detected_domain": plan.get("domain") or state.get("detected_domain"),
+                    "multi_company_results": plan_mc_results,
+                    "unauthorized_companies": plan_unauth,
+                    "extracted_params": plan.get("params") or {},
+                    "user_query": plan.get("sub_query") or user_query,
+                }
+                rendered = _format_multi_company_presentation(plan_state)  # type: ignore[arg-type]
+        else:
+            res = plan.get("result")
+            if res is None and key in multi_results:
+                res = multi_results[key]
+            elif res is None and t_name in multi_results:
+                res = multi_results[t_name]
+
+            plan_err = plan.get("error") or (res.get("error") if isinstance(res, dict) else None)
+            plan_ver_st = multi_status.get(key)
+
+            if plan.get("status") == "error" or plan_err:
+                rendered = (
+                    f"### Kendala Modul ERP (`{t_name}`)\n\n"
+                    f"> [!WARNING]\n"
+                    f"> Gagal memuat data modul ini: {plan_err or 'Terjadi kendala pada layanan ERP.'}"
+                )
+            elif plan_ver_st == "EMPTY":
+                rendered = _format_empty_plan_notice(plan, default_company_id=state.get("company_id"))
+            elif res:
+                plan_default_cid = plan.get("company_id") or (plan.get("params") or {}).get("company_id") or state.get("company_id")
+                rendered = _format_single_tool_presentation(
+                    t_name,
+                    res,
+                    plan.get("sub_query") or user_query,
+                    plan.get("params"),
+                    default_company_id=plan_default_cid,
+                )
+            else:
+                rendered = _format_empty_plan_notice(plan, default_company_id=state.get("company_id"))
+
+        if rendered:
+            buckets.setdefault(q_idx, []).append(rendered)
+
+    # Map RAG queries by matching text in sub_questions when available
+    rag_q_to_idx: Dict[str, int] = {}
+    for sq in sub_questions:
+        if isinstance(sq, dict) and sq.get("query_mode") == "vector_rag" and sq.get("text"):
+            rag_q_to_idx[sq["text"]] = int(sq.get("question_index") or 0)
+
+    next_fallback_idx = (max(q_labels.keys()) + 1) if q_labels else 0
+    for r_idx, rq in enumerate(rag_queries):
+        q_idx = rag_q_to_idx.get(rq)
+        if q_idx is None:
+            q_idx = next_fallback_idx + r_idx
+        if rq not in q_labels.values() and q_idx not in q_labels:
+            q_labels[q_idx] = rq
+        entry = rag_results_by_query.get(rq)
+        if entry is None:
+            entry = {
+                "chunks": state.get("rag_context") or [],
+                "sources": state.get("rag_sources") or [],
+                "error": state.get("error_message") if state.get("verification_status") == "ERROR" else None,
+            }
+        buckets.setdefault(q_idx, []).append(_format_rag_question_section(rq, entry))
+
+    for nt in non_tool_questions:
+        if not isinstance(nt, dict):
+            continue
+        q_idx = int(nt.get("question_index") or 0)
+        if nt.get("question_text") and q_idx not in q_labels:
+            q_labels[q_idx] = nt["question_text"]
+        buckets.setdefault(q_idx, []).append(
+            _format_non_tool_item_notice(nt, llm_general_answers=llm_general_answers)
+        )
+
+    if not buckets:
+        return None
+
+    ordered_indices = sorted(buckets.keys())
+    if len(ordered_indices) == 1:
+        return "\n\n---\n\n".join(buckets[ordered_indices[0]])
+
+    final_sections: List[str] = []
+    for display_num, q_idx in enumerate(ordered_indices, start=1):
+        label = (q_labels.get(q_idx) or "").strip()
+        body = "\n\n".join(buckets[q_idx])
+        if label:
+            final_sections.append(f"#### Pertanyaan {display_num}: {label}\n\n{body}")
+        else:
+            final_sections.append(body)
+    return "\n\n---\n\n".join(final_sections)
+
+
 def format_deterministic_answer(state: AgentState) -> str:
     """
     Deterministic template formatter for ERP results when offline or LLM is unavailable.
@@ -2272,10 +2529,30 @@ def format_deterministic_answer(state: AgentState) -> str:
     user_query = state.get("user_query") or ""
     error_message = state.get("error_message")
     multi_results = state.get("multi_tool_results") or {}
-    is_multi = state.get("is_multi_tool") or (len(multi_results) > 1)
+    active_tools = state.get("active_tools") or []
+    sub_questions = state.get("sub_questions") or []
+    non_tool_questions = state.get("non_tool_questions") or []
+    rag_queries = state.get("rag_queries") or []
+    is_single_tool_mc = (
+        not state.get("is_multi_tool")
+        and len(active_tools) <= 1
+        and len(sub_questions) <= 1
+        and not non_tool_questions
+        and len(rag_queries) <= 1
+        and bool(state.get("is_multi_company"))
+        and bool(state.get("multi_company_results"))
+    )
+    is_multi = (
+        state.get("is_multi_tool")
+        or (len(active_tools) > 1)
+        or (len(multi_results) > 1 and not is_single_tool_mc)
+        or (len(sub_questions) > 1)
+        or bool(non_tool_questions)
+        or (len(rag_queries) > 1)
+    )
 
-    # 0. Multi-Company Execution Unified Formatting
-    if state.get("is_multi_company") and state.get("multi_company_results"):
+    # 0. Multi-Company Execution Unified Formatting (Single-Tool Only)
+    if is_single_tool_mc:
         return _format_multi_company_presentation(state)
 
     # 0. Empty History Retry Handling
@@ -2343,6 +2620,12 @@ def format_deterministic_answer(state: AgentState) -> str:
             f"- Pastikan token autentikasi (JWT) masih aktif atau lakukan login ulang.\n"
             f"- Pastikan pengguna Anda memiliki hak akses ke modul dan perusahaan (Company ID) yang diminta."
         )
+
+    # 2.0 Multi-Question Unified Rendering (Ordered by question_index)
+    if is_multi:
+        ordered_answer = _build_question_ordered_answer(state)
+        if ordered_answer:
+            return ordered_answer
 
     # 2. Out of Scope Guardrail
     if domain == "out_of_scope":
@@ -2482,6 +2765,7 @@ def format_deterministic_answer(state: AgentState) -> str:
 
     multi_results = state.get("multi_tool_results") or {}
     active_tools = state.get("active_tools") or []
+    multi_status = state.get("multi_verification_status") or {}
     is_multi = state.get("is_multi_tool") or (len(multi_results) > 1) or (len(active_tools) > 1)
 
     # 4. Multi-Tool Execution Unified Formatting (Milestone 4)
@@ -2499,6 +2783,22 @@ def format_deterministic_answer(state: AgentState) -> str:
                 if not t_name:
                     continue
                 key = f"{t_name}_{idx}" if tool_counts.get(t_name, 0) > 1 else t_name
+                plan_mc_results = plan.get("multi_company_results")
+                if isinstance(plan_mc_results, dict) and plan_mc_results:
+                    plan_state: Dict[str, Any] = {
+                        **state,
+                        "detected_tool": t_name,
+                        "detected_domain": plan.get("domain") or state.get("detected_domain"),
+                        "multi_company_results": plan_mc_results,
+                        "unauthorized_companies": plan.get("unauthorized_companies") or [],
+                        "extracted_params": plan.get("params") or {},
+                        "user_query": plan.get("sub_query") or user_query,
+                    }
+                    mc_formatted = _format_multi_company_presentation(plan_state)  # type: ignore[arg-type]
+                    if mc_formatted:
+                        sections.append(mc_formatted)
+                    continue
+
                 # Check plan result first, then composite key, then base tool name
                 res = plan.get("result")
                 if res is None and key in multi_results:
@@ -2506,13 +2806,18 @@ def format_deterministic_answer(state: AgentState) -> str:
                 elif res is None and t_name in multi_results:
                     res = multi_results[t_name]
 
-                if res and plan.get("status") != "error":
+                if multi_status.get(key) == "EMPTY":
+                    sections.append(
+                        _format_empty_plan_notice(plan, default_company_id=state.get("company_id"))
+                    )
+                elif res and plan.get("status") != "error":
+                    plan_default_cid = plan.get("company_id") or (plan.get("params") or {}).get("company_id") or state.get("company_id")
                     formatted = _format_single_tool_presentation(
                         t_name,
                         res,
-                        user_query,
+                        plan.get("sub_query") or user_query,
                         plan.get("params"),
-                        default_company_id=state.get("company_id"),
+                        default_company_id=plan_default_cid,
                     )
                     if formatted:
                         sections.append(formatted)
@@ -3220,8 +3525,21 @@ async def asynthesizer_node(
     deterministic_answer = format_deterministic_answer(state)
     actual_model = state.get("active_model")
 
-    # For hybrid inquiries, combine live ERP results with semantic RAG findings
-    if query_mode == "hybrid":
+    sub_questions = state.get("sub_questions") or []
+    non_tool_questions = state.get("non_tool_questions") or []
+    rag_queries = state.get("rag_queries") or []
+    active_tools_list = state.get("active_tools") or []
+    is_multi_q = (
+        len(sub_questions) > 1
+        or len(active_tools_list) > 1
+        or len(rag_queries) > 1
+        or bool(non_tool_questions)
+        or bool(state.get("is_multi_tool"))
+    )
+
+    # For single-question hybrid inquiries, combine live ERP results with semantic RAG findings
+    # (multi-question hybrid prompts already render RAG per question inside _build_question_ordered_answer)
+    if query_mode == "hybrid" and not is_multi_q:
         rag_context = state.get("rag_context")
         rag_sources = state.get("rag_sources")
         rag_section = _format_rag_section(rag_context, rag_sources)
@@ -3237,13 +3555,6 @@ async def asynthesizer_node(
     final_text = deterministic_answer
     followups: List[Dict[str, str]] = []
 
-    # Emit deterministic table immediately via custom event for instant TTFT (<10ms)
-    if deterministic_answer:
-        try:
-            await adispatch_custom_event("token", {"content": deterministic_answer})
-        except Exception as dispatch_err:
-            logger.debug(f"Could not dispatch deterministic_chunk: {dispatch_err}")
-
     # Attempt LLM natural language polish and follow-up generation if LLM is provided/available
     model = llm
     is_test_env = "unittest" in sys.modules or os.environ.get("FASTPRINT_TEST_ENV") == "true"
@@ -3253,8 +3564,39 @@ async def asynthesizer_node(
         except Exception:
             model = None
 
+    # Answer general sub-questions via LLM before verbatim streaming when available
+    general_nt_items = [
+        nt for nt in non_tool_questions
+        if isinstance(nt, dict) and (nt.get("category") or "general") == "general" and nt.get("question_text")
+    ]
+    if model is not None and general_nt_items:
+        llm_general_answers: Dict[int, str] = {}
+        for nt in general_nt_items:
+            try:
+                g_resp = await model.ainvoke([
+                    SystemMessage(content="Anda adalah Asisten AI FastPrint ERP yang ringkas, jelas, dan bebas AI slop."),
+                    HumanMessage(content=f"Jawab pertanyaan umum/sapaan berikut dalam Bahasa Indonesia secara singkat (1-3 kalimat):\n{nt['question_text']}"),
+                ])
+                g_content = getattr(g_resp, "content", None)
+                if g_content and isinstance(g_content, str) and g_content.strip():
+                    llm_general_answers[int(nt.get("question_index") or 0)] = _clean_ai_slop(g_content.strip())
+            except Exception:
+                pass
+        if llm_general_answers:
+            updated_det = _build_question_ordered_answer(state, llm_general_answers=llm_general_answers)
+            if updated_det:
+                deterministic_answer = updated_det
+                final_text = deterministic_answer
+
+    # Emit deterministic table immediately via custom event for instant TTFT (<10ms)
+    if deterministic_answer:
+        try:
+            await adispatch_custom_event("token", {"content": deterministic_answer})
+        except Exception as dispatch_err:
+            logger.debug(f"Could not dispatch deterministic_chunk: {dispatch_err}")
+
     is_multi_co = state.get("is_multi_company", False)
-    is_large_deterministic = is_multi_co or len(deterministic_answer) > 1500
+    is_large_deterministic = is_multi_co or is_multi_q or len(deterministic_answer) > 1500
 
     if model is not None and status == "VALID":
         try:
@@ -3386,8 +3728,20 @@ def synthesizer_node(
     deterministic_answer = format_deterministic_answer(state)
     actual_model = state.get("active_model")
 
-    # For hybrid inquiries, combine live ERP results with semantic RAG findings
-    if query_mode == "hybrid":
+    sub_questions = state.get("sub_questions") or []
+    non_tool_questions = state.get("non_tool_questions") or []
+    rag_queries = state.get("rag_queries") or []
+    active_tools_list = state.get("active_tools") or []
+    is_multi_q = (
+        len(sub_questions) > 1
+        or len(active_tools_list) > 1
+        or len(rag_queries) > 1
+        or bool(non_tool_questions)
+        or bool(state.get("is_multi_tool"))
+    )
+
+    # For single-question hybrid inquiries, combine live ERP results with semantic RAG findings
+    if query_mode == "hybrid" and not is_multi_q:
         rag_context = state.get("rag_context")
         rag_sources = state.get("rag_sources")
         rag_section = _format_rag_section(rag_context, rag_sources)
@@ -3412,8 +3766,31 @@ def synthesizer_node(
         except Exception:
             model = None
 
+    general_nt_items = [
+        nt for nt in non_tool_questions
+        if isinstance(nt, dict) and (nt.get("category") or "general") == "general" and nt.get("question_text")
+    ]
+    if model is not None and general_nt_items:
+        llm_general_answers: Dict[int, str] = {}
+        for nt in general_nt_items:
+            try:
+                g_resp = model.invoke([
+                    SystemMessage(content="Anda adalah Asisten AI FastPrint ERP yang ringkas, jelas, dan bebas AI slop."),
+                    HumanMessage(content=f"Jawab pertanyaan umum/sapaan berikut dalam Bahasa Indonesia secara singkat (1-3 kalimat):\n{nt['question_text']}"),
+                ])
+                g_content = getattr(g_resp, "content", None)
+                if g_content and isinstance(g_content, str) and g_content.strip():
+                    llm_general_answers[int(nt.get("question_index") or 0)] = _clean_ai_slop(g_content.strip())
+            except Exception:
+                pass
+        if llm_general_answers:
+            updated_det = _build_question_ordered_answer(state, llm_general_answers=llm_general_answers)
+            if updated_det:
+                deterministic_answer = updated_det
+                final_text = deterministic_answer
+
     is_multi_co = state.get("is_multi_company", False)
-    is_large_deterministic = is_multi_co or len(deterministic_answer) > 1500
+    is_large_deterministic = is_multi_co or is_multi_q or len(deterministic_answer) > 1500
 
     if model is not None and status == "VALID":
         try:

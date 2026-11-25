@@ -243,10 +243,21 @@ def verifier_node(state: AgentState) -> Dict[str, Any]:
     current_instruction = state.get("retry_instruction")
     preserved_replay = current_instruction if current_instruction and current_instruction.startswith("Mengulang permintaan:") else None
 
+    multi_results = state.get("multi_tool_results") or {}
+    multi_status = state.get("multi_verification_status") or {}
+    active_tools = state.get("active_tools") or []
+    is_single_tool_mc = (
+        not state.get("is_multi_tool")
+        and len(active_tools) <= 1
+        and bool(state.get("is_multi_company"))
+        and bool(state.get("multi_company_results"))
+    )
+    is_multi = state.get("is_multi_tool") or (len(active_tools) > 1) or (len(multi_results) > 1 and not is_single_tool_mc)
+
     # ------------------------------------------------------------------
-    # Path MC: Verification for Multi-Company Execution
+    # Path MC: Verification for Multi-Company Execution (Single-Tool Only)
     # ------------------------------------------------------------------
-    if state.get("is_multi_company") and state.get("multi_company_results"):
+    if is_single_tool_mc:
         mc_results = state.get("multi_company_results") or {}
         total_records = sum(_calculate_records_count(r) for r in mc_results.values() if r)
         unauth = state.get("unauthorized_companies") or []
@@ -283,11 +294,6 @@ def verifier_node(state: AgentState) -> Dict[str, Any]:
                 "retry_instruction": None,
             }
 
-    multi_results = state.get("multi_tool_results") or {}
-    multi_status = state.get("multi_verification_status") or {}
-    active_tools = state.get("active_tools") or []
-    is_multi = state.get("is_multi_tool") or (len(multi_results) > 1) or (len(active_tools) > 1)
-
     # ------------------------------------------------------------------
     # Path A: Aggregate Verification for Multi-Tool Execution (Milestone 4)
     # ------------------------------------------------------------------
@@ -318,7 +324,30 @@ def verifier_node(state: AgentState) -> Dict[str, Any]:
         has_valid_tool = False
 
         for idx, (key, res, st) in enumerate(items):
-            if st in ("error", "ERROR") or (res is None and state.get("error_message")):
+            plan = active_tools[idx] if idx < len(active_tools) else {}
+            plan_mc_results = plan.get("multi_company_results") if isinstance(plan, dict) else None
+
+            if isinstance(plan_mc_results, dict) and plan_mc_results:
+                plan_unauth = plan.get("unauthorized_companies") or []
+                mc_total = sum(_calculate_records_count(r) for r in plan_mc_results.values() if r)
+                if len(plan_unauth) == len(plan_mc_results) and len(plan_unauth) > 0:
+                    per_tool_status[key] = "ERROR"
+                    has_error_tool = True
+                elif mc_total > 0 or (
+                    len(plan_mc_results) > len(plan_unauth)
+                    and any(r is not None for r in plan_mc_results.values())
+                ):
+                    total_records += max(mc_total, 1)
+                    per_tool_status[key] = "VALID"
+                    has_valid_tool = True
+                else:
+                    per_tool_status[key] = "EMPTY"
+                    plan_params = (plan.get("params") or {}) if isinstance(plan, dict) else {}
+                    if not has_strict_document_identifier(plan_params):
+                        has_empty_tool = True
+                continue
+
+            if st in ("error", "ERROR") or (res is None and (plan.get("error") if isinstance(plan, dict) else None)) or (res is None and state.get("error_message")):
                 per_tool_status[key] = "ERROR"
                 has_error_tool = True
             else:
