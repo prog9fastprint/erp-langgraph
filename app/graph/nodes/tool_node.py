@@ -546,6 +546,7 @@ async def tool_node(
             "get_sales_orders": erp_client.fetch_sales_orders,
             "get_sales_order_detail": erp_client.fetch_sales_order_detail,
             "get_sales_summary": erp_client.fetch_sales_summary,
+            "get_contacts": erp_client.fetch_contacts,
             "get_account_health": erp_client.fetch_account_health,
             "get_marketplace_orders": erp_client.fetch_marketplace_orders,
             "get_kilat_order_diagnostics": erp_client.fetch_kilat_order_diagnostics,
@@ -579,9 +580,13 @@ async def tool_node(
                 or {}
             )
 
-            # Marketplace tools natively accept params.company_ids in a single call;
-            # fall back to per-branch fan-out if any branch triggers HTTP 403.
-            if TOOL_DOMAIN_MAP.get(tool_name) == "marketplace":
+            # Marketplace tools and multi-company sales tools natively accept params.company_ids
+            # in a single call; fall back to per-branch fan-out if any branch triggers HTTP 403.
+            supports_native_mc = (
+                TOOL_DOMAIN_MAP.get(tool_name) == "marketplace"
+                or tool_name in ("get_contacts", "get_sales_orders")
+            )
+            if supports_native_mc:
                 primary_cid = target_company_ids[0]
                 native_params = dict(base_params)
                 native_params["company_ids"] = target_company_ids
@@ -805,6 +810,53 @@ async def tool_node(
                 "verification_status": "ERROR",
                 "error_message": err,
             }
+
+        # Hybrid HQ Auto-Probe: when active session company is HQ (1 or 3), no explicit branch
+        # was pinned in user_query, and HQ returned 0 sales records, auto-probe authorized branches.
+        user_q_str = str(state.get("user_query") or "")
+        user_q_low = user_q_str.lower()
+        hq_pinned = bool(re.search(r"\b(?:kantor\s+pusat|head\s*office|hq|pusat)\b", user_q_low))
+        from app.graph.nodes.verifier import _calculate_records_count
+        from app.graph.nodes.extractor import COMPANY_NAME_MAP, resolve_branch_company_id
+
+        if (
+            TOOL_DOMAIN_MAP.get(detected_tool) == "sales"
+            and detected_tool in ("get_contacts", "get_sales_orders", "get_top_selling_products")
+            and int(target_company_id or 0) in (1, 3)
+            and not hq_pinned
+            and resolve_branch_company_id(user_q_str) is None
+            and _calculate_records_count(final_tool_result) == 0
+        ):
+            raw_auth = state.get("authorized_company_ids") or []
+            probe_cids = [int(c) for c in raw_auth if c and int(c) not in (1, 3)]
+            if not probe_cids:
+                probe_cids = [int(c) for c in COMPANY_NAME_MAP.keys() if int(c) not in (1, 3)]
+            if probe_cids:
+                probe_params = dict(extracted_params)
+                probe_params["company_ids"] = probe_cids
+                probe_params["company_id"] = probe_cids[0]
+                probe_res, probe_err = await _execute_single_tool(
+                    tool_name=detected_tool,
+                    params=probe_params,
+                    erp_client=erp_client,
+                    user_token=user_token,
+                    default_company_id=probe_cids[0],
+                    dispatch_map=dispatch_map,
+                    user_query=user_q_str,
+                )
+                if not probe_err and probe_res is not None:
+                    return {
+                        "company_id": probe_cids[0],
+                        "company_ids": probe_cids,
+                        "is_multi_company": True,
+                        "multi_company_results": {},
+                        "unauthorized_companies": [],
+                        "tool_result": probe_res,
+                        "multi_tool_results": {detected_tool: probe_res},
+                        "multi_verification_status": {detected_tool: "VALID"},
+                        "verification_status": "VALID",
+                        "error_message": None,
+                    }
 
         return {
             "company_id": target_company_id,

@@ -225,6 +225,8 @@ def _build_workflow_kwargs(payload: ChatRequest, effective_token: Optional[str])
     }
     if payload.company_ids is not None:
         kwargs["company_ids"] = payload.company_ids
+    if payload.authorized_company_ids is not None:
+        kwargs["authorized_company_ids"] = payload.authorized_company_ids
     if payload.history is not None:
         kwargs["history"] = payload.history
     if payload.auth_token is not None:

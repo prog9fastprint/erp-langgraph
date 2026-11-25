@@ -9,6 +9,7 @@ import asyncio
 from collections import OrderedDict
 import concurrent.futures
 import logging
+import re
 import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
@@ -408,7 +409,28 @@ def _resolve_effective_company_ids(
     if len(text_cids) == 1:
         return text_cids[0], [text_cids[0]], False
 
-    # 3. Fallback to standard single-company resolution
+    # 3. Preserve multi-company scope on anaphoric or channel/contact follow-ups
+    if (
+        checkpoint_values
+        and checkpoint_values.get("is_multi_company")
+        and len(checkpoint_values.get("company_ids") or []) > 1
+    ):
+        from app.graph.nodes.extractor import has_anaphoric_reference
+        q_low = (user_query or "").lower()
+        is_channel_followup = bool(
+            re.search(r"\b(?:di\s+|via\s+|channel\s+)?(?:wa|whatsapp|shopee|tiktok|tokopedia|lazada)\b", q_low)
+        )
+        is_short_followup = len(q_low.split()) <= 8 and (
+            has_anaphoric_reference(q_low)
+            or is_channel_followup
+            or q_low.strip().rstrip("?!.,;:'\"> ") in ("dimana", "di mana", "cabang mana", "toko mana")
+        )
+        if is_short_followup:
+            cids = [int(c) for c in checkpoint_values["company_ids"] if c]
+            primary = int(checkpoint_values.get("company_id") or cids[0])
+            return primary, cids, True
+
+    # 4. Fallback to standard single-company resolution
     single_cid = _resolve_effective_company_id(
         user_query=user_query,
         company_id=company_id,
@@ -430,6 +452,7 @@ async def _prepare_workflow_execution(
     auth_token: Optional[str] = None,
     user_id: Optional[str] = None,
     user_roles: Optional[List[str]] = None,
+    authorized_company_ids: Optional[List[int]] = None,
     **kwargs: Any,
 ) -> Tuple[Any, Dict[str, Any], AgentState, bool, str]:
     """
@@ -473,6 +496,7 @@ async def _prepare_workflow_execution(
         user_roles=user_roles,
         company_id=effective_company_id,
         company_ids=effective_company_ids,
+        authorized_company_ids=authorized_company_ids,
         is_multi_company=is_multi_company,
         messages=hydrated_messages,
     )

@@ -4,6 +4,7 @@ Evaluates tool execution results, implements an automated retry/correction cycle
 for empty query results (with maximum 2 retries), and provides conditional edge routing.
 """
 import logging
+import re
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from app.core.context import (
@@ -103,7 +104,7 @@ def _calculate_records_count(tool_result: Any) -> int:
         # Check common collection list keys
         for list_key in (
             "entries", "accounts", "products", "items", "records", "lines", "locations",
-            "transfers", "history", "adjustments", "scraps", "warehouses", "categories", "alerts", "bills", "orders",
+            "transfers", "history", "adjustments", "scraps", "warehouses", "categories", "alerts", "bills", "orders", "contacts",
             "mappings", "exceptions", "simulations", "stock_logs", "price_logs", "pcls_logs",
             "anomalies", "by_store", "by_deduction_category", "cashflow_logs", "competitors",
         ):
@@ -261,8 +262,17 @@ def verifier_node(state: AgentState) -> Dict[str, Any]:
                 "error_message": f"Akses ditolak ke seluruh cabang yang diminta (HTTP 403): {unauth}",
             }
         else:
+            user_q_low = (state.get("user_query") or "").lower()
+            det_tool = state.get("detected_tool") or ""
+            ext_params = state.get("extracted_params") or {}
+            is_explicit_daily_existence = bool(
+                (state.get("detected_domain") == "sales" or det_tool in ("get_top_selling_products", "get_sales_orders", "get_contacts", "get_sales_summary"))
+                and (ext_params.get("date_from") or ext_params.get("date_to"))
+                and re.search(r"\b(?:hari\s+ini|kemarin)\b", user_q_low)
+                and re.search(r"\b(?:apakah\s+ada|ada\s+(?:tidak|penjualan|transaksi|order|quotation)|cek\s+(?:ada|apakah))\b", user_q_low)
+            )
             current_retry = int(state.get("retry_count") or 0)
-            if current_retry < 2:
+            if current_retry < 2 and not is_explicit_daily_existence:
                 return {
                     "verification_status": "RETRY",
                     "retry_count": current_retry + 1,
@@ -431,11 +441,34 @@ def verifier_node(state: AgentState) -> Dict[str, Any]:
         )
     )
 
-    if has_strict_document_identifier(extracted_params) or is_strict_product_search or is_strict_marketplace_lookup:
+    user_q_low = (state.get("user_query") or "").lower()
+    is_explicit_daily_existence = bool(
+        (
+            state.get("detected_domain") == "sales"
+            or tool in ("get_top_selling_products", "get_sales_orders", "get_contacts", "get_sales_summary")
+        )
+        and (extracted_params.get("date_from") or extracted_params.get("date_to"))
+        and re.search(r"\b(?:hari\s+ini|kemarin)\b", user_q_low)
+        and re.search(
+            r"\b(?:apakah\s+ada|ada\s+(?:tidak|penjualan|transaksi|order|quotation)|cek\s+(?:ada|apakah))\b",
+            user_q_low,
+        )
+    )
+
+    if (
+        has_strict_document_identifier(extracted_params)
+        or is_strict_product_search
+        or is_strict_marketplace_lookup
+        or is_explicit_daily_existence
+    ):
         guard_type = (
-            "Strict Product Guard"
-            if is_strict_product_search
-            else ("Strict Marketplace Guard" if is_strict_marketplace_lookup else "Strict Identifier Guard")
+            "Strict Daily Sales Existence Guard"
+            if is_explicit_daily_existence
+            else (
+                "Strict Product Guard"
+                if is_strict_product_search
+                else ("Strict Marketplace Guard" if is_strict_marketplace_lookup else "Strict Identifier Guard")
+            )
         )
         logger.info(f"Specific query returned 0 records -> EMPTY ({guard_type}).")
         return {

@@ -115,6 +115,7 @@ _PAGINATED_COLLECTION_KEYS: Set[str] = {
     "adjustments",
     "scraps",
     "orders",
+    "contacts",
     "records",
     "mappings",
     "exceptions",
@@ -233,7 +234,7 @@ def sanitize_erp_payload(
                 if cleaned_val or key in (
                     "calculations", "summary", "totals", "accounts", "entries", "lines", "items",
                     "products", "bills", "breakdown", "net_balance_check", "stock_summary", "price_summary",
-                    "orders", "records", "mappings", "exceptions", "simulations", "stock_logs", "price_logs",
+                    "orders", "contacts", "records", "mappings", "exceptions", "simulations", "stock_logs", "price_logs",
                     "pcls_logs", "anomalies", "by_deduction_category", "by_store", "cashflow_logs",
                     "competitors", "unassigned_company_errors", "log_entry_candidates", "quotation_note_candidates",
                 ):
@@ -460,6 +461,7 @@ def resolve_tool_record_count(tool_result: Any) -> int:
             "warehouses",
             "categories",
             "orders",
+            "contacts",
             "mappings",
             "exceptions",
             "simulations",

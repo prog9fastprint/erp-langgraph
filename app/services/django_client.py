@@ -37,6 +37,7 @@ from app.schemas.tools import (
     SalesOrdersFilterSchema,
     SalesOrderDetailFilterSchema,
     SalesSummaryFilterSchema,
+    ContactsFilterSchema,
     AccountHealthFilterSchema,
     MarketplaceOrdersFilterSchema,
     KilatOrderDiagnosticsFilterSchema,
@@ -850,6 +851,21 @@ class DjangoCoreClient:
         return await self.execute_tool(
             domain="sales",
             tool_name="get_sales_summary",
+            params=_clean_params(params),
+            company_id=company_id,
+            user_token=user_token,
+        )
+
+    async def fetch_contacts(
+        self,
+        params: Optional[Union[ContactsFilterSchema, Dict[str, Any]]] = None,
+        user_token: Optional[str] = None,
+        company_id: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Call sales.get_contacts tool."""
+        return await self.execute_tool(
+            domain="sales",
+            tool_name="get_contacts",
             params=_clean_params(params),
             company_id=company_id,
             user_token=user_token,

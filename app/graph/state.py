@@ -51,6 +51,7 @@ class AgentState(TypedDict, total=False):
     user_roles: Optional[List[str]]
     company_id: Optional[int]
     company_ids: Optional[List[int]]
+    authorized_company_ids: Optional[List[int]]
     is_multi_company: Optional[bool]
     multi_company_results: Optional[Dict[int, Any]]
     unauthorized_companies: Optional[List[int]]
@@ -98,6 +99,7 @@ def create_initial_state(
     user_token: Optional[str] = None,
     company_id: Optional[int] = None,
     company_ids: Optional[List[int]] = None,
+    authorized_company_ids: Optional[List[int]] = None,
     messages: Optional[List[BaseMessage]] = None,
     is_multi_tool: Optional[bool] = False,
     is_multi_company: Optional[bool] = False,
@@ -139,6 +141,7 @@ def create_initial_state(
         "user_roles": user_roles or [],
         "company_id": primary_cid,
         "company_ids": effective_cids,
+        "authorized_company_ids": list(authorized_company_ids) if authorized_company_ids else [],
         "is_multi_company": is_multi_co,
         "multi_company_results": {},
         "unauthorized_companies": [],

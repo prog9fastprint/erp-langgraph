@@ -986,23 +986,103 @@ def _format_single_tool_presentation(
         )
         total_cnt = tool_result.get("total_count", len(orders)) if isinstance(tool_result, dict) else len(orders)
         tot_sum = float(tool_result.get("total_amount_sum") or sum(float(o.get("total_amount") or 0.0) for o in orders))
-        st_filter = tool_result.get("status_filter", "confirmed") if isinstance(tool_result, dict) else "confirmed"
+        st_filter = tool_result.get("status_filter", "active") if isinstance(tool_result, dict) else "active"
+        sort_by = tool_result.get("sort_by") if isinstance(tool_result, dict) else (extracted_params or {}).get("sort_by")
+        has_company = any(bool(o.get("company_name")) for o in orders)
 
-        lines.append(f"### Daftar Pesanan Penjualan ({len(orders)} dari {total_cnt} Dokumen, Status: `{st_filter}`)\n")
+        if orders and sort_by == "amount_desc":
+            top_o = orders[0]
+            top_so = top_o.get("so_number") or "-"
+            top_comp = top_o.get("company_name") or "-"
+            top_cust = top_o.get("customer_name") or "-"
+            top_st = top_o.get("status") or "-"
+            top_amt = float(top_o.get("total_amount") or 0.0)
+            lines.append(
+                f"Nilai penjualan tertinggi pada filter ini tercatat pada quotation/SO `{top_so}` "
+                f"(**{top_comp}**, pelanggan **{top_cust}**, status `{top_st}`) sebesar **{_format_rupiah(top_amt)}**.\n"
+            )
+
+        lines.append(f"### Daftar Pesanan Penjualan & Quotation ({len(orders)} dari {total_cnt} Dokumen, Status: `{st_filter}`)\n")
         if orders:
-            lines.append("| No | No. SO | Tanggal | Pelanggan | Channel | Status | Total Nominal |")
-            lines.append("|:---:|:---|:---:|:---|:---|:---:|:---|")
+            if has_company:
+                lines.append("| No | Cabang | No. SO / Quotation | Tanggal | Pelanggan | Kontak HP | Channel | Status | Total Nominal |")
+                lines.append("|:---:|:---|:---|:---:|:---|:---|:---|:---:|:---|")
+            else:
+                lines.append("| No | No. SO / Quotation | Tanggal | Pelanggan | Kontak HP | Channel | Status | Total Nominal |")
+                lines.append("|:---:|:---|:---:|:---|:---|:---|:---:|:---|")
             for idx, o in enumerate(orders, start=1):
                 so_num = o.get("so_number") or "-"
                 dt = o.get("quotation_date") or "-"
                 cust = o.get("customer_name") or "-"
+                c_phone = o.get("customer_phone") or o.get("sales_phone") or "-"
                 ch = o.get("channel_name") or "Direct"
                 st = o.get("status") or "-"
                 tot = float(o.get("total_amount") or 0.0)
-                lines.append(f"| {idx} | `{so_num}` | {dt} | {cust} | {ch} | `{st}` | **{_format_rupiah(tot)}** |")
-            lines.append(f"| | **TOTAL** | | | | | **{_format_rupiah(tot_sum)}** |")
+                if has_company:
+                    comp_n = o.get("company_name") or "-"
+                    lines.append(f"| {idx} | **{comp_n}** | `{so_num}` | {dt} | {cust} | {c_phone} | {ch} | `{st}` | **{_format_rupiah(tot)}** |")
+                else:
+                    lines.append(f"| {idx} | `{so_num}` | {dt} | {cust} | {c_phone} | {ch} | `{st}` | **{_format_rupiah(tot)}** |")
+            if has_company:
+                lines.append(f"| | **TOTAL** | | | | | | | **{_format_rupiah(tot_sum)}** |")
+            else:
+                lines.append(f"| | **TOTAL** | | | | | | **{_format_rupiah(tot_sum)}** |")
         else:
-            lines.append("*Tidak ada dokumen sales order yang sesuai dengan kriteria filter.*")
+            lines.append("*Tidak ada dokumen sales order atau quotation yang sesuai dengan kriteria filter.*")
+        return "\n".join(lines)
+
+    # 14.5 Sales: Contacts / Customer Detail
+    if tool == "get_contacts":
+        contacts = tool_result.get("contacts") if isinstance(tool_result, dict) else (
+            tool_result if isinstance(tool_result, list) else []
+        )
+        total_cnt = tool_result.get("total_count", len(contacts)) if isinstance(tool_result, dict) else len(contacts)
+        filters_meta = tool_result.get("filters") if isinstance(tool_result, dict) else {}
+        ctx_parts = []
+        if isinstance(filters_meta, dict):
+            if filters_meta.get("channel_name"):
+                ctx_parts.append(f"Channel: **{filters_meta['channel_name']}**")
+            if filters_meta.get("product_search"):
+                ctx_parts.append(f"Produk: `{filters_meta['product_search']}`")
+            if filters_meta.get("date_from") or filters_meta.get("date_to"):
+                ctx_parts.append(f"Periode: {filters_meta.get('date_from', '-')} s/d {filters_meta.get('date_to', '-')}")
+            if filters_meta.get("status"):
+                ctx_parts.append(f"Status Order: `{filters_meta['status']}`")
+        ctx_suffix = f" ({', '.join(ctx_parts)})" if ctx_parts else ""
+
+        lines.append(f"### Daftar Detail Kontak ({len(contacts)} dari {total_cnt} Kontak){ctx_suffix}\n")
+        if contacts:
+            lines.append("| No | Nama Kontak | No. HP / WA | Kota | Channel | Sales HP | Order / Total Belanja | Dokumen Terbaru |")
+            lines.append("|:---:|:---|:---|:---|:---|:---|:---|:---|")
+            for idx, c in enumerate(contacts, start=1):
+                c_name = c.get("name") or "-"
+                hp = c.get("phone") or c.get("mobile") or "-"
+                city = c.get("city") or c.get("state") or "-"
+                ch_src = c.get("first_time_source") or "-"
+                s_hp = c.get("sales_phone") or "-"
+                o_cnt = int(c.get("orders_count") or 0)
+                t_spent = float(c.get("total_spent") or 0.0)
+                spent_str = f"{o_cnt} order ({_format_rupiah(t_spent)})" if o_cnt > 0 or t_spent > 0 else "-"
+                recent = c.get("recent_orders") or []
+                recent_str = ", ".join(
+                    f"`{ro.get('so_number')}` ({ro.get('company_name') or '-'}, `{ro.get('status') or '-'}`)"
+                    for ro in recent[:2]
+                    if isinstance(ro, dict) and ro.get("so_number")
+                ) or "-"
+                lines.append(f"| {idx} | **{c_name}** | {hp} | {city} | {ch_src} | {s_hp} | {spent_str} | {recent_str} |")
+
+            if len(contacts) <= 3:
+                for c in contacts:
+                    c_name = c.get("name") or "-"
+                    addr = c.get("address") or "-"
+                    email = c.get("email") or "-"
+                    ctype = c.get("contact_type") or "-"
+                    uname = c.get("username_mp") or "-"
+                    lines.append(
+                        f"\n- **{c_name}** | Tipe: {ctype} | Email: {email} | Username MP: {uname} | Alamat: {addr}"
+                    )
+        else:
+            lines.append("*Tidak ada data kontak yang sesuai dengan kriteria filter.*")
         return "\n".join(lines)
 
     # 15. Sales: Sales Order Detail
@@ -1024,7 +1104,18 @@ def _format_single_tool_presentation(
 
         cust = tool_result.get("customer") or {}
         cust_name = cust.get("name") or "-"
-        cust_phone = cust.get("sales_phone") or "-"
+        cust_phone = cust.get("phone") or cust.get("mobile") or cust.get("sales_phone") or "-"
+        cust_city = cust.get("city") or ""
+        cust_email = cust.get("email") or ""
+        cust_addr = cust.get("address") or ""
+        cust_extra_parts = []
+        if cust_email:
+            cust_extra_parts.append(f"Email: {cust_email}")
+        if cust_city:
+            cust_extra_parts.append(f"Kota: {cust_city}")
+        if cust_addr:
+            cust_extra_parts.append(f"Alamat: {cust_addr}")
+        cust_extra_str = f" | {' | '.join(cust_extra_parts)}" if cust_extra_parts else ""
 
         fin = tool_result.get("financial_summary") or {}
         tot_amount = float(fin.get("total_amount") or 0.0)
@@ -1034,7 +1125,7 @@ def _format_single_tool_presentation(
         lines.append(f"- **Cabang / Perusahaan**: {c_name}")
         lines.append(f"- **Status Dokumen**: `{status}` | **Status Packing**: `{packing}`")
         lines.append(f"- **Tanggal Order**: {q_date} | **Termin Pembayaran**: {pay_term}")
-        lines.append(f"- **Pelanggan**: **{cust_name}** (Telp: {cust_phone})")
+        lines.append(f"- **Pelanggan**: **{cust_name}** (Telp/HP: {cust_phone}{cust_extra_str})")
         lines.append(f"- **Channel**: {channel} | **Metode Pengiriman**: {deliv}")
         if resi:
             lines.append(f"- **No. Resi Kurir**: `{resi}`")
@@ -2014,24 +2105,97 @@ def _format_multi_company_presentation(state: AgentState) -> str:
         lines.append(f"| **TOTAL GABUNGAN** | **{_format_rupiah(tot_rev)}** | **{tot_orders:,}** | **{_format_rupiah(aov_grand)}** | **{_format_rupiah(tot_pipe)}** |")
 
     elif tool == "get_sales_orders":
-        lines.append("### Ringkasan Pesanan Penjualan Multi-Cabang\n")
-        lines.append("| Cabang | Jumlah Pesanan | Total Nominal | Status Filter |")
-        lines.append("|:---|:---:|:---|:---:|")
+        merged_orders: List[Dict[str, Any]] = []
+        branch_rows: List[str] = []
         grand_cnt = 0
         grand_sum = 0.0
         for cid in sorted(mc_results.keys()):
             res = mc_results[cid]
             c_name = COMPANY_NAME_MAP.get(cid, f"Cabang {cid}")
             if not res or not isinstance(res, dict):
-                lines.append(f"| **{c_name}** | - | *Tidak ada data* | - |")
+                branch_rows.append(f"| **{c_name}** | - | *Tidak ada data* | - |")
                 continue
             cnt = int(res.get("total_count") or 0)
             tot = float(res.get("total_amount_sum") or 0.0)
-            st = res.get("status_filter") or "confirmed"
+            st = res.get("status_filter") or "active"
             grand_cnt += cnt
             grand_sum += tot
-            lines.append(f"| **{c_name}** | {cnt:,} | **{_format_rupiah(tot)}** | `{st}` |")
+            branch_rows.append(f"| **{c_name}** | {cnt:,} | **{_format_rupiah(tot)}** | `{st}` |")
+            for o in (res.get("orders") or []):
+                if isinstance(o, dict):
+                    row_copy = dict(o)
+                    if not row_copy.get("company_name"):
+                        row_copy["company_name"] = c_name
+                    merged_orders.append(row_copy)
+
+        ext_params = state.get("extracted_params") or {}
+        if ext_params.get("sort_by") == "amount_desc" or any(
+            k in user_query.lower() for k in ("terbanyak", "terbesar", "tertinggi", "nominal")
+        ):
+            merged_orders.sort(key=lambda r: float(r.get("total_amount") or 0.0), reverse=True)
+
+        if merged_orders:
+            top_o = merged_orders[0]
+            lines.append(
+                f"Nilai penjualan tertinggi tercatat pada quotation/SO `{top_o.get('so_number') or '-'}` "
+                f"(**{top_o.get('company_name') or '-'}**, pelanggan **{top_o.get('customer_name') or '-'}**, status `{top_o.get('status') or '-'}`) "
+                f"sebesar **{_format_rupiah(float(top_o.get('total_amount') or 0.0))}**.\n"
+            )
+            lines.append("### Daftar Quotation & Pesanan Penjualan Lintas Cabang\n")
+            lines.append("| No | Cabang | No. SO / Quotation | Tanggal | Pelanggan | Kontak HP | Channel | Status | Total Nominal |")
+            lines.append("|:---:|:---|:---|:---:|:---|:---|:---|:---:|:---|")
+            for idx, o in enumerate(merged_orders[:20], start=1):
+                c_phone = o.get("customer_phone") or o.get("sales_phone") or "-"
+                lines.append(
+                    f"| {idx} | **{o.get('company_name') or '-'}** | `{o.get('so_number') or '-'}` | "
+                    f"{o.get('quotation_date') or '-'} | {o.get('customer_name') or '-'} | {c_phone} | "
+                    f"{o.get('channel_name') or 'Direct'} | `{o.get('status') or '-'}` | **{_format_rupiah(float(o.get('total_amount') or 0.0))}** |"
+                )
+            lines.append("")
+
+        lines.append("### Ringkasan Pesanan Penjualan Multi-Cabang\n")
+        lines.append("| Cabang | Jumlah Pesanan | Total Nominal | Status Filter |")
+        lines.append("|:---|:---:|:---|:---:|")
+        lines.extend(branch_rows)
         lines.append(f"| **TOTAL GABUNGAN** | **{grand_cnt:,}** | **{_format_rupiah(grand_sum)}** | |")
+
+    elif tool == "get_contacts":
+        merged_contacts: List[Dict[str, Any]] = []
+        seen_contact_keys = set()
+        for cid in sorted(mc_results.keys()):
+            res = mc_results[cid]
+            if not res or not isinstance(res, dict):
+                continue
+            for c in (res.get("contacts") or []):
+                if not isinstance(c, dict):
+                    continue
+                dedup_key = c.get("id") or (c.get("name"), c.get("phone"))
+                if dedup_key in seen_contact_keys:
+                    continue
+                seen_contact_keys.add(dedup_key)
+                merged_contacts.append(c)
+
+        lines.append(f"### Daftar Detail Kontak Lintas Cabang ({len(merged_contacts)} Kontak)\n")
+        if merged_contacts:
+            lines.append("| No | Nama Kontak | No. HP / WA | Kota | Channel | Sales HP | Order / Total Belanja | Dokumen Terbaru |")
+            lines.append("|:---:|:---|:---|:---|:---|:---|:---|:---|")
+            for idx, c in enumerate(merged_contacts[:20], start=1):
+                o_cnt = int(c.get("orders_count") or 0)
+                t_spent = float(c.get("total_spent") or 0.0)
+                spent_str = f"{o_cnt} order ({_format_rupiah(t_spent)})" if o_cnt > 0 or t_spent > 0 else "-"
+                recent = c.get("recent_orders") or []
+                recent_str = ", ".join(
+                    f"`{ro.get('so_number')}` ({ro.get('company_name') or '-'}, `{ro.get('status') or '-'}`)"
+                    for ro in recent[:2]
+                    if isinstance(ro, dict) and ro.get("so_number")
+                ) or "-"
+                lines.append(
+                    f"| {idx} | **{c.get('name') or '-'}** | {c.get('phone') or c.get('mobile') or '-'} | "
+                    f"{c.get('city') or c.get('state') or '-'} | {c.get('first_time_source') or '-'} | "
+                    f"{c.get('sales_phone') or '-'} | {spent_str} | {recent_str} |"
+                )
+        else:
+            lines.append("*Tidak ada data kontak yang ditemukan pada cabang yang diperiksa.*")
 
     elif tool == "get_low_stock_alerts":
         exclude_zero = any(
@@ -2273,6 +2437,16 @@ def format_deterministic_answer(state: AgentState) -> str:
                 continue
             if p.get("vendor_name"):
                 _add_hint(f"Vendor: **{p['vendor_name']}**")
+            if p.get("customer_name"):
+                _add_hint(f"Pelanggan: **{p['customer_name']}**")
+            if p.get("channel_name"):
+                _add_hint(f"Channel: **{p['channel_name']}**")
+            if p.get("product_search"):
+                _add_hint(f"Produk: **{p['product_search']}**")
+            if p.get("search"):
+                _add_hint(f"Kata Kunci: **{p['search']}**")
+            if p.get("order_ref"):
+                _add_hint(f"No. SO/Quotation: **{p['order_ref']}**")
             if p.get("date_from") or p.get("date_to"):
                 _add_hint(f"Periode: **{p.get('date_from', '-')} s/d {p.get('date_to', '-')}**")
             if p.get("account_code"):
@@ -2285,13 +2459,25 @@ def format_deterministic_answer(state: AgentState) -> str:
                 _add_hint(f"Lokasi: **{p['location_name']}**")
 
         hint_str = f" ({', '.join(filter_hints)})" if filter_hints else ""
+        if domain in ("sales", "inventory", "marketplace") or tool in (
+            "get_contacts", "get_sales_orders", "get_sales_order_detail", "get_top_selling_products", "get_sales_summary"
+        ):
+            advice = (
+                "- Silakan periksa kembali nomor SO/quotation, nama kontak, kata kunci produk, "
+                "atau pastikan transaksi telah tercatat di cabang terkait pada periode tersebut."
+            )
+        else:
+            advice = (
+                "- Silakan periksa kembali ketepatan nomor dokumen, nama vendor, "
+                "atau pastikan periode transaksi telah tercatat di ERP."
+            )
         return (
             f"### Data Tidak Ditemukan\n\n"
             f"Setelah dilakukan penelusuran pada database ERP FastPrint{hint_str}, "
             f"tidak ditemukan data transaksi yang sesuai.\n\n"
             f"**Catatan Verifikasi**:\n"
-            f"- Sistem telah mencoba relaksasi batasan filter tanggal dan kata kunci pencarian secara otomatis (maksimal 2x).\n"
-            f"- Silakan periksa kembali ketepatan nomor dokumen, nama vendor, atau pastikan periode transaksi telah tercatat di ERP."
+            f"- Sistem telah mencoba relaksasi batasan filter atau pengecekan cabang secara otomatis (maksimal 2x).\n"
+            f"{advice}"
         )
 
     multi_results = state.get("multi_tool_results") or {}
@@ -2933,6 +3119,7 @@ _PAGINATED_TABLE_TOOLS_META: Dict[str, str] = {
     "get_general_ledger": "accounts",
     "get_vendor_bills": "bills",
     "get_sales_orders": "orders",
+    "get_contacts": "contacts",
     "get_marketplace_orders": "orders",
 }
 

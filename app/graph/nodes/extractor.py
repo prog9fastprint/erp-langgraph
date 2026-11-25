@@ -10,7 +10,7 @@ from datetime import date, timedelta
 import os
 import re
 import sys
-from typing import Any, Dict, List, Optional, Tuple, Type
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Type
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import SystemMessage, HumanMessage
 from pydantic import BaseModel
@@ -49,6 +49,7 @@ from app.schemas.tools import (
     SalesOrdersFilterSchema,
     SalesOrderDetailFilterSchema,
     SalesSummaryFilterSchema,
+    ContactsFilterSchema,
     AccountHealthFilterSchema,
     MarketplaceOrdersFilterSchema,
     KilatOrderDiagnosticsFilterSchema,
@@ -88,6 +89,7 @@ TOOL_SCHEMA_REGISTRY: Dict[str, Type[BaseModel]] = {
     "get_sales_orders": SalesOrdersFilterSchema,
     "get_sales_order_detail": SalesOrderDetailFilterSchema,
     "get_sales_summary": SalesSummaryFilterSchema,
+    "get_contacts": ContactsFilterSchema,
     "get_account_health": AccountHealthFilterSchema,
     "get_marketplace_orders": MarketplaceOrdersFilterSchema,
     "get_kilat_order_diagnostics": KilatOrderDiagnosticsFilterSchema,
@@ -1114,7 +1116,91 @@ _TOP_SALES_STOPWORDS = {
     "minggu", "kemarin", "ini", "itu", "lalu", "terakhir", "berapa", "cek", "tampilkan",
     "daftar", "peringkat", "dari", "di", "ke", "pada", "untuk", "dan", "serta", "atau",
     "unit", "qty", "revenue", "ytd", "mtd",
+    "jenis", "apapun", "macam", "tipe", "segala", "aneka", "apa", "saja", "aja",
+    "apakah", "ada", "terkait", "khusus", "semuanya", "tidak",
+    "wa", "whatsapp", "shopee", "tokopedia", "tokped", "tiktok", "lazada", "blibli",
+    "website", "offline", "channel",
 }
+
+_SALES_CHANNEL_PATTERNS = [
+    (r"\b(?:whatsapp|wa)\b", "WA"),
+    (r"\bshopee\b", "Shopee"),
+    (r"\btokopedia\b|\btokped\b", "Tokopedia"),
+    (r"\btiktok(?:\s+shop)?\b", "TikTok"),
+    (r"\blazada\b", "Lazada"),
+    (r"\bblibli\b", "Blibli"),
+    (r"\bwebsite\b|\bweb\b", "Website"),
+    (r"\boffline\b|\bwalk[\s-]?in\b|\btoko\s+fisik\b", "Offline"),
+]
+
+
+def _extract_sales_channel(query: str) -> Optional[str]:
+    """Extract canonical ERP Sales Channel name from natural language text."""
+    q = (query or "").strip()
+    if not q:
+        return None
+    for pat, canonical in _SALES_CHANNEL_PATTERNS:
+        if re.search(pat, q, re.IGNORECASE):
+            return canonical
+    return None
+
+
+def _extract_prior_sales_context(
+    messages: Optional[Sequence[Any]],
+    today: date,
+    state: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Recover product_search, date_from/date_to, and confirmed/active status hint
+    from prior conversation turns or state for anaphoric follow-ups (e.g. 'di wa itu contactnya siapa saja').
+    """
+    ctx: Dict[str, Any] = {}
+    if state:
+        prior_params = state.get("extracted_params") or {}
+        for p_key in ("product_search", "search", "code", "sku"):
+            val = prior_params.get(p_key)
+            if val and isinstance(val, str) and val.lower() not in _TOP_SALES_STOPWORDS:
+                ctx["product_search"] = val.strip()
+                break
+        if prior_params.get("date_from"):
+            ctx["date_from"] = prior_params["date_from"]
+        if prior_params.get("date_to"):
+            ctx["date_to"] = prior_params["date_to"]
+        prior_tool = state.get("detected_tool") or ""
+        if prior_tool in ("get_top_selling_products", "get_sales_summary"):
+            ctx["prior_confirmed_sales"] = True
+
+    if messages:
+        # Inspect recent HumanMessages excluding current turn (last element)
+        prior_msgs = list(messages[:-1]) if len(messages) > 1 else []
+        for msg in reversed(prior_msgs):
+            if getattr(msg, "type", None) != "human":
+                continue
+            content = str(getattr(msg, "content", "") or "").strip()
+            if not content:
+                continue
+            low = content.lower()
+            if not ctx.get("product_search"):
+                top_ext = _fallback_extract_top_selling_products(content, today)
+                if top_ext.get("search"):
+                    ctx["product_search"] = top_ext["search"]
+                else:
+                    prod_ext = _fallback_extract_product_info(content, None)
+                    if prod_ext.get("search") or prod_ext.get("code"):
+                        ctx["product_search"] = prod_ext.get("search") or prod_ext.get("code")
+            if not ctx.get("date_from") and has_temporal_expression(content):
+                df, dt = resolve_relative_dates(content, today)
+                if df:
+                    ctx["date_from"] = df
+                if dt:
+                    ctx["date_to"] = dt
+            if not ctx.get("prior_confirmed_sales"):
+                if re.search(r"\b(?:penjualan|terjual|omzet|omset)\b", low) and not re.search(r"\b(?:quotation|penawaran)\b", low):
+                    ctx["prior_confirmed_sales"] = True
+            if ctx.get("product_search") and ctx.get("date_from"):
+                break
+
+    return ctx
 
 
 def _fallback_extract_top_selling_products(query: str, ref_date: Optional[date] = None) -> Dict[str, Any]:
@@ -1132,6 +1218,10 @@ def _fallback_extract_top_selling_products(query: str, ref_date: Optional[date] 
         params["sort_by"] = "qty"
     else:
         params["sort_by"] = "revenue"
+
+    ch = _extract_sales_channel(cleaned)
+    if ch:
+        params["channel_name"] = ch
 
     # Extract explicit SKU token first
     sku_m = re.search(r"\b(?:sku|kode(?:\s+produk|\s+barang)?)\s*[:#]?\s*([A-Za-z0-9._\-\/]{2,40})\b", cleaned, re.IGNORECASE)
@@ -1156,7 +1246,7 @@ def _fallback_extract_top_selling_products(query: str, ref_date: Optional[date] 
 
     if not params.get("search"):
         m_post = re.search(
-            r"\b(?:(?:omzet|omset)\s+)?(?:penjualan|omzet|omset|terjual)\s+(?:produk\s+|barang\s+)?([A-Za-z0-9\s\.\-\+\/]+?)(?:\s+\b(?:bulan|tahun|hari|minggu|kemarin|di|ke|pada|cabang|semua|terbanyak|tertinggi|terbesar|terlaris|dimana|berapa)\b|$)",
+            r"\b(?:(?:omzet|omset)\s+)?(?:penjualan|omzet|omset|terjual)\s+(?:produk\s+|barang\s+)?([A-Za-z0-9\s\.\-\+\/]+?)(?:\s+\b(?:bulan|tahun|hari|minggu|kemarin|di|ke|pada|cabang|semua|terbanyak|tertinggi|terbesar|terlaris|dimana|berapa|jenis|apapun)\b|$)",
             cleaned,
             re.IGNORECASE,
         )
@@ -1202,23 +1292,147 @@ def _fallback_extract_top_selling_products(query: str, ref_date: Optional[date] 
     return params
 
 
-def _fallback_extract_sales_orders(query: str, today: date) -> Dict[str, Any]:
+_CONTACT_STOPWORDS = {
+    "detail", "info", "informasi", "profil", "profile", "data", "daftar", "list",
+    "cek", "cari", "tampilkan", "lihat", "siapa", "saja", "aja", "apa", "mana",
+    "dimana", "di", "ke", "dari", "pada", "untuk", "yang", "itu", "ini", "tersebut",
+    "tadi", "nya", "kontak", "contact", "contacts", "contactnya", "kontaknya",
+    "pelanggan", "customer", "customers", "pembeli", "klien", "client", "vendor",
+    "supplier", "pemasok", "toko", "no", "nomor", "hp", "telp", "telepon", "wa",
+    "whatsapp", "alamat", "email", "kota", "shopee", "tokopedia", "tokped", "tiktok",
+    "lazada", "blibli", "website", "offline", "channel", "penjualan", "pembelian",
+    "order", "transaksi", "bulan", "tahun", "hari", "minggu", "kemarin", "semua",
+    "seluruh", "cabang", "perusahaan", "dong", "ya", "kak", "min", "tolong",
+}
+
+
+def _fallback_extract_contacts(
+    query: str,
+    today: date,
+    messages: Optional[Sequence[Any]] = None,
+    state: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Deterministic heuristic extraction for sales.get_contacts."""
+    params: Dict[str, Any] = {"limit": 20, "offset": 0}
+    cleaned = (query or "").strip()
+    clean_q = cleaned.lower()
+
+    ch = _extract_sales_channel(cleaned)
+    if ch:
+        params["channel_name"] = ch
+
+    # Direct explicit contact name / phone / email lookup (e.g. 'detail contact Budi Santoso', 'kontak 08123456')
+    m_phone = re.search(r"\b(\+?62\d{7,14}|08\d{7,13})\b", cleaned)
+    if m_phone:
+        params["search"] = m_phone.group(1)
+    elif "@" in cleaned:
+        m_email = re.search(r"([A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,})", cleaned)
+        if m_email:
+            params["search"] = m_email.group(1)
+    else:
+        # Strip structural prefixes and stopwords to isolate an entity name
+        stripped = strip_company_scope_keywords(cleaned)
+        # Preserve multi-word proper names after contact keyword if present
+        m_named = re.search(
+            r"\b(?:detail\s+(?:kontak|contact|customer|pelanggan)|kontak|contact|customer|pelanggan|pembeli)\s+([A-Za-z0-9\.\-\s]{2,60})$",
+            stripped,
+            re.IGNORECASE,
+        )
+        cand_src = m_named.group(1) if m_named else stripped
+        words = [
+            w.strip("?!.,:;\"'")
+            for w in cand_src.split()
+            if w.strip("?!.,:;\"'").lower() not in _CONTACT_STOPWORDS
+            and not _is_pure_branch_token(w.strip("?!.,:;\"'"))
+            and not re.match(r"^20\d\d$", w.strip("?!.,:;\"'"))
+        ]
+        if words:
+            params["search"] = " ".join(words)
+
+    # Explicit date parsing
+    m_year = re.search(r"\b(20\d\d)\b", query)
+    if m_year:
+        yr = int(m_year.group(1))
+        params["date_from"] = f"{yr}-01-01"
+        params["date_to"] = f"{yr}-12-31"
+    else:
+        df, dt = resolve_relative_dates(query, today)
+        if df:
+            params["date_from"] = df
+        if dt:
+            params["date_to"] = dt
+
+    # Anaphoric / channel follow-up inheritance (e.g. "di wa itu contactnya siapa saja")
+    is_followup = (
+        has_anaphoric_reference(cleaned)
+        or (bool(ch) and not params.get("search"))
+        or bool(re.search(r"\b(?:siapa\s+(?:saja|aja)|contactnya|kontaknya|pembelinya|pelanggannya|customernya)\b", clean_q))
+    )
+    if is_followup:
+        prior_ctx = _extract_prior_sales_context(messages, today, state=state)
+        if not params.get("search") and prior_ctx.get("product_search"):
+            params["product_search"] = prior_ctx["product_search"]
+        if not params.get("date_from") and not params.get("date_to") and prior_ctx.get("date_from"):
+            params["date_from"] = prior_ctx["date_from"]
+            if prior_ctx.get("date_to"):
+                params["date_to"] = prior_ctx["date_to"]
+            params["_inherited_dates"] = True
+        if prior_ctx.get("prior_confirmed_sales") and not re.search(r"\b(?:quotation|penawaran|semua|all)\b", clean_q):
+            params["status"] = "confirmed"
+        else:
+            params["status"] = "active"
+    else:
+        params["status"] = "all" if params.get("search") else "active"
+
+    # Vendor scoping: customer/channel/sales queries set is_vendor=False; direct name lookup searches all (None)
+    if re.search(r"\b(?:vendor|supplier|pemasok)\b", clean_q):
+        params["is_vendor"] = True
+    elif params.get("channel_name") or params.get("product_search") or re.search(
+        r"\b(?:pelanggan|customer|pembeli|penjualan|order|quotation)\b", clean_q
+    ):
+        params["is_vendor"] = False
+
+    return params
+
+
+def _fallback_extract_sales_orders(
+    query: str,
+    today: date,
+    messages: Optional[Sequence[Any]] = None,
+    state: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     """Deterministic heuristic extraction for sales.get_sales_orders."""
     params: Dict[str, Any] = {"limit": 20, "offset": 0, "status": "confirmed"}
 
     clean_q = query.lower()
-    if "quotation" in clean_q or "penawaran" in clean_q:
-        params["status"] = "quotation"
-    elif "cancel" in clean_q or "batal" in clean_q or "dibatalkan" in clean_q:
+    if "cancel" in clean_q or "batal" in clean_q or "dibatalkan" in clean_q:
         params["status"] = "cancel"
-    elif "semua" in clean_q or "all" in clean_q:
+    elif re.search(r"\b(?:semua\s+(?:status|order|quotation)|all\s+status)\b", clean_q) or (
+        ("semua" in clean_q or "all" in clean_q) and not re.search(r"\b(?:semua|seluruh)\s+(?:cabang|perusahaan|toko|outlet)\b", clean_q)
+    ):
         params["status"] = "all"
     elif "lunas" in clean_q or "paid" in clean_q:
         params["status"] = "paid"
     elif "invoiced" in clean_q or "faktur" in clean_q:
         params["status"] = "invoiced"
+    elif re.search(r"\b(?:draft\s+quotation|status\s+quotation|masih\s+quotation|belum\s+(?:confirm|terkonfirmasi)|hanya\s+quotation|only\s+quotation|(?:daftar|list|tampilkan)\s+quotation)\b", clean_q):
+        params["status"] = "quotation"
+    elif "quotation" in clean_q or "penawaran" in clean_q:
+        params["status"] = "active"
 
-    m_limit = re.search(r"\b(?:limit|tampilkan|daftar)?\s*(\d+)\s*(?:so|pesanan|order)?\b", query, re.IGNORECASE)
+    if re.search(r"\b(?:ter\s*banyak|ter\s*besar|ter\s*tinggi|paling\s+(?:banyak|besar|tinggi)|top|nominal)\b", clean_q):
+        params["sort_by"] = "amount_desc"
+
+    ch = _extract_sales_channel(query)
+    if ch:
+        params["channel_name"] = ch
+
+    if (has_anaphoric_reference(query) or ch) and not re.search(r"\b(?:terbanyak|terbesar|tertinggi)\b", clean_q):
+        prior_ctx = _extract_prior_sales_context(messages, today, state=state)
+        if prior_ctx.get("product_search"):
+            params["product_search"] = prior_ctx["product_search"]
+
+    m_limit = re.search(r"\b(?:limit|tampilkan|daftar)?\s*(\d+)\s*(?:so|pesanan|order|quotation)?\b", query, re.IGNORECASE)
     if m_limit:
         try:
             val = int(m_limit.group(1))
@@ -1247,6 +1461,11 @@ def _fallback_extract_sales_order_detail(query: str) -> Dict[str, Any]:
     """Deterministic heuristic extraction for sales.get_sales_order_detail."""
     params: Dict[str, Any] = {}
 
+    m_branch_so = re.search(r"\b([A-Za-z]{2,5}/SO/\d+(?:/[A-Za-z0-9_-]+)?)\b", query, re.IGNORECASE)
+    if m_branch_so:
+        params["order_ref"] = m_branch_so.group(1).upper()
+        return params
+
     m_so = re.search(r"\b(SO[/-][a-zA-Z0-9/_-]+)\b", query, re.IGNORECASE)
     if m_so:
         params["order_ref"] = m_so.group(1)
@@ -1257,10 +1476,10 @@ def _fallback_extract_sales_order_detail(query: str) -> Dict[str, Any]:
         params["order_ref"] = m_inv.group(1)
         return params
 
-    m_num = re.search(r"\b(?:so|nomor|no\.?|order|pesanan|resi)\s*[:#]?\s*([a-zA-Z0-9/_-]+)\b", query, re.IGNORECASE)
+    m_num = re.search(r"\b(?:so|quotation|penawaran|nomor|no\.?|order|pesanan|resi)\s*[:#]?\s*([a-zA-Z0-9/_-]+)\b", query, re.IGNORECASE)
     if m_num:
         cand = m_num.group(1).strip()
-        if cand.lower() not in ("ini", "itu", "terbaru", "kemarin", "hari", "bulan", "tahun"):
+        if cand.lower() not in ("ini", "itu", "terbaru", "kemarin", "hari", "bulan", "tahun", "mana", "terbanyak"):
             params["order_ref"] = cand
             return params
 
@@ -1783,6 +2002,14 @@ def _extract_single_tool_params(
         fast_params = _fallback_extract_top_selling_products(sub_query, today)
         if fast_params:
             extracted_dict = dict(fast_params)
+    elif tool_name == "get_contacts" and retry_count == 0:
+        fast_params = _fallback_extract_contacts(sub_query, today, state.get("messages"), state=state)
+        if fast_params:
+            extracted_dict = dict(fast_params)
+    elif tool_name == "get_sales_orders" and retry_count == 0:
+        fast_params = _fallback_extract_sales_orders(sub_query, today, state.get("messages"), state=state)
+        if fast_params.get("status") == "active" or fast_params.get("sort_by") == "amount_desc" or fast_params.get("channel_name") or fast_params.get("product_search"):
+            extracted_dict = dict(fast_params)
 
     # 1. LLM Structured Output Attempt
     if extracted_dict is None and model is not None:
@@ -1898,11 +2125,13 @@ def _extract_single_tool_params(
         elif tool_name == "get_top_selling_products":
             extracted_dict = _fallback_extract_top_selling_products(sub_query, today)
         elif tool_name == "get_sales_orders":
-            extracted_dict = _fallback_extract_sales_orders(sub_query, today)
+            extracted_dict = _fallback_extract_sales_orders(sub_query, today, state.get("messages"), state=state)
         elif tool_name == "get_sales_order_detail":
             extracted_dict = _fallback_extract_sales_order_detail(sub_query)
         elif tool_name == "get_sales_summary":
             extracted_dict = _fallback_extract_sales_summary(sub_query, today)
+        elif tool_name == "get_contacts":
+            extracted_dict = _fallback_extract_contacts(sub_query, today, state.get("messages"), state=state)
         elif tool_name == "get_account_health":
             extracted_dict = _fallback_extract_account_health(sub_query)
         elif tool_name == "get_marketplace_orders":
@@ -2100,8 +2329,11 @@ def _extract_single_tool_params(
         if not extracted_dict.get("date_to") and rel_date_to:
             extracted_dict["date_to"] = rel_date_to
 
+    has_inherited_dates = bool(extracted_dict.pop("_inherited_dates", False))
+
     # Strict date enforcement: if query mentions no explicit dates or temporal keywords, drop hallucinated dates
-    if supports_dates and not has_temporal_expression(sub_query) and not has_temporal_expression(user_query):
+    # Exception: referential sales follow-ups inheriting dates from prior turn (e.g. 'di wa itu contactnya siapa saja').
+    if supports_dates and not has_inherited_dates and not has_temporal_expression(sub_query) and not has_temporal_expression(user_query):
         extracted_dict.pop("date_from", None)
         extracted_dict.pop("date_to", None)
 
@@ -2216,7 +2448,15 @@ def _extract_single_tool_params(
     has_doc_identifier = bool(
         extracted_dict.get("entry_number")
         or extracted_dict.get("reference")
-        or (extracted_dict.get("search") and re.search(r"\b(?:[A-Za-z0-9_\-]+/)+\d{4}/\d+\b", str(extracted_dict.get("search"))))
+        or extracted_dict.get("order_ref")
+        or (
+            extracted_dict.get("search")
+            and re.search(
+                r"\b(?:(?:[A-Za-z0-9_\-]+/)+\d{4}/\d+|[A-Za-z]{2,5}/SO/\d+)\b",
+                str(extracted_dict.get("search")),
+                re.IGNORECASE,
+            )
+        )
     )
     if retry_count == 1:
         extracted_dict.pop("date_from", None)
@@ -2231,6 +2471,18 @@ def _extract_single_tool_params(
             elif tool_name == "get_journal_entries":
                 extracted_dict.pop("status", None)
                 extracted_dict.pop("search", None)
+            elif tool_name == "get_sales_orders":
+                extracted_dict["status"] = "all"
+                extracted_dict.pop("search", None)
+                extracted_dict.pop("customer_name", None)
+                extracted_dict.pop("product_search", None)
+            elif tool_name == "get_contacts":
+                extracted_dict["status"] = "all"
+                extracted_dict.pop("product_search", None)
+                extracted_dict.pop("search", None)
+            elif domain == "sales":
+                extracted_dict.pop("search", None)
+                extracted_dict.pop("channel_name", None)
             elif domain == "marketplace":
                 extracted_dict.pop("search", None)
                 if not extracted_dict.get("account_id"):

@@ -25,6 +25,10 @@ class ChatRequest(BaseModel):
     query: str = Field(..., min_length=1, description="Natural language query from user")
     company_id: Optional[int] = Field(default=1, description="Target ERP company ID (defaults to 1)")
     company_ids: Optional[List[int]] = Field(default=None, description="Optional list of target company IDs for multi-company inquiries")
+    authorized_company_ids: Optional[List[int]] = Field(
+        default=None,
+        description="Optional list of authorized company IDs selected in ERP session for HQ/cross-branch probing",
+    )
     user_token: Optional[str] = Field(default=None, description="Optional JWT authentication token")
     auth_token: Optional[str] = Field(default=None, description="Optional JWT authentication token (alias for user_token)")
     user_id: Optional[str] = Field(default=None, description="Optional authenticated user ID")

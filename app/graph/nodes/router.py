@@ -290,16 +290,29 @@ SALES_SUMMARY_PATTERNS = [
 ]
 
 SALES_ORDER_DETAIL_PATTERNS = [
-    r"\b(?:detail|rincian|status|info|cek)\s+(?:so|sales\s*order|pesanan|order)\s+(?:nomor\s+|no\s*)?([a-zA-Z0-9/\-_]+)\b",
+    r"\b(?:detail|rincian|status|info|cek)\s+(?:so|sales\s*order|quotation|penawaran|pesanan|order)\s+(?:nomor\s+|no\s*)?([a-zA-Z0-9/\-_]+\d+[a-zA-Z0-9/\-_]*)\b",
     r"\b(?:detail|rincian)\s+(?:so|sales\s*order|pesanan|order)\b",
     r"\b(?:lacak|resi|awb)\s+(?:so|pesanan|order|pengiriman)\b",
-    r"\b(?:so|sales\s*order)\s*(?:nomor\s+|no\s*)?[a-zA-Z0-9/\-_]+\s+(?:status|detail|rincian)\b",
+    r"\b(?:so|sales\s*order|quotation)\s*(?:nomor\s+|no\s*)?[a-zA-Z0-9/\-_]+\s+(?:status|detail|rincian)\b",
     r"\bso/\d{4}/\d+\b",
+    r"\b[a-z]{2,5}/so/\d+\b",
+]
+
+SALES_CONTACTS_PATTERNS = [
+    r"\b(?:detail|info|data|cek|cari|lihat|daftar|list)\s+(?:contact|kontak)(?:nya)?\b",
+    r"\b(?:contact|kontak)(?:nya)?\s+(?:siapa(?:\s+saja)?|mana(?:\s+saja)?|apa(?:\s+saja)?)\b",
+    r"\bsiapa\s+(?:saja\s+)?(?:contact|kontak|pelanggan|customer|pembeli|buyer)(?:nya)?\b",
+    r"\b(?:nomor|no\.?)\s*(?:hp|wa|whatsapp|telp|telepon)\s+(?:contact|kontak|pelanggan|customer|pembeli)\b",
+    r"\b(?:contact|kontak)\s+(?:dari\s+|di\s+)?(?:wa|whatsapp|shopee|tiktok|tokopedia|lazada)\b",
+    r"\b(?:contact|kontak)\s+[a-zA-Z0-9]",
 ]
 
 SALES_ORDERS_PATTERNS = [
-    r"\b(?:daftar|list|tampilkan|cari|cek)\s+(?:so|sales\s*order|order\s+penjualan|pesanan\s+penjualan|quotation|penawaran)\b",
-    r"\b(?:so|sales\s*order|order\s+penjualan|pesanan)\s+(?:terbaru|hari\s+ini|bulan\s+ini|kemarin|minggu\s+ini|pending|draft|cancel)\b",
+    r"\b(?:daftar|list|tampilkan|cari|cek|lihat|detail|rincian)\s+(?:so|sales\s*order|order\s+penjualan|pesanan\s+penjualan|quotation|penawaran)\b",
+    r"\b(?:so|sales\s*order|order\s+penjualan|pesanan|quotation|penawaran)\s+(?:terbaru|hari\s+ini|bulan\s+ini|kemarin|minggu\s+ini|pending|draft|cancel)\b",
+    r"\b(?:penjualan|omzet|omset|transaksi|nominal)\s+(?:ter\s*banyak|ter\s*besar|ter\s*tinggi|paling\s+(?:banyak|besar|tinggi))\s+(?:di\s+)?(?:quotation|penawaran|so|sales\s*order)\b",
+    r"\b(?:quotation|penawaran)\s+(?:mana|apa)\s+(?:yang\s+)?(?:penjualan(?:nya)?\s+|nominal(?:nya)?\s+|total(?:nya)?\s+)?(?:ter\s*banyak|ter\s*besar|ter\s*tinggi|paling\s+(?:banyak|besar|tinggi))\b",
+    r"\b(?:penjualan|order|pesanan|transaksi)\s+(?:di\s+|via\s+|lewat\s+|channel\s+)(?:wa|whatsapp|cust\s+datang|website\s+fp|goshop)\b",
     r"\b(?:ada\s+berapa|daftar)\s+(?:pesanan|order)\s+(?:dari|customer|pelanggan)\b",
     r"\bdaftar\s+pesanan\b",
     r"\bpesanan\s+penjualan\b",
@@ -729,16 +742,21 @@ def classify_query_rule_based(query: str) -> Optional[Dict[str, Any]]:
         else:
             candidates.append(("get_locations", "inventory", m_loc.start()))
 
+    # Sales: Contacts (Contact details & channel/product buyer lookup)
+    m_sales_contacts = _find_first_match(SALES_CONTACTS_PATTERNS, cleaned)
+    if m_sales_contacts and not any(kw in cleaned for kw in CUSTOMER_BILLING_TERMS):
+        candidates.append(("get_contacts", "sales", m_sales_contacts.start()))
+
     # Sales: Top selling products by revenue / qty (and product-scoped sales/omzet queries)
     m_top_sales = _find_first_match(SALES_TOP_PRODUCTS_PATTERNS, cleaned)
-    is_product_sales = _has_product_scoped_sales_intent(cleaned)
+    is_product_sales = _has_product_scoped_sales_intent(cleaned) and not m_sales_contacts
     if m_top_sales or is_product_sales:
         pos = m_top_sales.start() if m_top_sales else max(0, cleaned.find("penjualan"))
         candidates.append(("get_top_selling_products", "sales", pos))
 
     # Sales: Summary / Omzet (only when NOT scoped to a specific product or SKU)
     m_sales_summary = _find_first_match(SALES_SUMMARY_PATTERNS, cleaned)
-    if m_sales_summary and not m_top_sales and not is_product_sales:
+    if m_sales_summary and not m_top_sales and not is_product_sales and not m_sales_contacts:
         candidates.append(("get_sales_summary", "sales", m_sales_summary.start()))
 
     # Suppress 'omzet'-only Profit & Loss trigger when sales domain owns the omzet query
@@ -747,12 +765,12 @@ def classify_query_rule_based(query: str) -> Optional[Dict[str, Any]]:
 
     # Sales: Order Detail
     m_sales_detail = _find_first_match(SALES_ORDER_DETAIL_PATTERNS, cleaned)
-    if m_sales_detail and not m_top_sales and not is_product_sales and not m_sales_summary:
+    if m_sales_detail and not m_top_sales and not is_product_sales and not m_sales_summary and not m_sales_contacts:
         candidates.append(("get_sales_order_detail", "sales", m_sales_detail.start()))
 
-    # Sales: Orders List
+    # Sales: Orders List & Quotations
     m_sales_orders = _find_first_match(SALES_ORDERS_PATTERNS, cleaned)
-    if m_sales_orders and not m_top_sales and not is_product_sales and not m_sales_summary and not m_sales_detail:
+    if m_sales_orders and not m_top_sales and not is_product_sales and not m_sales_summary and not m_sales_detail and not m_sales_contacts:
         candidates.append(("get_sales_orders", "sales", m_sales_orders.start()))
 
     # Marketplace Domain: 11 Specialized Operational & Financial Diagnostic Tools
@@ -810,6 +828,7 @@ def classify_query_rule_based(query: str) -> Optional[Dict[str, Any]]:
         and not m_sales_summary
         and not m_sales_detail
         and not m_sales_orders
+        and not m_sales_contacts
         and "get_price_comparison" not in matched_mp_tools
         and (not m_low_stock or _find_first_match([r"\bharga\b", r"\bpricelist\b"], cleaned))
     ):
@@ -962,18 +981,37 @@ def _annotate_multi_company(res: Dict[str, Any], state: AgentState, user_query: 
         resolve_all_branch_company_ids,
         resolve_branch_company_id,
         COMPANY_NAME_MAP,
+        has_anaphoric_reference,
     )
     multi_cids, is_all = resolve_all_branch_company_ids(user_query)
     explicit_single = resolve_branch_company_id(user_query)
 
+    q_low = (user_query or "").lower()
+    active_cid = state.get("company_id")
+    is_hq_active = active_cid in (1, 3)
+
     is_branch_ranking_query = bool(
         res.get("detected_tool") in ("get_top_selling_products", "get_stock_level")
-        and re.search(r"\b(?:di\s*mana|cabang\s+mana|toko\s+mana|outlet\s+mana|gudang\s+mana)\b", user_query or "", re.IGNORECASE)
+        and re.search(r"\b(?:di\s*mana|cabang\s+mana|toko\s+mana|outlet\s+mana|gudang\s+mana)\b", q_low)
+    )
+    is_hq_cross_branch_sales_q = bool(
+        is_hq_active
+        and explicit_single is None
+        and not multi_cids
+        and res.get("detected_tool") in ("get_sales_orders", "get_contacts", "get_top_selling_products", "get_sales_summary")
+        and (
+            re.search(r"\b(?:quotation\s+mana|penjualan\s+.*?\s+mana|apakah\s+ada\s+penjualan|ter\s*banyak\s+di\s+quotation)\b", q_low)
+            or has_anaphoric_reference(q_low)
+        )
     )
 
-    if is_all or (is_branch_ranking_query and explicit_single is None and not multi_cids):
+    if is_all or (is_branch_ranking_query and explicit_single is None and not multi_cids) or is_hq_cross_branch_sales_q:
+        auth_cids = [int(c) for c in (state.get("authorized_company_ids") or []) if c]
+        if is_hq_cross_branch_sales_q and len(auth_cids) > 1:
+            effective_cids = auth_cids
+        else:
+            effective_cids = list(COMPANY_NAME_MAP.keys())
         res["is_multi_company"] = True
-        effective_cids = list(COMPANY_NAME_MAP.keys())
         res["company_ids"] = effective_cids
         res["company_id"] = effective_cids[0]
     elif len(multi_cids) > 1:
@@ -1089,13 +1127,25 @@ def _router_node_impl(
             is_location_interrogative = clean_uq in {
                 "dimana", "di mana", "cabang mana", "toko mana", "gudang mana", "outlet mana",
             }
-            is_branch_mention = bool(resolve_branch_company_id(clean_uq)) or bool(
-                re.search(r"\b(?:di\s+|cabang\s+|gudang\s+|lokasi\s+|rak\s+)([A-Za-z0-9\_\-]+)", clean_uq)
+            _NON_BRANCH_FOLLOWUP_TOKENS = {
+                "wa", "whatsapp", "shopee", "tiktok", "tokopedia", "lazada", "goshop",
+                "website", "offline", "online", "quotation", "penawaran", "order", "so",
+                "contact", "kontak", "produk", "barang", "faktur", "invoice", "jurnal",
+                "mana", "sini", "situ", "atas", "bawah", "dalam", "luar",
+            }
+            m_loc_hint = re.search(r"\b(?:di\s+|cabang\s+|gudang\s+|lokasi\s+|rak\s+)([A-Za-z0-9\_\-]+)", clean_uq)
+            is_branch_mention = bool(resolve_branch_company_id(clean_uq)) or (
+                bool(m_loc_hint) and m_loc_hint.group(1).lower() not in _NON_BRANCH_FOLLOWUP_TOKENS
             )
             is_followup_retry = is_retry_query(clean_uq) or bool(
                 re.search(r"\b(coba\s+(?:(?:di)?cek\s+|(?:di)?periksa\s+|(?:di)?cari\s+)?lagi|(?:di)?cek\s+lagi|coba\s+lagi|ulang(i)?|tes\s+lagi|(?:di)?cek\s+ulang)\b", clean_uq)
             )
-            is_short_followup = len(clean_uq.split()) <= 7 and (
+            has_sales_entity_shift = (
+                _match_any(SALES_CONTACTS_PATTERNS, clean_uq)
+                or _match_any(SALES_ORDERS_PATTERNS, clean_uq)
+                or any(term in clean_uq for term in ("contact", "kontak", "quotation", "penawaran"))
+            )
+            is_short_followup = len(clean_uq.split()) <= 7 and not has_sales_entity_shift and (
                 is_branch_mention or is_followup_retry or is_location_interrogative
             )
 
@@ -1142,6 +1192,7 @@ def _router_node_impl(
             has_new_domain_intent = (
                 any(term in clean_uq for term in CUSTOMER_TERMS)
                 or any(term in clean_uq for term in VENDOR_TERMS)
+                or has_sales_entity_shift
                 or _match_any(GREETING_PATTERNS, clean_uq)
                 or _match_any(OUT_OF_SCOPE_PATTERNS, clean_uq)
                 or _match_any(ACCOUNTING_BALANCE_PATTERNS, clean_uq)
@@ -1222,9 +1273,10 @@ def _router_node_impl(
                 "- 'get_journal_entries': General journal vouchers/entries, memorial entries.\n\n"
                 "SALES TOOLS GUIDE:\n"
                 "- 'get_top_selling_products': Top selling products by volume or revenue.\n"
-                "- 'get_sales_orders': Sales order & quotation list.\n"
-                "- 'get_sales_order_detail': Single SO detail, lines, and AWB/courier.\n"
-                "- 'get_sales_summary': Executive revenue/omzet summary and channel breakdown.\n\n"
+                "- 'get_sales_orders': Sales order & quotation list (filterable by channel, product_search, status, sort_by).\n"
+                "- 'get_sales_order_detail': Single SO / quotation detail, customer contact, lines, and AWB/courier.\n"
+                "- 'get_sales_summary': Executive revenue/omzet summary and channel breakdown.\n"
+                "- 'get_contacts': Customer/buyer contact details (phone, email, address, city, channel, product buyers).\n\n"
                 "MARKETPLACE TOOLS GUIDE (All READ-ONLY):\n"
                 "- 'get_account_health': Store readiness, OAuth token expiry, shop moderation status, missing configs, fetch errors.\n"
                 "- 'get_marketplace_orders': Shipping SLA (overdue/due_soon), missing AWB, cancellations, ERP vs marketplace status mismatch.\n"

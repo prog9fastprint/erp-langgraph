@@ -350,10 +350,12 @@ class ProductCategoriesFilterSchema(BaseModel):
 class TopSellingProductsFilterSchema(BaseModel):
     """Input filter schema for sales.get_top_selling_products."""
     company_id: Optional[int] = Field(None, description="Company ID")
+    company_ids: Optional[List[int]] = Field(None, description="Optional list of authorized company IDs")
     date_from: Optional[str] = Field(None, description="Tanggal awal transaksi (YYYY-MM-DD)")
     date_to: Optional[str] = Field(None, description="Tanggal akhir transaksi (YYYY-MM-DD)")
     limit: int = Field(10, ge=1, le=100, description="Jumlah produk teratas yang ditampilkan (1-100)")
     search: Optional[str] = Field(None, description="Pencarian bebas nama produk atau SKU")
+    channel_name: Optional[str] = Field(None, description="Filter nama sales channel (e.g. 'WA', 'Shopee')")
     sort_by: Optional[Literal["revenue", "qty"]] = Field(None, description="Urutkan peringkat berdasarkan 'revenue' atau 'qty'")
 
     @field_validator("date_from")
@@ -370,16 +372,47 @@ class TopSellingProductsFilterSchema(BaseModel):
 class SalesOrdersFilterSchema(BaseModel):
     """Input filter schema for sales.get_sales_orders."""
     company_id: Optional[int] = Field(None, description="Company ID")
+    company_ids: Optional[List[int]] = Field(None, description="Optional list of authorized company IDs")
     date_from: Optional[str] = Field(None, description="Tanggal awal transaksi (YYYY-MM-DD)")
     date_to: Optional[str] = Field(None, description="Tanggal akhir transaksi (YYYY-MM-DD)")
-    status: Optional[str] = Field("confirmed", description="Filter status: 'confirmed', 'quotation', 'cancel', 'all', atau status spesifik")
+    status: Optional[str] = Field("confirmed", description="Filter status: 'confirmed', 'active', 'quotation', 'cancel', 'all', atau status spesifik")
     customer_name: Optional[str] = Field(None, description="Filter nama pelanggan / customer")
     customer_id: Optional[int] = Field(None, description="Filter ID kontak customer")
-    channel_name: Optional[str] = Field(None, description="Filter nama sales channel (e.g. 'Shopee', 'Tokopedia', 'Offline Store')")
+    channel_name: Optional[str] = Field(None, description="Filter nama sales channel (e.g. 'WA', 'Shopee', 'Tokopedia')")
+    product_search: Optional[str] = Field(None, description="Filter nama produk atau kode SKU pada baris pesanan")
     search: Optional[str] = Field(None, description="Pencarian bebas nomor SO, alias, resi kurir, atau nama pelanggan")
     min_amount: Optional[float] = Field(None, description="Batas minimal total nominal order")
     max_amount: Optional[float] = Field(None, description="Batas maksimal total nominal order")
+    sort_by: Optional[Literal["date_desc", "amount_desc", "amount_asc"]] = Field(
+        None, description="Urutan hasil: 'date_desc' (default), 'amount_desc', atau 'amount_asc'"
+    )
     limit: int = Field(20, ge=1, le=100, description="Batas jumlah baris order (1-100, default 20)")
+    offset: int = Field(0, ge=0, description="Offset paginasi")
+
+    @field_validator("date_from")
+    @classmethod
+    def validate_date_from(cls, v: Optional[str]) -> Optional[str]:
+        return _validate_date_str(v, "date_from")
+
+    @field_validator("date_to")
+    @classmethod
+    def validate_date_to(cls, v: Optional[str]) -> Optional[str]:
+        return _validate_date_str(v, "date_to")
+
+
+class ContactsFilterSchema(BaseModel):
+    """Input filter schema for sales.get_contacts."""
+    company_id: Optional[int] = Field(None, description="Company ID")
+    company_ids: Optional[List[int]] = Field(None, description="Optional list of authorized company IDs")
+    contact_id: Optional[int] = Field(None, description="Specific Contact ID")
+    search: Optional[str] = Field(None, description="Pencarian nama kontak, nomor HP/WA, email, username MP, atau alamat")
+    channel_name: Optional[str] = Field(None, description="Filter kontak yang bertransaksi pada channel tertentu (e.g. 'WA', 'Shopee')")
+    product_search: Optional[str] = Field(None, description="Filter kontak yang membeli produk atau SKU tertentu")
+    date_from: Optional[str] = Field(None, description="Tanggal awal transaksi (YYYY-MM-DD)")
+    date_to: Optional[str] = Field(None, description="Tanggal akhir transaksi (YYYY-MM-DD)")
+    status: Optional[str] = Field(None, description="Filter status pesanan: 'active', 'confirmed', 'quotation', 'cancel', 'all'")
+    is_vendor: Optional[bool] = Field(None, description="Filter kontak vendor (True) vs pelanggan (False)")
+    limit: int = Field(20, ge=1, le=100, description="Batas jumlah kontak (1-100, default 20)")
     offset: int = Field(0, ge=0, description="Offset paginasi")
 
     @field_validator("date_from")
@@ -1265,6 +1298,7 @@ TOOL_DOMAIN_MAP: Dict[str, str] = {
     "get_sales_orders": "sales",
     "get_sales_order_detail": "sales",
     "get_sales_summary": "sales",
+    "get_contacts": "sales",
     "get_account_health": "marketplace",
     "get_marketplace_orders": "marketplace",
     "get_kilat_order_diagnostics": "marketplace",
