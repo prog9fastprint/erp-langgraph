@@ -1,0 +1,307 @@
+"""
+Unit tests for Hybrid Semantic NLU Router & Conservative Disambiguation (Task 2.2).
+Covers MultiRouterDecision clarification validation, hard guardrails, explicit vs ambiguous
+billing split, per-clause parallel hybrid retrieval, dynamic Top-K prompt construction,
+multi-turn clarification resolution, and graceful failure fallback.
+"""
+import unittest
+from unittest.mock import AsyncMock, MagicMock
+
+from langchain_core.messages import AIMessage, HumanMessage
+
+from app.graph.nodes.router import (
+    ClarificationOption,
+    MultiRouterDecision,
+    PlannedToolCall,
+    _try_route_contextual_analysis,
+)
+from app.graph.nodes.router_semantic import (
+    aroute_semantic_nlu,
+    aretrieve_candidate_tools,
+    build_scoped_router_system_prompt,
+    check_hard_guardrails,
+    is_explicit_customer_billing_query,
+    is_hard_write_block_query,
+    match_strict_document_identifier,
+    route_semantic_nlu_sync,
+)
+from app.graph.state import create_initial_state
+
+
+def _make_mock_llm(decision: MultiRouterDecision) -> MagicMock:
+    """Create a mock BaseChatModel whose with_structured_output returns decision."""
+    structured = MagicMock()
+    structured.ainvoke = AsyncMock(return_value=decision)
+    structured.invoke = MagicMock(return_value=decision)
+    model = MagicMock()
+    model.with_structured_output = MagicMock(return_value=structured)
+    return model
+
+
+class TestMultiRouterDecisionClarification(unittest.TestCase):
+    """Validate MultiRouterDecision clarification fields and Pydantic reconciliation."""
+
+    def test_clarification_clears_tools_strips_emojis_and_caps_options(self):
+        decision = MultiRouterDecision(
+            domain="sales",
+            query_mode="clarification",
+            tool="get_sales_orders",
+            planned_tools=[PlannedToolCall(tool="get_sales_orders", domain="sales")],
+            needs_clarification=True,
+            clarification_question="Order mana yang ingin Anda cek?",
+            clarification_options=[
+                ClarificationOption(label="📋 Sales Order ERP", query="Cek sales order minggu ini"),
+                ClarificationOption(label="🛒 Order Marketplace", query="Cek order marketplace minggu ini"),
+                ClarificationOption(label="Duplikat", query="cek sales order minggu ini!"),
+                ClarificationOption(label="Pesanan Kilat", query="Cek pesanan kilat Shopee", icon="bad<tag>"),
+                ClarificationOption(label="Opsi 4", query="Cek omzet minggu ini"),
+                ClarificationOption(label="Opsi 5", query="Cek produk terlaris minggu ini"),
+            ],
+        )
+        self.assertEqual(decision.domain, "clarification")
+        self.assertEqual(decision.query_mode, "clarification")
+        self.assertTrue(decision.needs_clarification)
+        self.assertIsNone(decision.tool)
+        self.assertEqual(decision.planned_tools, [])
+        self.assertEqual(len(decision.clarification_options), 4)
+        self.assertEqual(decision.clarification_options[0].label, "Sales Order ERP")
+        self.assertEqual(decision.clarification_options[1].label, "Order Marketplace")
+        self.assertEqual(decision.clarification_options[2].icon, "fa-arrow-right")
+
+    def test_clarification_populates_default_question_when_blank(self):
+        decision = MultiRouterDecision(
+            domain="clarification",
+            query_mode="clarification",
+            needs_clarification=True,
+            clarification_question="   ",
+        )
+        self.assertTrue(decision.clarification_question)
+        self.assertIn("perjelas", decision.clarification_question.lower())
+
+
+class TestSemanticHardGuardrails(unittest.TestCase):
+    """Validate the 4 zero-risk deterministic hard guardrails + Branch 6/7 splits."""
+
+    def test_greeting_help_meta_route_without_llm(self):
+        for q in ("Halo!", "Selamat pagi admin", "Bisa bantu apa saja?", "yang kamu pakai perusahaan mana?"):
+            with self.subTest(query=q):
+                state = create_initial_state(q)
+                res = check_hard_guardrails(q, state, [q])
+                self.assertIsNotNone(res)
+                self.assertEqual(res["detected_domain"], "general")
+                self.assertEqual(res["query_mode"], "general")
+                self.assertEqual(res["active_tools"], [])
+
+    def test_write_block_vs_diagnostic_read_questions(self):
+        self.assertTrue(is_hard_write_block_query("update stok ke shopee sekarang"))
+        self.assertTrue(is_hard_write_block_query("merge order kilat shopee"))
+        self.assertTrue(is_hard_write_block_query("buatkan jurnal memorial baru"))
+        # Diagnostic read questions must NOT be blocked
+        self.assertFalse(is_hard_write_block_query("kenapa log update stok shopee gagal?"))
+        self.assertFalse(is_hard_write_block_query("simulasi push stok ke shopee SKU HVS-A4"))
+
+    def test_explicit_vs_ambiguous_customer_billing_split(self):
+        """Explicit customer billing stays hard-guardrailed; ambiguous 'cek tagihan <nama>' reaches LLM."""
+        self.assertTrue(is_explicit_customer_billing_query("cek tagihan customer Budi"))
+        self.assertTrue(is_explicit_customer_billing_query("faktur penjualan toko mainstore"))
+        self.assertTrue(is_explicit_customer_billing_query("cek piutang pelanggan bulan ini"))
+        self.assertTrue(is_explicit_customer_billing_query("kuitansi transaksi Andi"))
+
+        # Ambiguous name without vendor/customer context -> False (reaches Scoped LLM for clarification)
+        self.assertFalse(is_explicit_customer_billing_query("coba cek tagihan Frendy Krisnata di mainstore"))
+        self.assertFalse(is_explicit_customer_billing_query("cek invoice Hendra"))
+        # Explicit vendor -> False
+        self.assertFalse(is_explicit_customer_billing_query("cek tagihan vendor PT Sumber Makmur"))
+
+    def test_strict_document_identifier_fast_path(self):
+        self.assertEqual(match_strict_document_identifier("cek surat jalan WH/OUT/00123"), ("get_transfers", "inventory"))
+        self.assertEqual(match_strict_document_identifier("detail MS/SO/0585308"), ("get_sales_order_detail", "sales"))
+        self.assertEqual(match_strict_document_identifier("lihat jurnal JE/2026/0009"), ("get_journal_entries", "accounting"))
+        self.assertEqual(match_strict_document_identifier("cek voucher PC/2026/00002"), ("fetch_vendor_invoices", "accounting"))
+        self.assertIsNone(match_strict_document_identifier("cek stok kertas A4"))
+
+        # Multi-clause query with a doc ID must NOT short-circuit and drop the second intent
+        multi_q = "cek detail MS/SO/0585308 dan cek stok tinta sublim"
+        state = create_initial_state(multi_q)
+        res = check_hard_guardrails(multi_q, state, ["cek detail MS/SO/0585308", "cek stok tinta sublim"])
+        self.assertIsNone(res)
+
+
+class TestSemanticNLURouterPipeline(unittest.IsolatedAsyncioTestCase):
+    """End-to-end unit tests for aroute_semantic_nlu & route_semantic_nlu_sync with mocked LLM."""
+
+    async def test_single_intent_slang_retrieves_scoped_candidates_and_routes(self):
+        """Slang/paraphrase query retrieves Top-K candidates and routes via Scoped LLM with internal_no_stream tag."""
+        q = "pesanan kilat shopee nyangkut hari ini"
+        state = create_initial_state(q)
+        decision = MultiRouterDecision(
+            domain="marketplace",
+            query_mode="live_erp",
+            tool="get_kilat_order_diagnostics",
+            planned_tools=[PlannedToolCall(tool="get_kilat_order_diagnostics", domain="marketplace", sub_query=q)],
+        )
+        mock_llm = _make_mock_llm(decision)
+
+        res = await aroute_semantic_nlu(
+            state=state,
+            user_query=q,
+            get_model_fn=lambda: mock_llm,
+            contextual_analysis_fn=_try_route_contextual_analysis,
+        )
+
+        self.assertIsNotNone(res)
+        self.assertEqual(res["detected_domain"], "marketplace")
+        self.assertEqual(res["detected_tool"], "get_kilat_order_diagnostics")
+        self.assertEqual(res["query_mode"], "live_erp")
+        self.assertFalse(res["needs_clarification"])
+
+        # Verify Scoped LLM prompt contained retrieved Top-K card & internal_no_stream tag
+        structured = mock_llm.with_structured_output.return_value
+        call_args = structured.ainvoke.await_args
+        sent_messages = call_args.args[0]
+        self.assertIn("get_kilat_order_diagnostics", sent_messages[0].content)
+        self.assertEqual(call_args.kwargs.get("config"), {"tags": ["internal_no_stream"]})
+
+    async def test_multi_intent_cross_domain_per_clause_retrieval(self):
+        """Multi-intent query retrieves candidates from each clause in parallel and plans multiple tools."""
+        q = "cek stok kertas A4 dan cek laporan laba rugi bulan ini"
+        state = create_initial_state(q)
+        decision = MultiRouterDecision(
+            domain="inventory",
+            query_mode="live_erp",
+            planned_tools=[
+                PlannedToolCall(tool="get_stock_level", domain="inventory", sub_query="cek stok kertas A4"),
+                PlannedToolCall(tool="get_profit_and_loss", domain="accounting", sub_query="cek laporan laba rugi bulan ini"),
+            ],
+        )
+        mock_llm = _make_mock_llm(decision)
+
+        res = await aroute_semantic_nlu(
+            state=state,
+            user_query=q,
+            get_model_fn=lambda: mock_llm,
+        )
+
+        self.assertTrue(res["is_multi_tool"])
+        self.assertEqual(res["detected_tools"], ["get_stock_level", "get_profit_and_loss"])
+        self.assertEqual(res["detected_domains"], ["inventory", "accounting"])
+        self.assertEqual(len(res["active_tools"]), 2)
+        sent_sys = mock_llm.with_structured_output.return_value.ainvoke.await_args.args[0][0].content
+        self.assertIn("get_stock_level", sent_sys)
+        self.assertIn("get_profit_and_loss", sent_sys)
+
+    async def test_conservative_clarification_and_multiturn_resolution(self):
+        """Turn 1 triggers clarification chips; Turn 2 short reply enriches retrieval and resolves directly."""
+        # Turn 1: Ambiguous query -> clarification
+        q1 = "cek order minggu ini"
+        state1 = create_initial_state(q1)
+        clarify_decision = MultiRouterDecision(
+            domain="clarification",
+            query_mode="clarification",
+            needs_clarification=True,
+            clarification_question="Order mana yang ingin Anda periksa untuk minggu ini?",
+            clarification_options=[
+                ClarificationOption(label="Sales Order ERP", query="Cek daftar sales order minggu ini"),
+                ClarificationOption(label="Order Marketplace", query="Cek order marketplace minggu ini"),
+            ],
+        )
+        mock_llm1 = _make_mock_llm(clarify_decision)
+        res1 = await aroute_semantic_nlu(state=state1, user_query=q1, get_model_fn=lambda: mock_llm1)
+
+        self.assertTrue(res1["needs_clarification"])
+        self.assertEqual(res1["query_mode"], "clarification")
+        self.assertEqual(res1["verification_status"], "CLARIFICATION")
+        self.assertEqual(res1["active_tools"], [])
+        self.assertEqual(len(res1["clarification_options"]), 2)
+
+        # Turn 2: Short reply ("yang marketplace") enriches retrieval with prior query and resolves directly
+        q2 = "yang marketplace"
+        state2 = create_initial_state(
+            user_query=q2,
+            messages=[
+                HumanMessage(content=q1),
+                AIMessage(content="Order mana yang ingin Anda periksa untuk minggu ini?"),
+                HumanMessage(content=q2),
+            ],
+        )
+        cands2 = await aretrieve_candidate_tools(q2, [q2], state2)
+        self.assertIn("get_marketplace_orders", [c["tool_name"] for c in cands2])
+
+        resolved_decision = MultiRouterDecision(
+            domain="marketplace",
+            query_mode="live_erp",
+            tool="get_marketplace_orders",
+            planned_tools=[PlannedToolCall(tool="get_marketplace_orders", domain="marketplace", sub_query=q2)],
+        )
+        mock_llm2 = _make_mock_llm(resolved_decision)
+        res2 = await aroute_semantic_nlu(state=state2, user_query=q2, get_model_fn=lambda: mock_llm2)
+
+        self.assertFalse(res2["needs_clarification"])
+        self.assertEqual(res2["detected_tool"], "get_marketplace_orders")
+        self.assertEqual(res2["query_mode"], "live_erp")
+
+    async def test_short_followup_injects_prior_detected_tool_into_candidates(self):
+        """Branch follow-up ('di mainstore') injects prior_detected_tool so LLM always sees it."""
+        q = "di mainstore"
+        state = create_initial_state(
+            user_query=q,
+            messages=[
+                HumanMessage(content="cek saldo kas hari ini"),
+                AIMessage(content="Saldo kas pusat Rp 50.000.000"),
+                HumanMessage(content=q),
+            ],
+        )
+        state["prior_detected_tool"] = "get_account_balance"
+        state["prior_detected_domain"] = "accounting"
+
+        cands = await aretrieve_candidate_tools(q, [q], state)
+        self.assertIn("get_account_balance", [c["tool_name"] for c in cands])
+
+    async def test_post_llm_general_guardrail_coerces_offtopic_to_out_of_scope(self):
+        """If LLM mistakenly outputs domain='general' for trivia, deterministic guardrail coerces it to out_of_scope."""
+        q = "jelaskan teori relativitas Einstein"
+        state = create_initial_state(q)
+        bad_decision = MultiRouterDecision(domain="general", query_mode="general")
+        mock_llm = _make_mock_llm(bad_decision)
+
+        res = await aroute_semantic_nlu(state=state, user_query=q, get_model_fn=lambda: mock_llm)
+        self.assertEqual(res["detected_domain"], "out_of_scope")
+        self.assertEqual(res["query_mode"], "out_of_scope")
+        self.assertEqual(res["active_tools"], [])
+
+    async def test_returns_none_when_llm_unavailable_or_raises(self):
+        """Missing or failing LLM returns None so caller degrades cleanly to legacy_regex."""
+        q = "cek omzet bulan ini"
+        state = create_initial_state(q)
+
+        res_no_llm = await aroute_semantic_nlu(state=state, user_query=q, get_model_fn=lambda: None)
+        self.assertIsNone(res_no_llm)
+
+        failing_llm = MagicMock()
+        failing_structured = MagicMock()
+        failing_structured.ainvoke = AsyncMock(side_effect=RuntimeError("429 rate limited"))
+        failing_llm.with_structured_output.return_value = failing_structured
+        res_err = await aroute_semantic_nlu(state=state, user_query=q, get_model_fn=lambda: failing_llm)
+        self.assertIsNone(res_err)
+
+    def test_sync_semantic_router_and_dynamic_prompt_structure(self):
+        """Sync counterpart routes via structured invoke and prompt enforces conservative disambiguation rules."""
+        q = "cek SOP retur barang rusak"
+        state = create_initial_state(q)
+        decision = MultiRouterDecision(domain="knowledge", query_mode="vector_rag", rag_query="SOP retur barang rusak")
+        mock_llm = _make_mock_llm(decision)
+
+        res = route_semantic_nlu_sync(state=state, user_query=q, get_model_fn=lambda: mock_llm)
+        self.assertEqual(res["detected_domain"], "knowledge")
+        self.assertEqual(res["query_mode"], "vector_rag")
+        self.assertEqual(res["rag_query"], "SOP retur barang rusak")
+        self.assertEqual(res["rag_queries"], ["SOP retur barang rusak"])
+        self.assertEqual(res["active_tools"], [])
+
+        prompt = build_scoped_router_system_prompt([], state, [q])
+        self.assertIn("ATURAN KLARIFIKASI KONSERVATIF", prompt)
+        self.assertIn("DILARANG KERAS meminta klarifikasi hanya karena cabang/company atau rentang tanggal", prompt)
+
+
+if __name__ == "__main__":
+    unittest.main()

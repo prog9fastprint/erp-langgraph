@@ -163,23 +163,53 @@ class RouterDecision(BaseModel):
         return self
 
 
+_EMOJI_STRIP_RE = re.compile(
+    "["
+    "\U0001F300-\U0001F9FF"
+    "\U0001FA00-\U0001FAFF"
+    "\u2600-\u27BF"
+    "\uFE0F"
+    "]+",
+    flags=re.UNICODE,
+)
+
+
+def _strip_clarification_emojis(text: str) -> str:
+    """Remove decorative Unicode emojis from clarification chip labels."""
+    return re.sub(r"\s+", " ", _EMOJI_STRIP_RE.sub("", text or "")).strip()
+
+
+class ClarificationOption(BaseModel):
+    """Clickable clarification chip returned when conservative disambiguation triggers."""
+    label: str = Field(..., description="Label chip singkat 2-5 kata tanpa emoji")
+    query: str = Field(..., description="Prompt lengkap dan spesifik yang langsung bisa dieksekusi saat diklik")
+    icon: str = Field(default="fa-arrow-right", description="FontAwesome icon class")
+
+
 class MultiRouterDecision(BaseModel):
-    """Structured output schema for LLM router supporting multi-intent planning."""
-    domain: Literal["accounting", "inventory", "sales", "marketplace", "knowledge", "general", "out_of_scope"] = Field(
+    """Structured output schema for LLM router supporting multi-intent planning and clarification."""
+    domain: Literal[
+        "accounting", "inventory", "sales", "marketplace",
+        "knowledge", "general", "out_of_scope", "clarification"
+    ] = Field(
         ...,
         description=(
             "Primary target ERP module domain: 'accounting', 'inventory', 'sales', 'marketplace', "
             "'knowledge' (SOPs/specs/policies), 'general' (STRICTLY ONLY pure greetings, thanks, bot capability/help, or session meta-questions), "
-            "or 'out_of_scope' (ANY non-ERP topic such as general knowledge, trivia, recipes, weather, coding, chitchat, unsupported modules, or write operations)."
+            "'out_of_scope' (ANY non-ERP topic such as general knowledge, trivia, recipes, weather, coding, chitchat, unsupported modules, or write operations), "
+            "or 'clarification' (ONLY when intent genuinely conflicts across tools or a mandatory target entity is missing)."
         ),
     )
-    query_mode: Literal["live_erp", "vector_rag", "hybrid", "general", "out_of_scope", "contextual_analysis"] = Field(
+    query_mode: Literal[
+        "live_erp", "vector_rag", "hybrid", "general",
+        "out_of_scope", "contextual_analysis", "clarification"
+    ] = Field(
         "live_erp",
-        description="Execution mode: 'vector_rag', 'live_erp', 'hybrid', 'contextual_analysis', 'general' (greetings/help only), or 'out_of_scope' (anything outside ERP capabilities).",
+        description="Execution mode: 'vector_rag', 'live_erp', 'hybrid', 'contextual_analysis', 'clarification', 'general' (greetings/help only), or 'out_of_scope' (anything outside ERP capabilities).",
     )
     tool: Optional[str] = Field(
         None,
-        description="Primary target tool name (for backward compatibility), or null if general/out_of_scope/knowledge."
+        description="Primary target tool name (for backward compatibility), or null if general/out_of_scope/knowledge/clarification."
     )
     planned_tools: List[PlannedToolCall] = Field(
         default_factory=list,
@@ -189,6 +219,18 @@ class MultiRouterDecision(BaseModel):
         None,
         description="Extracted search query for RAG knowledge retrieval if query_mode is vector_rag or hybrid."
     )
+    needs_clarification: bool = Field(
+        False,
+        description="Set True ONLY when intent conflicts strongly between distinct tools or a required target entity is missing."
+    )
+    clarification_question: Optional[str] = Field(
+        None,
+        description="Pertanyaan klarifikasi singkat (1-2 kalimat, Bahasa Indonesia) saat intent bentrok antar-tool atau objek wajib tidak ada."
+    )
+    clarification_options: List[ClarificationOption] = Field(
+        default_factory=list,
+        description="2 hingga 4 opsi jawaban spesifik yang dapat langsung diklik user."
+    )
     reasoning: Optional[str] = Field(
         None,
         description="Brief explanation of why these domains and tools were selected."
@@ -196,10 +238,47 @@ class MultiRouterDecision(BaseModel):
 
     @model_validator(mode="after")
     def reconcile_and_clean_tools(self) -> "MultiRouterDecision":
-        """Clean tools on non-tool domains and synchronize primary tool with planned_tools."""
+        """Clean tools on non-tool/clarification domains and synchronize primary tool with planned_tools."""
+        if (
+            self.domain == "clarification"
+            or self.query_mode == "clarification"
+            or self.needs_clarification
+        ):
+            self.domain = "clarification"
+            self.query_mode = "clarification"
+            self.needs_clarification = True
+            self.tool = None
+            self.planned_tools = []
+            self.rag_query = None
+            raw_q = (self.clarification_question or "").strip()
+            self.clarification_question = raw_q or (
+                "Mohon perjelas permintaan Anda dengan memilih salah satu opsi di bawah ini."
+            )
+            cleaned_opts: List[ClarificationOption] = []
+            seen_queries: set[str] = set()
+            for opt in self.clarification_options or []:
+                lbl = _strip_clarification_emojis(opt.label)
+                q = (opt.query or "").strip()
+                if not lbl or not q:
+                    continue
+                norm_q = re.sub(r"\s+", " ", q.rstrip("?!.,;:'\"> ")).lower()
+                if norm_q in seen_queries:
+                    continue
+                seen_queries.add(norm_q)
+                raw_icon = (opt.icon or "fa-arrow-right").strip()
+                icon = raw_icon if re.fullmatch(r"[A-Za-z0-9_\- ]+", raw_icon) else "fa-arrow-right"
+                cleaned_opts.append(ClarificationOption(label=lbl, query=q, icon=icon or "fa-arrow-right"))
+                if len(cleaned_opts) >= 4:
+                    break
+            self.clarification_options = cleaned_opts
+            return self
+
         if self.domain in ("general", "out_of_scope", "knowledge") or self.query_mode in ("vector_rag", "contextual_analysis"):
             self.tool = None
             self.planned_tools = []
+            self.needs_clarification = False
+            self.clarification_question = None
+            self.clarification_options = []
             return self
 
         # If planned_tools is populated but primary tool is omitted, set from first planned tool
