@@ -313,7 +313,14 @@ async def _execute_single_tool(
         if k in clean_params and isinstance(clean_params[k], str):
             clean_params[k] = clean_product_identifier(clean_params[k])
     if "search" in clean_params and isinstance(clean_params["search"], str):
-        if tool_name in ("get_product_info", "get_stock_level", "get_stock_history", "get_product_mapping_status", "get_price_comparison"):
+        if tool_name in (
+            "get_product_info",
+            "get_stock_level",
+            "get_stock_history",
+            "get_price_history",
+            "get_product_mapping_status",
+            "get_price_comparison",
+        ):
             clean_params["search"] = clean_product_identifier(clean_params["search"])
     if "codes" in clean_params and isinstance(clean_params["codes"], list):
         clean_params["codes"] = [
@@ -529,7 +536,13 @@ async def _execute_tool_multi_company(
     params_copy = dict(base_params or {})
     supports_native_mc = (
         TOOL_DOMAIN_MAP.get(tool_name) == "marketplace"
-        or tool_name in ("get_contacts", "get_sales_orders", "get_sales_summary", "get_inventory_velocity_forecast")
+        or tool_name in (
+            "get_contacts",
+            "get_sales_orders",
+            "get_sales_summary",
+            "get_inventory_velocity_forecast",
+            "get_price_history",
+        )
     )
     if supports_native_mc:
         primary_cid = target_company_ids[0]

@@ -678,6 +678,82 @@ def format_get_inventory_velocity_forecast(
     return "\n".join(lines)
 
 
+def format_get_price_history(
+    tool: str,
+    tool_result: Any,
+    user_query: Optional[str] = None,
+    extracted_params: Optional[Dict[str, Any]] = None,
+    default_company_id: Optional[int] = None,
+) -> str:
+    """Format inventory.get_price_history payload into Markdown."""
+    lines: List[str] = []
+    dw = tool_result.get("date_window") or {}
+    summary = tool_result.get("summary") or {}
+    changes = tool_result.get("changes") or []
+    current_prices = tool_result.get("current_prices") or []
+    total_cnt = _extract_total_count(tool_result, len(changes))
+
+    df = dw.get("date_from") or (extracted_params.get("date_from") if isinstance(extracted_params, dict) else None) or "-"
+    dt = dw.get("date_to") or (extracted_params.get("date_to") if isinstance(extracted_params, dict) else None) or "-"
+    lines.append(f"### Riwayat Perubahan Harga Produk (Periode: {df} s/d {dt})\n")
+
+    tot_chg = summary.get("total_changes", total_cnt)
+    latest_dt = summary.get("latest_change_date") or "-"
+    net_idr = summary.get("net_change_idr")
+    net_pct = summary.get("net_change_pct")
+    min_p = summary.get("min_price")
+    max_p = summary.get("max_price")
+
+    summary_parts = [f"**Total Perubahan**: **{tot_chg}**", f"**Perubahan Terakhir**: `{latest_dt}`"]
+    if min_p is not None and max_p is not None:
+        summary_parts.append(f"**Rentang Harga**: {_format_rupiah(min_p)} – {_format_rupiah(max_p)}")
+    if net_idr is not None:
+        pct_str = f" ({float(net_pct):+.2f}%)" if net_pct is not None else ""
+        sign = "+" if float(net_idr) > 0 else ""
+        summary_parts.append(f"**Perubahan Bersih**: **{sign}{_format_rupiah(net_idr)}{pct_str}**")
+    lines.append("- " + " | ".join(summary_parts) + "\n")
+
+    if current_prices:
+        lines.append("#### Snapshot Harga Terkini (Pricelist ERP):\n")
+        lines.append("| Pricelist | Region | Min Qty | Harga Aktif |")
+        lines.append("|:---|:---|:---:|:---|")
+        for cp in current_prices[:10]:
+            lines.append(
+                f"| {cp.get('pricelist_name', '-')} | {cp.get('region') or '-'} | "
+                f"{cp.get('min_qty', 1)} | **{_format_rupiah(cp.get('price', 0))}** |"
+            )
+        lines.append("")
+
+    if changes:
+        lines.append("#### Kronologi Perubahan Harga:\n")
+        lines.append("| Waktu | Sumber | Pricelist / Akun | SKU | Produk | Tier | Harga Lama -> Baru | Selisih | Diubah Oleh | Status |")
+        lines.append("|:---|:---|:---|:---|:---|:---:|:---|:---|:---|:---:|")
+        for ch in changes:
+            old_p = ch.get("old_price")
+            new_p = ch.get("new_price")
+            old_s = _format_rupiah(old_p) if old_p is not None else "-"
+            new_s = _format_rupiah(new_p) if new_p is not None else "-"
+            d_idr = ch.get("delta_idr")
+            d_pct = ch.get("delta_pct")
+            if d_idr is not None:
+                sgn = "+" if float(d_idr) > 0 else ""
+                p_txt = f" ({float(d_pct):+.1f}%)" if d_pct is not None else ""
+                diff_s = f"**{sgn}{_format_rupiah(d_idr)}**{p_txt}"
+            else:
+                diff_s = "-"
+            lines.append(
+                f"| {ch.get('changed_at') or '-'} | `{ch.get('source') or '-'}` | "
+                f"{ch.get('channel_or_pricelist') or '-'} | `{ch.get('sku') or '-'}` | "
+                f"{ch.get('product_name') or '-'} | {ch.get('qty_tier', '1')} | "
+                f"{old_s} -> **{new_s}** | {diff_s} | {ch.get('updated_by') or '-'} | `{ch.get('status') or 'SUCCESS'}` |"
+            )
+        _append_pagination_footer(lines, len(changes), total_cnt)
+    else:
+        lines.append("Tidak tercatat perubahan harga produk pada filter dan periode ini.")
+
+    return "\n".join(lines)
+
+
 INVENTORY_FORMATTERS: Dict[str, Callable[..., str]] = {
     "get_stock_level": format_get_stock_level,
     "get_product_info": format_get_product_info,
@@ -690,4 +766,5 @@ INVENTORY_FORMATTERS: Dict[str, Callable[..., str]] = {
     "get_warehouses": format_get_warehouses,
     "get_product_categories": format_get_product_categories,
     "get_inventory_velocity_forecast": format_get_inventory_velocity_forecast,
+    "get_price_history": format_get_price_history,
 }

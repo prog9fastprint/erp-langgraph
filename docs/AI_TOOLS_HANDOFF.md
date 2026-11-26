@@ -37,12 +37,22 @@ FastPrint ERP menyediakan gateway API khusus AI (`/ai/tools/`) yang memisahkan e
 │            │    └── get_bank_reconciliation_summary │
 │            ├── inventory                     │
 │            │    ├── get_stock_level          │
-│            │    └── get_product_info         │
+│            │    ├── get_product_info         │
+│            │    └── get_price_history        │
 │            ├── sales                         │
 │            │    ├── get_top_selling_products │
 │            │    ├── get_sales_orders         │
 │            │    ├── get_sales_order_detail   │
-│            │    └── get_sales_summary        │
+│            │    ├── get_sales_summary        │
+│            │    └── get_contacts             │
+│            ├── fastpos                       │
+│            │    ├── get_product_performance  │
+│            │    ├── get_stock_alerts         │
+│            │    ├── get_list_orders          │
+│            │    └── get_stock_opname         │
+│            ├── helpdesk                      │
+│            │    ├── get_complaints           │
+│            │    └── get_product_returns      │
 │            └── marketplace                   │
 │                 ├── get_account_health       │
 │                 ├── get_marketplace_orders   │
@@ -378,6 +388,110 @@ Kode error khusus domain `marketplace`:
 - `MISSING_PRICELIST_OR_ACCOUNT` / `MISSING_PRICELIST_ID` (saat `get_price_comparison` tidak memiliki `account_id` maupun `pricelist_id`)
 - `INVALID_COMPANY_IDS` (format `company_ids` bukan list integer)
 - `ACCOUNT_NOT_FOUND` / `PRICELIST_NOT_FOUND`
+
+---
+
+### 6.4 Domain: FastPOS (`is_write: false`)
+
+Domain `fastpos` mengekspos data analitik produk, klasifikasi BCG, COGS/HPP harian, ITO, Power, alert stok, antrean List Order, dan laporan Stock Opname dari `modules/fastpos` di Django ERP. Semua tool bersifat read-only dan mendukung parameter opsional `company_ids: list[int]`.
+
+| Tool Name | Endpoint | Sumber Model Django ERP | Fungsi Utama |
+|---|---|---|---|
+| `get_product_performance` | `POST /ai/tools/fastpos/get_product_performance/` | `ProductStockRecap`, `ProductRecommendationRecap`, `FastposIndex`, `CogsDailySnapshot`, `BcgHistory`, `ProductAnalyticsService` | Profil performa 1 produk atau top-N produk: tren penjualan 6 bulan (`sales_m1..m6`, rata-rata, top/middle, termasuk BOM explosion MTH), stok & cover days, BCG + histori perpindahan BCG, COGS/HPP harian & gross margin, ITO, Power, Index global/kategori, serta `attention_score` (`CRITICAL`/`HIGH`/`ATTENTION`/`NORMAL`). |
+| `get_stock_alerts` | `POST /ai/tools/fastpos/get_stock_alerts/` | `ProductStockRecap`, `ProductRecommendationRecap`, `stockKosongView`, `zeroReportView`, `overStockView`, `OverStockSixMonthView` | Daftar & ringkasan alert FastPOS: `stok_kosong`, `nol_sales` (dead stock), `overstock`, `overstock_6m`, dan rekomendasi kuantitas restock (`recommended_min_qty`, `recommended_stock_qty`) untuk `branch`, `jd`, maupun `mentah`. |
+| `get_list_orders` | `POST /ai/tools/fastpos/get_list_orders/` | `ListOrder`, `PreListOrderItem`, `RawExpeditionHistory`, `supplierFastpos` | Monitoring antrean `ListOrder` restock (Branch/JD/MTH): filter status `nota` (`YES`/`NO`), `urgent_only`, `supplier`, usia order, estimasi waktu, dan relasi PO/MO/Interbranch. |
+| `get_stock_opname` | `POST /ai/tools/fastpos/get_stock_opname/` | `StockOpname`, `LogStockOpname`, `ProblemOpname`, `WarehouseOpname` | Laporan hasil Stock Opname FastPOS per gudang/produk: qty sistem vs qty akurat, selisih, status problem, solusi, dan flag `is_done`. |
+
+#### Kontrak Parameter & Payload Utama `fastpos`
+
+- **`fastpos.get_product_performance`**:
+  - Params: `company_id`, `company_ids`, `product_id`, `sku`, `search`, `recap_type` (`"all"|"branch"|"jd"|"mentah"`), `bcg_order` (`1..4`), `attention_level` (`"all"|"CRITICAL"|"HIGH"|"ATTENTION"|"NORMAL"`), `sort_by` (`"revenue_6m"|"power"|"ito"|"attention_score"|"cogs_pct"`), `include_bcg_history` (`false`), `include_cogs_7d` (`false`), `date_from`, `date_to`, `limit` (`1..100`, default `20`), `offset`.
+  - Response `data`: `summary` (`products_analyzed`, `total_revenue_6m`, `total_inventory_value`, `critical_count`, `high_attention_count`), `total_count`, `products[]` (`product_id`, `sku`, `name`, `company_name`, `recap_type`, `bcg_order`, `sales_6m_qty`, `revenue_6m`, `sales_m1..sales_m6`, `average_sales`, `current_stock`, `indent`, `dlv_stock`, `stock_cover_days`, `cogs_per_unit`, `cogs_fp_pct`, `gross_margin_pct`, `ito`, `power`, `index_global`, `index_category`, `attention_score`, `attention_level`, `bcg_history[]`, `cogs_daily_7d[]`).
+- **`fastpos.get_stock_alerts`**:
+  - Params: `company_id`, `company_ids`, `alert_type` (`"all"|"stok_kosong"|"nol_sales"|"overstock"|"overstock_6m"|"restock"`), `recap_type` (`"all"|"branch"|"jd"|"mentah"`), `sku`, `search`, `bcg_order` (`1..4`), `limit` (`1..100`, default `20`), `offset`.
+  - Response `data`: `summary` (`total_alerts`, `stok_kosong_count`, `nol_sales_count`, `overstock_count`, `restock_count`), `total_count`, `alerts[]` (`sku`, `name`, `company_name`, `recap_type`, `alert_type`, `current_stock`, `indent`, `dlv_stock`, `average_sales`, `stock_cover_days`, `recommended_min_qty`, `recommended_stock_qty`, `bcg_order`).
+- **`fastpos.get_list_orders`**:
+  - Params: `company_id`, `company_ids`, `order_type` (`"all"|"branch"|"jd"|"mth"`), `sku`, `search`, `supplier`, `nota` (`"all"|"YES"|"NO"`), `urgent_only` (`false`), `date_from`, `date_to`, `limit` (`1..100`, default `20`), `offset`.
+  - Response `data`: `summary` (`total_orders`, `urgent_count`, `pending_nota_count`, `total_qty`, `total_amount`), `total_count`, `orders[]` (`id`, `tgl`, `company_name`, `sku`, `product_name`, `supplier`, `qty`, `satuan`, `harga`, `total`, `bcg`, `nota`, `checklist_nota`, `urgent`, `usia`, `qc_note`).
+- **`fastpos.get_stock_opname`**:
+  - Params: `company_id`, `company_ids`, `sku`, `search`, `warehouse_name`, `status`, `problem_only` (`false`), `is_done` (`null|true|false`), `date_from`, `date_to`, `limit` (`1..100`, default `20`), `offset`.
+  - Response `data`: `summary` (`total_items`, `matched_count`, `discrepancy_count`, `open_problem_count`), `total_count`, `opnames[]` (`id`, `date`, `company_name`, `warehouse_name`, `sku`, `product_name`, `quantity_stock`, `quantity_accurate`, `difference`, `status`, `status_problem`, `solution`, `is_done`).
+
+---
+
+### 6.5 Domain: Helpdesk (`is_write: false`)
+
+Domain `helpdesk` mengekspos data tiket komplain pelanggan (`modules/helpdesk/models/tiketModel.py` & 4 laporan agregat `reportingView.py`) serta data retur & refund produk lintas modul. Semua tool bersifat read-only dan mendukung `company_ids: list[int]`.
+
+| Tool Name | Endpoint | Sumber Model Django ERP | Fungsi Utama |
+|---|---|---|---|
+| `get_complaints` | `POST /ai/tools/helpdesk/get_complaints/` | `helpdesk.Tiket` (exclude `Q_SERVICE_TICKETS` default), `reportingView.py` | Daftar & ringkasan tiket komplain pelanggan per produk/cabang/periode: kendala produk, stage (`1=Masuk`, `2=Pengecekan`, `3=Selesai`), durasi penanganan, rasio komplain vs penjualan, dan kerugian (`harga_produk + ongkir_komplain`). |
+| `get_product_returns` | `POST /ai/tools/helpdesk/get_product_returns/` | `inventory.ReturnTransfer`, `helpdesk.Tiket` (pengecekan retur), `accounting.JournalEntry` + `RefundsLine` (`refund customer`) | Rekap & rincian transaksi retur produk lintas sumber: total qty retur, nilai refund, alasan/kendala, hasil pengecekan retur, dan referensi SO asal. |
+
+#### Kontrak Parameter & Payload Utama `helpdesk`
+
+- **`helpdesk.get_complaints`**:
+  - Params: `company_id`, `company_ids`, `sku`, `search`, `order_ref`, `customer_name`, `issue_category`, `stage` (`"all"|"open"|"checking"|"done"`), `include_service_stempel` (`false`), `report_view` (`"list"|"summary"|"by_branch"|"by_issue"|"vs_sales"|"loss"`), `date_from` (default YTD), `date_to` (default hari ini), `limit` (`1..100`, default `20`), `offset`.
+  - Response `data`: `date_window`, `summary` (`total_tickets`, `open_count`, `checking_count`, `done_count`, `total_qty`, `total_product_loss`, `total_shipping_loss`, `total_loss`, `complaint_vs_sales_pct`), `by_issue[]`, `by_branch[]`, `total_count`, `complaints[]` (`ticket_id`, `name`, `created_at`, `company_name`, `so_number`, `customer_name`, `sku`, `product_name`, `qty`, `kendala_produk`, `tindakan_lanjutan`, `stage_label`, `harga_produk`, `ongkir_komplain`, `durasi`).
+- **`helpdesk.get_product_returns`**:
+  - Params: `company_id`, `company_ids`, `sku`, `search`, `order_ref`, `source` (`"all"|"return_transfer"|"helpdesk"|"refund"`), `date_from` (default YTD), `date_to` (default hari ini), `limit` (`1..100`, default `20`), `offset`.
+  - Response `data`: `date_window`, `summary` (`total_return_events`, `total_qty_returned`, `total_refund_amount`, `helpdesk_return_count`, `transfer_return_count`, `refund_count`, `return_rate_pct`), `by_reason[]`, `total_count`, `returns[]` (`date`, `source`, `reference`, `so_number`, `company_name`, `sku`, `product_name`, `qty`, `refund_amount`, `reason`, `inspection_result`, `status`).
+
+---
+
+### 6.6 Tool Tambahan Domain Inventory: `inventory.get_price_history` (`is_write: false`)
+
+- **Endpoint**: `POST /ai/tools/inventory/get_price_history/`
+- **Sumber Model Django ERP**:
+  1. `ess.LogEntry` (`model='PricelistLineModel'`, di-log oleh `PricelistService.update_pricelist_lines`)
+  2. `marketplace.PriceUpdateLog` (`status='SUCCESS'` default, atau semua jika `include_failed=true`)
+  3. `inventory.InventoryUpdatePriceLog` (`service_type='sales_pricelist'` untuk sinkronisasi PCLS)
+  4. `sales.PricelistLineModel` (snapshot harga jual terkini per pricelist & tier qty)
+- **Parameter**:
+  | Field | Tipe | Default | Keterangan |
+  |---|---|---|---|
+  | `company_id` / `company_ids` | integer / list[int] | active company | Cakupan perusahaan / multi-cabang |
+  | `product_id` / `sku` / `search` | integer / string | `null` | Identitas produk (ID, SKU exact, atau keyword nama) |
+  | `source` | `"all"\|"erp_pricelist"\|"marketplace"\|"pcls"` | `"all"` | Filter sumber riwayat perubahan harga |
+  | `marketplace` | string | `null` | Filter platform (`Shopee`, `TikTok Shop`, `Tokopedia`, `Lazada`) |
+  | `pricelist_name` | string | `null` | Filter nama pricelist ERP (misal `Jawa`, `Luar Jawa`, `Medan`) |
+  | `include_failed` | boolean | `false` | Sertakan entri log `FAILED` selain `SUCCESS` |
+  | `date_from` / `date_to` | string (`YYYY-MM-DD`) | 90 hari terakhir s/d hari ini | Rentang waktu kronologi perubahan harga |
+  | `limit` / `offset` | integer | `20` / `0` | Paginasi (`limit` maks `100`) |
+- **Response `data`**:
+  ```json
+  {
+    "date_window": {"date_from": "2026-08-28", "date_to": "2026-11-26"},
+    "current_prices": [
+      {"pricelist_name": "Pricelist FP Jawa", "min_qty": 1, "price": 45000.0, "region": "jawa"}
+    ],
+    "summary": {
+      "total_changes": 3,
+      "latest_change_date": "2026-11-18",
+      "min_price": 42000.0,
+      "max_price": 45000.0,
+      "net_change_idr": 3000.0,
+      "net_change_pct": 7.14
+    },
+    "total_count": 3,
+    "changes": [
+      {
+        "changed_at": "2026-11-18 10:15:00",
+        "source": "erp_pricelist",
+        "channel_or_pricelist": "Pricelist FP Jawa",
+        "sku": "SKU-A01",
+        "product_name": "Barang A",
+        "qty_tier": "1",
+        "old_price": 42000.0,
+        "new_price": 45000.0,
+        "delta_idr": 3000.0,
+        "delta_pct": 7.14,
+        "updated_by": "Admin Pricing",
+        "status": "SUCCESS"
+      }
+    ]
+  }
+  ```
 
 ---
 

@@ -465,6 +465,7 @@ _COLLECTION_LIST_KEYS = (
     "fast_moving",
     "slow_moving",
     "restock_recommendations",
+    "changes",
 )
 
 _BALANCE_METRIC_KEYS = {

@@ -48,6 +48,7 @@ from app.schemas.tools import (
     WarehousesFilterSchema,
     ProductCategoriesFilterSchema,
     InventoryVelocityForecastFilterSchema,
+    PriceHistoryFilterSchema,
     TopSellingProductsFilterSchema,
     SalesOrdersFilterSchema,
     SalesOrderDetailFilterSchema,
@@ -122,6 +123,7 @@ from app.graph.nodes.extractors import (
     _fallback_extract_low_stock_alerts,
     _fallback_extract_marketplace_orders,
     _fallback_extract_price_comparison,
+    _fallback_extract_price_history,
     _fallback_extract_product_categories,
     _fallback_extract_product_info,
     _fallback_extract_product_mapping_status,
@@ -175,6 +177,7 @@ TOOL_SCHEMA_REGISTRY: Dict[str, Type[BaseModel]] = {
     "get_warehouses": WarehousesFilterSchema,
     "get_product_categories": ProductCategoriesFilterSchema,
     "get_inventory_velocity_forecast": InventoryVelocityForecastFilterSchema,
+    "get_price_history": PriceHistoryFilterSchema,
     "get_top_selling_products": TopSellingProductsFilterSchema,
     "get_sales_orders": SalesOrdersFilterSchema,
     "get_sales_order_detail": SalesOrderDetailFilterSchema,
@@ -242,6 +245,8 @@ def _extract_single_tool_params(
                 extracted_dict = dict(scan_probe)
     elif tool_name == "get_inventory_velocity_forecast" and retry_count == 0:
         extracted_dict = _fallback_extract_inventory_velocity_forecast(sub_query, today)
+    elif tool_name == "get_price_history" and retry_count == 0:
+        extracted_dict = _fallback_extract_price_history(sub_query, today, state.get("messages"))
     elif tool_name == "get_profit_and_loss" and retry_count == 0:
         fast_params = _fallback_extract_profit_and_loss(sub_query, today, state.get("messages"))
         if fast_params.get("date_from") or fast_params.get("date_to") or fast_params.get("include_breakdown"):
@@ -386,6 +391,8 @@ def _extract_single_tool_params(
             extracted_dict = _fallback_extract_product_categories(sub_query)
         elif tool_name == "get_inventory_velocity_forecast":
             extracted_dict = _fallback_extract_inventory_velocity_forecast(sub_query, today)
+        elif tool_name == "get_price_history":
+            extracted_dict = _fallback_extract_price_history(sub_query, today, state.get("messages"))
         elif tool_name == "get_top_selling_products":
             extracted_dict = _fallback_extract_top_selling_products(sub_query, today)
         elif tool_name == "get_sales_orders":
@@ -616,7 +623,12 @@ def _extract_single_tool_params(
     has_scope_temporal = has_temporal_expression(sub_query) or (
         (not is_decomposed_clause or has_explicit_anaphora) and has_temporal_expression(user_query)
     )
-    if supports_dates and not has_inherited_dates and not has_scope_temporal and tool_name != "get_inventory_velocity_forecast":
+    if (
+        supports_dates
+        and not has_inherited_dates
+        and not has_scope_temporal
+        and tool_name not in ("get_inventory_velocity_forecast", "get_price_history")
+    ):
         extracted_dict.pop("date_from", None)
         extracted_dict.pop("date_to", None)
 

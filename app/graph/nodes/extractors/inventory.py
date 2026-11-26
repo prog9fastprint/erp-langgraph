@@ -439,6 +439,173 @@ def _fallback_extract_inventory_velocity_forecast(
     return params
 
 
+_PRICE_HISTORY_STOPWORDS = {
+    "cek", "dicek", "lihat", "tampilkan", "cari", "tolong", "coba", "berapa", "bagaimana", "gimana",
+    "perubahan", "riwayat", "histori", "history", "pergerakan", "fluktuasi", "kenaikan", "penurunan",
+    "revisi", "update", "harga", "harganya", "price", "changes", "change", "changelog", "trend",
+    "produk", "barang", "item", "sku", "kode", "dari", "untuk", "pada", "di", "ke", "yang", "yg",
+    "dan", "atau", "serta", "juga", "ini", "itu", "tersebut", "tadi", "pernah", "berubah", "naik",
+    "turun", "diubah", "diganti", "selama", "bulan", "tahun", "hari", "minggu", "kemarin", "terakhir",
+    "shopee", "tiktok", "shop", "tokopedia", "tokped", "lazada", "marketplace", "pcls", "pricelist",
+    "erp", "log", "gagal", "failed", "sukses", "success", "semua", "seluruh", "cabang", "perusahaan",
+    "penjualan", "penjualannya", "omzet", "omzetnya", "omset", "omsetnya", "retur", "returnya",
+    "komplain", "komplainnya", "stok", "stoknya", "fastpos", "jawa", "luar", "medan",
+}
+
+
+def _extract_product_target_for_metric_query(
+    query: str,
+    extra_stopwords: Optional[set] = None,
+    history: Optional[list] = None,
+) -> tuple[Optional[str], Optional[str]]:
+    """
+    Extract (sku, search) from product-centric queries including multi-metric lists such as
+    'coba cek barang A penjualannya, returnya, perubahan harganya' or 'riwayat harga SKU-A01'.
+    """
+    cleaned = (query or "").strip()
+    if not cleaned:
+        return None, None
+    stop = set(_PRICE_HISTORY_STOPWORDS)
+    if extra_stopwords:
+        stop.update(extra_stopwords)
+
+    # 1. Explicit SKU / kode prefix (must be separated by whitespace or ':'/'#', not hyphenated into the SKU itself)
+    m_sku = re.search(
+        r"\b(?:sku|kode(?:\s+produk|\s+barang)?)(?:\s*[:#]\s*|\s+)([A-Za-z0-9._\-\/]{2,40})\b",
+        cleaned,
+        re.IGNORECASE,
+    )
+    if m_sku:
+        cand = clean_product_identifier(m_sku.group(1))
+        if cand and cand.lower() not in stop and not _is_pure_branch_token(cand):
+            return cand, None
+
+    # 2. Hyphenated SKU or numeric barcode/SKU (excluding 4-digit years 2020..2035)
+    m_hy = re.search(r"\b([A-Za-z0-9]+(?:-[A-Za-z0-9]+)+)\b", cleaned)
+    if m_hy:
+        cand = clean_product_identifier(m_hy.group(1))
+        if cand and cand.lower() not in stop and not is_account_code_or_name(cand) and not is_vendor_name(cand):
+            return cand, None
+    m_num = re.search(r"\b(\d{4,14})\b", cleaned)
+    if m_num:
+        cand_num = m_num.group(1)
+        if not (len(cand_num) == 4 and 2020 <= int(cand_num) <= 2035) and not is_account_code_or_name(cand_num):
+            return cand_num, None
+
+    # 3. Product name after 'barang / produk / item' or after metric phrase ('perubahan harga <produk>')
+    metric_boundary = (
+        r"(?:\s*,|\s+\b(?:penjualan(?:nya)?|omzet(?:nya)?|omset(?:nya)?|retur(?:nya)?|komplain(?:nya)?|"
+        r"perubahan|riwayat|histori|history|kenaikan|penurunan|pergerakan|harga(?:nya)?|stok(?:nya)?|"
+        r"bulan|tahun|hari|minggu|kemarin|di|ke|pada|untuk|cabang|semua|seluruh|shopee|tiktok|tokopedia|lazada|pcls|pricelist|marketplace|fastpos)\b|$)"
+    )
+    patterns = [
+        rf"\b(?:barang|produk|product|item)\s+([A-Za-z0-9\-\_\.\+\/\s]{{1,60}}?){metric_boundary}",
+        rf"\b(?:perubahan|riwayat|histori|history|pergerakan|kenaikan|penurunan|revisi)\s+harga(?:nya)?\s+(?:untuk\s+|produk\s+|barang\s+)?([A-Za-z0-9\-\_\.\+\/\s]{{1,60}}?){metric_boundary}",
+    ]
+    for pat in patterns:
+        m = re.search(pat, cleaned, re.IGNORECASE)
+        if m:
+            raw_phrase = clean_product_identifier(m.group(1).strip(" ,.;:?!'\""))
+            words = [
+                w for w in raw_phrase.split()
+                if w.lower() not in stop
+                and not _is_pure_branch_token(w)
+                and not re.match(r"^(?:20\d\d|q[1-4])$", w.lower())
+            ]
+            if words:
+                cand = " ".join(words)
+                if not is_vendor_name(cand) and not is_account_code_or_name(cand) and not is_accounting_term(cand):
+                    return None, cand
+
+    # 4. History fallback for anaphoric references
+    if history and (has_anaphoric_reference(cleaned) or re.search(r"\b(?:itu|tersebut|tadi)\b", cleaned, re.IGNORECASE)):
+        info = _fallback_extract_product_info(cleaned, history=history)
+        if info.get("code"):
+            return info["code"], None
+        if info.get("search"):
+            return None, info["search"]
+
+    return None, None
+
+
+def _fallback_extract_price_history(
+    query: str,
+    today: Optional[date] = None,
+    history: Optional[list] = None,
+) -> Dict[str, Any]:
+    """Deterministic heuristic extraction for inventory.get_price_history."""
+    ref_day = today or get_current_erp_date()
+    cleaned = (query or "").strip()
+    clean_low = cleaned.lower()
+    params: Dict[str, Any] = {
+        "source": "all",
+        "include_failed": False,
+        "limit": 20,
+        "offset": 0,
+    }
+
+    # Marketplace platform detection
+    mp_plat: Optional[str] = None
+    if re.search(r"\btiktok(?:\s*shop)?\b", clean_low):
+        mp_plat = "TikTok Shop"
+    elif re.search(r"\bshopee\b", clean_low):
+        mp_plat = "Shopee"
+    elif re.search(r"\btokopedia\b|\btokped\b", clean_low):
+        mp_plat = "Tokopedia"
+    elif re.search(r"\blazada\b", clean_low):
+        mp_plat = "Lazada"
+    if mp_plat:
+        params["marketplace"] = mp_plat
+
+    # Source disambiguation
+    has_pcls = bool(re.search(r"\b(?:pcls|inventoryupdatepricelog)\b", clean_low))
+    has_mp = bool(mp_plat or re.search(r"\b(?:marketplace|priceupdatelog)\b", clean_low))
+    has_erp_pl = bool(re.search(r"\b(?:erp\s+pricelist|pricelist\s+erp|pricelist|master\s+harga)\b", clean_low))
+    if has_pcls and not has_mp and not has_erp_pl:
+        params["source"] = "pcls"
+    elif has_mp and not has_pcls and not has_erp_pl:
+        params["source"] = "marketplace"
+    elif has_erp_pl and not has_pcls and not has_mp:
+        params["source"] = "erp_pricelist"
+
+    # Optional pricelist region hint
+    if "pricelist" in clean_low:
+        if re.search(r"\bluar\s+jawa\b", clean_low):
+            params["pricelist_name"] = "Luar Jawa"
+        elif re.search(r"\bjawa\b", clean_low):
+            params["pricelist_name"] = "Jawa"
+        elif re.search(r"\bmedan\b", clean_low):
+            params["pricelist_name"] = "Medan"
+
+    if re.search(r"\b(?:gagal|failed|error|termasuk\s+gagal|semua\s+status)\b", clean_low):
+        params["include_failed"] = True
+
+    sku_val, search_val = _extract_product_target_for_metric_query(cleaned, history=history)
+    if sku_val:
+        params["sku"] = sku_val
+    elif search_val:
+        params["search"] = search_val
+
+    m_lim = re.search(r"\b(?:limit|top|tampilkan)\s*(\d+)\b", clean_low)
+    if m_lim:
+        try:
+            params["limit"] = max(1, min(100, int(m_lim.group(1))))
+        except ValueError:
+            pass
+
+    df, dt = resolve_relative_dates(cleaned, ref_day)
+    if df or dt:
+        if df:
+            params["date_from"] = df
+        if dt:
+            params["date_to"] = dt
+    else:
+        params["date_from"] = (ref_day - timedelta(days=90)).strftime("%Y-%m-%d")
+        params["date_to"] = ref_day.strftime("%Y-%m-%d")
+
+    return params
+
+
 def try_fast_path_stock_extraction(
     sub_query: str,
     user_query: str,

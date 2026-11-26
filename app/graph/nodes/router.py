@@ -63,6 +63,7 @@ from app.graph.nodes.router_patterns import (
     INVENTORY_CATEGORIES_PATTERNS,
     INVENTORY_LOCATION_PATTERNS,
     INVENTORY_VELOCITY_FORECAST_PATTERNS,
+    INVENTORY_PRICE_HISTORY_PATTERNS,
     SALES_TOP_PRODUCTS_PATTERNS,
     SALES_SUMMARY_PATTERNS,
     SALES_ORDER_DETAIL_PATTERNS,
@@ -553,13 +554,31 @@ def classify_query_rule_based(query: str) -> Optional[Dict[str, Any]]:
             suppressed_tools.update({"get_sales_orders", "get_sales_order_detail"})
         if "get_price_comparison" in matched_mp_tools:
             suppressed_tools.add("get_product_info")
+        if "get_competitor_insights" in matched_mp_tools and not re.search(
+            r"\b(?:bandingkan|perbandingan|pricelist|harga\s+erp|vs\s+erp)\b", cleaned
+        ):
+            suppressed_tools.add("get_price_comparison")
         if suppressed_tools:
             candidates = [c for c in candidates if c[0] not in suppressed_tools]
+
+    # Inventory: Price Change History (ERP Pricelist + Marketplace + PCLS)
+    m_price_hist = _find_first_match(INVENTORY_PRICE_HISTORY_PATTERNS, cleaned)
+    if (
+        m_price_hist
+        and "get_competitor_insights" not in matched_mp_tools
+        and "get_sync_execution_logs" not in matched_mp_tools
+    ):
+        candidates.append(("get_price_history", "inventory", m_price_hist.start()))
+        if "get_price_comparison" in matched_mp_tools and not re.search(
+            r"\b(?:bandingkan|perbandingan|selisih|compare|vs)\b", cleaned
+        ):
+            candidates = [c for c in candidates if c[0] != "get_price_comparison"]
 
     # Inventory: Product info
     if (
         not is_rag
         and not m_velocity
+        and not m_price_hist
         and not m_top_sales
         and not is_product_sales
         and not m_sales_summary
@@ -726,6 +745,7 @@ _HQ_CROSS_BRANCH_TOOLS = {
     "get_top_selling_products",
     "get_sales_summary",
     "get_inventory_velocity_forecast",
+    "get_price_history",
     "get_account_health",
     "get_marketplace_orders",
     "get_kilat_order_diagnostics",
@@ -1715,6 +1735,8 @@ def _router_single_and_llm_steps(
                 "- 'get_sales_order_detail': Single SO / quotation detail, customer contact, lines, and AWB/courier.\n"
                 "- 'get_sales_summary': Executive revenue/omzet summary and channel breakdown.\n"
                 "- 'get_contacts': Customer/buyer contact details (phone, email, address, city, channel, product buyers).\n\n"
+                "INVENTORY PRICE HISTORY:\n"
+                "- 'get_price_history': Historical product price changes across ERP Pricelist, Marketplace PriceUpdateLog, and PCLS plus current pricelist snapshot.\n\n"
                 "MARKETPLACE TOOLS GUIDE (All READ-ONLY):\n"
                 "- 'get_account_health': Store readiness, OAuth token expiry, shop moderation status, missing configs, fetch errors.\n"
                 "- 'get_marketplace_orders': Shipping SLA (overdue/due_soon), missing AWB, cancellations, ERP vs marketplace status mismatch.\n"
@@ -1890,6 +1912,7 @@ _LIVE_DIAGNOSTIC_OR_DRILLDOWN_TOOLS = {
     "get_general_ledger",
     "get_stock_sync_simulation",
     "get_price_comparison",
+    "get_price_history",
 }
 
 
@@ -2190,6 +2213,7 @@ __all__ = [
     "INVENTORY_CATEGORIES_PATTERNS",
     "INVENTORY_LOCATION_PATTERNS",
     "INVENTORY_VELOCITY_FORECAST_PATTERNS",
+    "INVENTORY_PRICE_HISTORY_PATTERNS",
     "SALES_TOP_PRODUCTS_PATTERNS",
     "SALES_SUMMARY_PATTERNS",
     "SALES_ORDER_DETAIL_PATTERNS",

@@ -378,6 +378,36 @@ class InventoryVelocityForecastFilterSchema(BaseModel):
         return _validate_date_str(v, "date_to")
 
 
+class PriceHistoryFilterSchema(BaseModel):
+    """Input filter schema for inventory.get_price_history."""
+    company_id: Optional[int] = Field(None, description="Company ID")
+    company_ids: Optional[List[int]] = Field(None, description="Optional list of authorized company IDs")
+    product_id: Optional[int] = Field(None, description="Specific ProductVariant ID")
+    sku: Optional[str] = Field(None, description="Exact product SKU code")
+    search: Optional[str] = Field(None, description="Keyword search matching product SKU or product name")
+    source: Literal["all", "erp_pricelist", "marketplace", "pcls"] = Field(
+        "all",
+        description="Sumber riwayat perubahan harga: 'all' (gabungan), 'erp_pricelist' (LogEntry PricelistLineModel), 'marketplace' (PriceUpdateLog), atau 'pcls' (InventoryUpdatePriceLog)",
+    )
+    marketplace: Optional[str] = Field(None, description="Optional marketplace platform filter (e.g. 'Shopee', 'TikTok Shop', 'Tokopedia')")
+    pricelist_name: Optional[str] = Field(None, description="Optional ERP pricelist name keyword (e.g. 'Jawa', 'Luar Jawa', 'Medan')")
+    include_failed: bool = Field(False, description="Sertakan log update harga berstatus FAILED selain SUCCESS")
+    date_from: Optional[str] = Field(None, description="Tanggal awal jendela riwayat perubahan harga (YYYY-MM-DD, default 90 hari terakhir)")
+    date_to: Optional[str] = Field(None, description="Tanggal akhir jendela riwayat perubahan harga (YYYY-MM-DD, default hari ini)")
+    limit: int = Field(20, ge=1, le=100, description="Max rows (1-100)")
+    offset: int = Field(0, ge=0, description="Pagination offset")
+
+    @field_validator("date_from")
+    @classmethod
+    def validate_date_from(cls, v: Optional[str]) -> Optional[str]:
+        return _validate_date_str(v, "date_from")
+
+    @field_validator("date_to")
+    @classmethod
+    def validate_date_to(cls, v: Optional[str]) -> Optional[str]:
+        return _validate_date_str(v, "date_to")
+
+
 class TopSellingProductsFilterSchema(BaseModel):
     """Input filter schema for sales.get_top_selling_products."""
     company_id: Optional[int] = Field(None, description="Company ID")
@@ -1340,6 +1370,7 @@ TOOL_DOMAIN_MAP: Dict[str, str] = {
     "get_warehouses": "inventory",
     "get_product_categories": "inventory",
     "get_inventory_velocity_forecast": "inventory",
+    "get_price_history": "inventory",
     "get_top_selling_products": "sales",
     "get_sales_orders": "sales",
     "get_sales_order_detail": "sales",

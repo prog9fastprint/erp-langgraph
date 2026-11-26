@@ -282,6 +282,12 @@ INVENTORY_VELOCITY_FORECAST_PATTERNS = [
     r"\bperputaran\s+(?:stok|stock|barang|produk)\b",
 ]
 
+INVENTORY_PRICE_HISTORY_PATTERNS = [
+    r"\b(?:perubahan|riwayat|histori|history|pergerakan|fluktuasi|kenaikan|penurunan|revisi|update)\s+harga(?:nya)?\b",
+    r"\b(?:harga(?:nya)?\s+(?:pernah\s+)?(?:berubah|naik|turun|diubah|diganti))\b",
+    r"\bprice\s+(?:history|changes?|changelog|trend)\b",
+]
+
 INVENTORY_PRODUCT_PATTERNS = [
     r"\bproduk(nya)?\b",
     r"\bproduct\b",

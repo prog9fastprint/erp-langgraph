@@ -45,6 +45,8 @@ from app.graph.nodes.extractors.inventory import (
     _fallback_extract_warehouses,
     _fallback_extract_product_categories,
     _fallback_extract_inventory_velocity_forecast,
+    _extract_product_target_for_metric_query,
+    _fallback_extract_price_history,
     try_fast_path_stock_extraction,
 )
 from app.graph.nodes.extractors.sales import (
@@ -118,6 +120,8 @@ __all__ = [
     "_fallback_extract_warehouses",
     "_fallback_extract_product_categories",
     "_fallback_extract_inventory_velocity_forecast",
+    "_extract_product_target_for_metric_query",
+    "_fallback_extract_price_history",
     "try_fast_path_stock_extraction",
     "_TOP_SALES_STOPWORDS",
     "_SALES_CHANNEL_PATTERNS",
