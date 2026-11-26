@@ -303,5 +303,210 @@ class TestSemanticNLURouterPipeline(unittest.IsolatedAsyncioTestCase):
         self.assertIn("DILARANG KERAS meminta klarifikasi hanya karena cabang/company atau rentang tanggal", prompt)
 
 
+class TestRouterModeDispatcherAndShadow(unittest.IsolatedAsyncioTestCase):
+    """Test suite for Task 2.3 NLU_ROUTER_MODE dispatcher (legacy_regex, semantic_llm, shadow) and E2E workflow."""
+
+    async def test_legacy_regex_mode_skips_semantic_router(self):
+        from unittest.mock import patch
+        from app.core.config import settings
+        from app.graph.nodes.router import arouter_node, router_node
+
+        state = create_initial_state("cek laporan laba rugi bulan ini")
+        with patch.object(settings, "NLU_ROUTER_MODE", "legacy_regex"), \
+             patch("app.graph.nodes.router_semantic.aroute_semantic_nlu", new_callable=AsyncMock) as mock_sem_async, \
+             patch("app.graph.nodes.router_semantic.route_semantic_nlu_sync") as mock_sem_sync:
+            res_async = await arouter_node(state)
+            res_sync = router_node(state)
+
+        mock_sem_async.assert_not_awaited()
+        mock_sem_sync.assert_not_called()
+        self.assertEqual(res_async["detected_tool"], "get_profit_and_loss")
+        self.assertEqual(res_sync["detected_tool"], "get_profit_and_loss")
+
+    async def test_semantic_llm_mode_dispatches_and_falls_back_on_llm_unavailable(self):
+        from unittest.mock import patch
+        from app.core.config import settings
+        from app.graph.nodes.router import arouter_node, router_node
+
+        q = "cek order minggu ini"
+        clarify = MultiRouterDecision(
+            domain="clarification",
+            query_mode="clarification",
+            needs_clarification=True,
+            clarification_question="Order ERP atau Order Marketplace?",
+            clarification_options=[
+                ClarificationOption(label="Sales Order ERP", query="Cek sales order minggu ini"),
+                ClarificationOption(label="Order Marketplace", query="Cek order marketplace minggu ini"),
+            ],
+        )
+        mock_llm = _make_mock_llm(clarify)
+        state = create_initial_state(q)
+
+        with patch.object(settings, "NLU_ROUTER_MODE", "semantic_llm"):
+            res_async = await arouter_node(state, llm=mock_llm)
+            res_sync = router_node(state, llm=mock_llm)
+
+        self.assertTrue(res_async["needs_clarification"])
+        self.assertEqual(res_async["query_mode"], "clarification")
+        self.assertTrue(res_sync["needs_clarification"])
+        self.assertEqual(res_sync["query_mode"], "clarification")
+
+        # When no LLM is available (returns None), semantic_llm falls back gracefully to legacy_regex
+        fallback_state = create_initial_state("cek laba rugi bulan ini")
+        with patch.object(settings, "NLU_ROUTER_MODE", "semantic_llm"):
+            res_fb_async = await arouter_node(fallback_state, llm=None)
+            res_fb_sync = router_node(fallback_state, llm=None)
+
+        self.assertEqual(res_fb_async["detected_tool"], "get_profit_and_loss")
+        self.assertEqual(res_fb_sync["detected_tool"], "get_profit_and_loss")
+
+    async def test_shadow_mode_is_non_blocking_logs_mismatch_and_cleans_up_tasks(self):
+        import asyncio
+        from unittest.mock import patch
+        from app.core.config import settings
+        import app.graph.nodes.router as router_mod
+
+        gate = asyncio.Event()
+
+        async def _slow_semantic(**kwargs):
+            await gate.wait()
+            return {
+                "detected_domain": "clarification",
+                "detected_tool": None,
+                "detected_tools": [],
+                "query_mode": "clarification",
+                "needs_clarification": True,
+            }
+
+        state = create_initial_state("cek daftar sales order hari ini")
+        with patch.object(settings, "NLU_ROUTER_MODE", "shadow"), \
+             patch.object(settings, "NLU_SHADOW_LOG_MISMATCH_ONLY", True), \
+             patch("app.graph.nodes.router_semantic.aroute_semantic_nlu", side_effect=_slow_semantic), \
+             self.assertLogs("router_node", level="INFO") as cm:
+            # Must return legacy result immediately while shadow task is still blocked on gate
+            res = await router_mod.arouter_node(state)
+            self.assertEqual(res["detected_tool"], "get_sales_orders")
+            self.assertFalse(res.get("needs_clarification", False))
+            self.assertTrue(len(router_mod._SHADOW_ROUTER_TASKS) >= 1)
+
+            # Release shadow task and wait for clean completion
+            gate.set()
+            pending = list(router_mod._SHADOW_ROUTER_TASKS)
+            if pending:
+                await asyncio.gather(*pending)
+
+        self.assertEqual(len(router_mod._SHADOW_ROUTER_TASKS), 0)
+        self.assertTrue(any("NLU_SHADOW_DIFF" in msg and '"mismatch": true' in msg for msg in cm.output))
+
+    async def test_shadow_mode_handles_timeout_and_sync_skips_shadow(self):
+        import asyncio
+        from unittest.mock import patch
+        from app.core.config import settings
+        import app.graph.nodes.router as router_mod
+
+        async def _hanging_semantic(**kwargs):
+            await asyncio.sleep(2.0)
+            return None
+
+        state = create_initial_state("cek saldo kas hari ini")
+        with patch.object(settings, "NLU_ROUTER_MODE", "shadow"), \
+             patch.object(router_mod, "_SHADOW_ROUTER_TIMEOUT_SEC", 0.05), \
+             patch("app.graph.nodes.router_semantic.aroute_semantic_nlu", side_effect=_hanging_semantic), \
+             self.assertLogs("router_node", level="INFO") as cm:
+            res = await router_mod.arouter_node(state)
+            self.assertEqual(res["detected_tool"], "get_account_balance")
+            pending = list(router_mod._SHADOW_ROUTER_TASKS)
+            if pending:
+                await asyncio.gather(*pending)
+
+        self.assertEqual(len(router_mod._SHADOW_ROUTER_TASKS), 0)
+        self.assertTrue(any("NLU_SHADOW_DIFF" in msg and '"status": "timeout"' in msg for msg in cm.output))
+
+        # Sync router_node in shadow mode runs legacy_regex only and schedules zero tasks
+        with patch.object(settings, "NLU_ROUTER_MODE", "shadow"), \
+             patch("app.graph.nodes.router_semantic.route_semantic_nlu_sync") as mock_sync_sem:
+            sync_res = router_mod.router_node(state)
+        mock_sync_sem.assert_not_called()
+        self.assertEqual(sync_res["detected_tool"], "get_account_balance")
+
+    async def test_workflow_e2e_clarification_then_multiturn_resolution_in_semantic_mode(self):
+        """Full StateGraph E2E: Turn 1 clarifies without hitting ERP; Turn 2 resets clarification and executes tool."""
+        from unittest.mock import patch
+        from langgraph.checkpoint.memory import MemorySaver
+        from app.core.config import settings
+        from app.graph.workflow import arun_workflow, create_workflow_graph
+        from app.services.django_client import DjangoCoreClient
+
+        clarify_decision = MultiRouterDecision(
+            domain="clarification",
+            query_mode="clarification",
+            needs_clarification=True,
+            clarification_question="Order mana yang ingin Anda cek untuk minggu ini?",
+            clarification_options=[
+                ClarificationOption(label="Sales Order ERP", query="Cek daftar sales order minggu ini"),
+                ClarificationOption(label="Order Marketplace", query="Cek daftar order marketplace minggu ini"),
+            ],
+        )
+        resolve_decision = MultiRouterDecision(
+            domain="marketplace",
+            query_mode="live_erp",
+            tool="get_marketplace_orders",
+            planned_tools=[
+                PlannedToolCall(tool="get_marketplace_orders", domain="marketplace", sub_query="yang marketplace")
+            ],
+        )
+
+        structured_mock = MagicMock()
+        structured_mock.ainvoke = AsyncMock(side_effect=[clarify_decision, resolve_decision])
+        router_llm = MagicMock()
+        router_llm.with_structured_output.return_value = structured_mock
+
+        mock_client = MagicMock(spec=DjangoCoreClient)
+        mock_client.fetch_marketplace_orders = AsyncMock(
+            return_value={
+                "total_count": 1,
+                "orders": [
+                    {
+                        "order_sn": "260320ABC123",
+                        "marketplace": "shopee",
+                        "status": "READY_TO_SHIP",
+                        "sla_status": "due_soon",
+                    }
+                ],
+            }
+        )
+
+        from app.graph.nodes.router import _prepare_router_context as real_prep
+
+        def _prep_with_mock(state, llm, user_query):
+            return real_prep(state=state, llm=llm or router_llm, user_query=user_query)
+
+        graph = create_workflow_graph(checkpointer=MemorySaver())
+        with patch.object(settings, "NLU_ROUTER_MODE", "semantic_llm"), \
+             patch("app.graph.nodes.router._prepare_router_context", side_effect=_prep_with_mock), \
+             patch("app.graph.nodes.tool_node.DjangoCoreClient", return_value=mock_client):
+            res1 = await arun_workflow(
+                user_query="cek order minggu ini",
+                thread_id="semantic_clarify_e2e_thread",
+                graph=graph,
+            )
+            self.assertTrue(res1["needs_clarification"])
+            self.assertEqual(res1["query_mode"], "clarification")
+            self.assertEqual(res1["verification_status"], "CLARIFICATION")
+            self.assertEqual(res1["final_answer"], "Order mana yang ingin Anda cek untuk minggu ini?")
+            self.assertEqual(len(res1["suggested_followups"]), 2)
+            mock_client.fetch_marketplace_orders.assert_not_awaited()
+
+            res2 = await arun_workflow(
+                user_query="yang marketplace",
+                thread_id="semantic_clarify_e2e_thread",
+                graph=graph,
+            )
+            self.assertFalse(res2["needs_clarification"])
+            self.assertEqual(res2["detected_tool"], "get_marketplace_orders")
+            self.assertEqual(res2["verification_status"], "VALID")
+            mock_client.fetch_marketplace_orders.assert_awaited_once()
+
+
 if __name__ == "__main__":
     unittest.main()

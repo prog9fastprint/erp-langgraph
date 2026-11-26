@@ -4,10 +4,13 @@ Provides high-speed hybrid routing: keyword/regex pattern matching for ERP modul
 with negative guardrails (preventing customer-vendor confusion), multi-intent subagent planning,
 and LLM fallback.
 """
+import asyncio
+import json
 import logging
 import os
 import re
 import sys
+import time
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import BaseMessage, SystemMessage, HumanMessage
@@ -2130,19 +2133,132 @@ def _try_route_contextual_analysis(
     }
 
 
-def _router_node_impl(
-    state: AgentState,
-    llm: Optional[BaseChatModel] = None,
-    user_query: str = "",
-) -> Dict[str, Any]:
-    early_res, is_retry, prior_query, eff_query, get_model_fn = _prepare_router_context(
-        state=state,
-        llm=llm,
-        user_query=user_query,
-    )
-    if early_res is not None:
-        return early_res
+_SHADOW_ROUTER_TASKS: set["asyncio.Task[Any]"] = set()
+_SHADOW_ROUTER_TIMEOUT_SEC: float = 5.0
 
+
+def _resolve_nlu_router_mode() -> str:
+    """Read normalized NLU_ROUTER_MODE ('legacy_regex' | 'semantic_llm' | 'shadow')."""
+    mode = str(getattr(settings, "NLU_ROUTER_MODE", "legacy_regex") or "legacy_regex").strip().lower()
+    if mode in ("legacy_regex", "semantic_llm", "shadow"):
+        return mode
+    return "legacy_regex"
+
+
+def _build_shadow_diff_record(
+    user_query: str,
+    legacy_res: Dict[str, Any],
+    semantic_res: Optional[Dict[str, Any]],
+    latency_ms: float,
+    status: str = "ok",
+) -> Tuple[bool, Dict[str, Any]]:
+    """Build structured comparison record between legacy_regex and semantic_llm routing decisions."""
+    legacy_tools = sorted(legacy_res.get("detected_tools") or [])
+    semantic_tools = sorted((semantic_res or {}).get("detected_tools") or [])
+    legacy_domain = legacy_res.get("detected_domain")
+    semantic_domain = (semantic_res or {}).get("detected_domain")
+    legacy_mode = legacy_res.get("query_mode")
+    semantic_mode = (semantic_res or {}).get("query_mode")
+    needs_clarification = bool((semantic_res or {}).get("needs_clarification", False))
+
+    is_mismatch = (
+        status != "ok"
+        or legacy_tools != semantic_tools
+        or legacy_domain != semantic_domain
+        or legacy_mode != semantic_mode
+        or needs_clarification
+    )
+    payload = {
+        "query": (user_query or "")[:200],
+        "status": status,
+        "mismatch": is_mismatch,
+        "legacy_domain": legacy_domain,
+        "semantic_domain": semantic_domain,
+        "legacy_mode": legacy_mode,
+        "semantic_mode": semantic_mode,
+        "legacy_tools": legacy_tools,
+        "semantic_tools": semantic_tools,
+        "needs_clarification": needs_clarification,
+        "latency_ms": round(latency_ms, 2),
+    }
+    return is_mismatch, payload
+
+
+def _schedule_shadow_semantic_router(
+    state: AgentState,
+    eff_query: str,
+    is_retry: bool,
+    prior_query: Optional[str],
+    get_model_fn: Callable[[], Optional[BaseChatModel]],
+    legacy_res: Dict[str, Any],
+) -> Optional["asyncio.Task[Any]"]:
+    """
+    Fire non-blocking tracked background task running semantic_llm in shadow mode
+    with bounded timeout and silent error handling so user latency/availability is untouched.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return None
+
+    state_snapshot = dict(state)
+    legacy_snapshot = dict(legacy_res)
+    timeout_sec = min(float(getattr(settings, "REQUEST_TIMEOUT_SEC", 15)), _SHADOW_ROUTER_TIMEOUT_SEC)
+
+    async def _run_shadow() -> None:
+        from app.graph.nodes.router_semantic import aroute_semantic_nlu
+
+        t0 = time.perf_counter()
+        semantic_res: Optional[Dict[str, Any]] = None
+        status = "ok"
+        try:
+            semantic_res = await asyncio.wait_for(
+                aroute_semantic_nlu(
+                    state=state_snapshot,
+                    user_query=eff_query,
+                    get_model_fn=get_model_fn,
+                    is_retry=is_retry,
+                    prior_query=prior_query,
+                    contextual_analysis_fn=_try_route_contextual_analysis,
+                    enforce_general_fn=_enforce_general_vs_out_of_scope,
+                ),
+                timeout=timeout_sec,
+            )
+            if semantic_res is None:
+                status = "fallback_none"
+        except asyncio.TimeoutError:
+            status = "timeout"
+            logger.debug("Shadow semantic NLU router timed out after %.1fs for '%s'", timeout_sec, eff_query[:80])
+        except Exception as exc:
+            status = "error"
+            logger.debug("Shadow semantic NLU router error for '%s': %s", eff_query[:80], exc)
+
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        is_mismatch, payload = _build_shadow_diff_record(
+            user_query=eff_query,
+            legacy_res=legacy_snapshot,
+            semantic_res=semantic_res,
+            latency_ms=elapsed_ms,
+            status=status,
+        )
+        log_mismatch_only = bool(getattr(settings, "NLU_SHADOW_LOG_MISMATCH_ONLY", True))
+        if is_mismatch or not log_mismatch_only:
+            logger.info("NLU_SHADOW_DIFF %s", json.dumps(payload, ensure_ascii=False))
+
+    task = asyncio.create_task(_run_shadow())
+    _SHADOW_ROUTER_TASKS.add(task)
+    task.add_done_callback(_SHADOW_ROUTER_TASKS.discard)
+    return task
+
+
+def _legacy_router_node_impl(
+    state: AgentState,
+    eff_query: str,
+    is_retry: bool,
+    prior_query: Optional[str],
+    get_model_fn: Callable[[], Optional[BaseChatModel]],
+) -> Dict[str, Any]:
+    """Legacy regex-first synchronous routing pipeline."""
     if not is_retry:
         ctx_res = _try_route_contextual_analysis(eff_query, state)
         if ctx_res is not None:
@@ -2195,19 +2311,14 @@ def _router_node_impl(
     return _general_fallback_result()
 
 
-async def _arouter_node_impl(
+async def _alegacy_router_node_impl(
     state: AgentState,
-    llm: Optional[BaseChatModel] = None,
-    user_query: str = "",
+    eff_query: str,
+    is_retry: bool,
+    prior_query: Optional[str],
+    get_model_fn: Callable[[], Optional[BaseChatModel]],
 ) -> Dict[str, Any]:
-    early_res, is_retry, prior_query, eff_query, get_model_fn = _prepare_router_context(
-        state=state,
-        llm=llm,
-        user_query=user_query,
-    )
-    if early_res is not None:
-        return early_res
-
+    """Legacy regex-first asynchronous routing pipeline."""
     if not is_retry:
         ctx_res = _try_route_contextual_analysis(eff_query, state)
         if ctx_res is not None:
@@ -2258,7 +2369,96 @@ async def _arouter_node_impl(
 
     return _general_fallback_result()
 
+
+def _router_node_impl(
+    state: AgentState,
+    llm: Optional[BaseChatModel] = None,
+    user_query: str = "",
+) -> Dict[str, Any]:
+    early_res, is_retry, prior_query, eff_query, get_model_fn = _prepare_router_context(
+        state=state,
+        llm=llm,
+        user_query=user_query,
+    )
+    if early_res is not None:
+        return early_res
+
+    mode = _resolve_nlu_router_mode()
+    if mode == "semantic_llm":
+        from app.graph.nodes.router_semantic import route_semantic_nlu_sync
+
+        semantic_res = route_semantic_nlu_sync(
+            state=state,
+            user_query=eff_query,
+            get_model_fn=get_model_fn,
+            is_retry=is_retry,
+            prior_query=prior_query,
+            contextual_analysis_fn=_try_route_contextual_analysis,
+            enforce_general_fn=_enforce_general_vs_out_of_scope,
+        )
+        if semantic_res is not None:
+            return semantic_res
+        logger.info("Sync semantic_llm router unavailable/failed; falling back to legacy_regex.")
+
+    return _legacy_router_node_impl(
+        state=state,
+        eff_query=eff_query,
+        is_retry=is_retry,
+        prior_query=prior_query,
+        get_model_fn=get_model_fn,
+    )
+
+
+async def _arouter_node_impl(
+    state: AgentState,
+    llm: Optional[BaseChatModel] = None,
+    user_query: str = "",
+) -> Dict[str, Any]:
+    early_res, is_retry, prior_query, eff_query, get_model_fn = _prepare_router_context(
+        state=state,
+        llm=llm,
+        user_query=user_query,
+    )
+    if early_res is not None:
+        return early_res
+
+    mode = _resolve_nlu_router_mode()
+    if mode == "semantic_llm":
+        from app.graph.nodes.router_semantic import aroute_semantic_nlu
+
+        semantic_res = await aroute_semantic_nlu(
+            state=state,
+            user_query=eff_query,
+            get_model_fn=get_model_fn,
+            is_retry=is_retry,
+            prior_query=prior_query,
+            contextual_analysis_fn=_try_route_contextual_analysis,
+            enforce_general_fn=_enforce_general_vs_out_of_scope,
+        )
+        if semantic_res is not None:
+            return semantic_res
+        logger.info("Async semantic_llm router unavailable/failed; falling back to legacy_regex.")
+
+    legacy_res = await _alegacy_router_node_impl(
+        state=state,
+        eff_query=eff_query,
+        is_retry=is_retry,
+        prior_query=prior_query,
+        get_model_fn=get_model_fn,
+    )
+    if mode == "shadow":
+        _schedule_shadow_semantic_router(
+            state=state,
+            eff_query=eff_query,
+            is_retry=is_retry,
+            prior_query=prior_query,
+            get_model_fn=get_model_fn,
+            legacy_res=legacy_res,
+        )
+    return legacy_res
+
 __all__ = [
+    "ClarificationOption",
     "PlannedToolCall",
     "RouterDecision",
     "MultiRouterDecision",
