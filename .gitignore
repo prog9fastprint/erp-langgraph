@@ -25,3 +25,6 @@ Thumbs.db
 
 # Code intelligence (CodeGraph)
 .codegraph/
+
+# Playwright MCP artifacts
+.playwright-mcp/

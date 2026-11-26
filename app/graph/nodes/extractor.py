@@ -243,11 +243,11 @@ def _extract_single_tool_params(
     elif tool_name == "get_inventory_velocity_forecast" and retry_count == 0:
         extracted_dict = _fallback_extract_inventory_velocity_forecast(sub_query, today)
     elif tool_name == "get_profit_and_loss" and retry_count == 0:
-        fast_params = _fallback_extract_profit_and_loss(sub_query, today)
+        fast_params = _fallback_extract_profit_and_loss(sub_query, today, state.get("messages"))
         if fast_params.get("date_from") or fast_params.get("date_to") or fast_params.get("include_breakdown"):
             extracted_dict = dict(fast_params)
     elif tool_name == "get_balance_sheet" and retry_count == 0:
-        fast_params = _fallback_extract_balance_sheet(sub_query, today)
+        fast_params = _fallback_extract_balance_sheet(sub_query, today, state.get("messages"))
         if fast_params.get("as_of_date") or fast_params.get("include_breakdown"):
             extracted_dict = dict(fast_params)
     elif tool_name == "get_top_selling_products" and retry_count == 0:
@@ -363,9 +363,9 @@ def _extract_single_tool_params(
         elif tool_name == "get_general_ledger":
             extracted_dict = _fallback_extract_general_ledger(sub_query, today, state.get("messages"))
         elif tool_name == "get_profit_and_loss":
-            extracted_dict = _fallback_extract_profit_and_loss(sub_query, today)
+            extracted_dict = _fallback_extract_profit_and_loss(sub_query, today, state.get("messages"))
         elif tool_name == "get_balance_sheet":
-            extracted_dict = _fallback_extract_balance_sheet(sub_query, today)
+            extracted_dict = _fallback_extract_balance_sheet(sub_query, today, state.get("messages"))
         elif tool_name == "get_vendor_bills":
             extracted_dict = _fallback_extract_vendor_bills(sub_query, today)
         elif tool_name == "get_bank_reconciliation_summary":

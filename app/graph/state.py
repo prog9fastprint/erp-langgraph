@@ -11,7 +11,7 @@ from app.services.llm import get_default_model_name
 
 # Structured verification status literal
 VerificationStatus = Literal["VALID", "EMPTY", "RETRY", "ERROR"]
-QueryMode = Literal["live_erp", "vector_rag", "hybrid", "general", "out_of_scope"]
+QueryMode = Literal["live_erp", "vector_rag", "hybrid", "general", "out_of_scope", "contextual_analysis"]
 
 
 class ToolCallPlan(TypedDict, total=False):
@@ -87,6 +87,10 @@ class AgentState(TypedDict, total=False):
     # 4. Tool Execution & Output Data
     tool_result: Optional[Dict[str, Any]] # Legacy/primary raw data & calculations returned from ERP
     multi_tool_results: Optional[Dict[str, Any]] # Tool execution results mapped by tool_name
+    prior_tool_result: Optional[Dict[str, Any]] # Prior-turn raw ERP payload snapshot for contextual analysis
+    prior_detected_tool: Optional[str]          # Prior-turn tool name for contextual analysis continuity
+    prior_detected_domain: Optional[str]        # Prior-turn domain for contextual analysis continuity
+    prior_extracted_params: Optional[Dict[str, Any]] # Prior-turn tool parameters snapshot
 
     # 5. Guardrail & Verification Cycle
     verification_status: Optional[VerificationStatus] # Aggregate status: "VALID", "EMPTY", "RETRY", "ERROR"
@@ -173,6 +177,10 @@ def create_initial_state(
         "detected_tool": None,
         "extracted_params": None,
         "tool_result": None,
+        "prior_tool_result": None,
+        "prior_detected_tool": None,
+        "prior_detected_domain": None,
+        "prior_extracted_params": None,
         "verification_status": None,
         "retry_count": 0,
         "retry_instruction": None,

@@ -5,9 +5,9 @@ and contextual summary prompt injection.
 """
 from datetime import date, datetime, timedelta, timezone, tzinfo
 import re
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 from zoneinfo import ZoneInfo
-from langchain_core.messages import BaseMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 
 from app.core.config import settings
 
@@ -689,5 +689,145 @@ def has_anaphoric_reference(text: str) -> bool:
         return True
     if re.search(r"\b(?:berapa|gimana|bagaimana|mana|ada berapa)\s+(?:stok|harga|saldo|tagihan|faktur|detail)\b", cleaned):
         return True
+    return False
+
+
+_ANALYTICAL_CAUSAL_RE = re.compile(
+    r"(?:\b(?:kenapa|mengapa|kok)\b|"
+    r"\b(?:penyebab(?:nya)?|alasan(?:nya)?|pemicu(?:nya)?|faktor\s+(?:penyebab|utama|pendorong))\b|"
+    r"\bapa\s+(?:penyebab|alasan|masalah|kendala|pemicu|faktor)(?:nya)?\b|"
+    r"\b(?:jelas(?:kan|in)|urai(?:kan)?|analisis|analisa|evaluasi|kesimpulan(?:nya)?|simpulan|insight|diagnosa)\b|"
+    r"\b(?:pos|akun|biaya|beban|komponen|kategori|item|produk|cabang|channel)\s+(?:apa|mana)(?:\s+(?:saja|aja))?\s+.*?\b(?:paling|terbesar|tertinggi|dominan|menggerus|membebani|menyebabkan|berpengaruh|bermasalah)\b|"
+    r"\bmana\s+(?:yang|yg)\s+paling\s+(?:besar|tinggi|berpengaruh|dominan|membebani|menggerus|bermasalah|menyebabkan)\b|"
+    r"\bapakah\s+.*?\b(?:wajar|normal|sehat|bagus|signifikan|bermasalah|aman)\b)",
+    re.IGNORECASE,
+)
+
+_EXPLICIT_TABULAR_LIST_RE = re.compile(
+    r"\b(?:tampilkan|berikan|lihat(?:kan)?|list|daftar|jabarkan)\s+.*?\b(?:tabel|table|daftar|list|per\s+akun|rincian\s+akun|detail\s+akun)\b",
+    re.IGNORECASE,
+)
+
+
+def is_analytical_thinking_query(query: Optional[str]) -> bool:
+    """
+    Return True when the user asks a causal, diagnostic, explanatory, or analytical
+    ("thinking") question rather than a plain data-lookup or table-dump command.
+    """
+    text = (query or "").strip()
+    if not text:
+        return False
+    if not _ANALYTICAL_CAUSAL_RE.search(text):
+        return False
+    # If user explicitly asks for a raw table listing without causal cues, treat as tabular request
+    if _EXPLICIT_TABULAR_LIST_RE.search(text) and not re.search(
+        r"\b(?:kenapa|mengapa|kok|penyebab|alasan|jelas|urai|analisis|analisa|evaluasi|kesimpulan|simpulan|insight)\b",
+        text,
+        re.IGNORECASE,
+    ):
+        return False
+    return True
+
+
+def extract_period_from_messages(
+    messages: Optional[Sequence[Any]],
+) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """
+    Extract the most recent reported date_from, date_to, or as_of_date from prior AI messages.
+    Returns (date_from, date_to, as_of_date).
+    """
+    if not messages:
+        return None, None, None
+    prior_msgs = list(messages)
+    if prior_msgs and (getattr(prior_msgs[-1], "type", "") in ("human", "user") or isinstance(prior_msgs[-1], HumanMessage)):
+        prior_msgs = prior_msgs[:-1]
+
+    for msg in reversed(prior_msgs):
+        msg_type = getattr(msg, "type", "")
+        if msg_type != "ai" and not isinstance(msg, AIMessage):
+            continue
+        content = str(getattr(msg, "content", "") or "")
+        if not content:
+            continue
+        m_per = re.search(
+            r"Periode(?:\s+Evaluasi)?\s*[:\s]\s*`?(\d{4}-\d{2}-\d{2})`?\s*(?:s/d|-|to)\s*`?(\d{4}-\d{2}-\d{2})`?",
+            content,
+            re.IGNORECASE,
+        )
+        if m_per:
+            return m_per.group(1), m_per.group(2), None
+        m_asof = re.search(
+            r"Posisi\s+per\s*[:\s]\s*`?(\d{4}-\d{2}-\d{2})`?",
+            content,
+            re.IGNORECASE,
+        )
+        if m_asof:
+            return None, None, m_asof.group(1)
+    return None, None, None
+
+
+def has_sufficient_prior_erp_context(
+    messages: Optional[Sequence[Any]],
+    prior_tool_result: Any = None,
+    prior_tool_name: Optional[str] = None,
+) -> bool:
+    """
+    Determine whether prior conversation context already holds detailed ERP report data
+    sufficient to answer an analytical follow-up without re-fetching from Django Core.
+    Summary-only 1-line answers return False for breakdown-dependent tools (e.g. P&L/Balance Sheet).
+    """
+    if isinstance(prior_tool_result, dict) and prior_tool_result:
+        if prior_tool_name in ("get_profit_and_loss", "get_balance_sheet"):
+            if prior_tool_result.get("breakdown"):
+                return True
+        elif resolve_tool_record_count(prior_tool_result) > 0:
+            # Check for list collections or multi-metric summaries
+            has_detail_keys = any(
+                isinstance(prior_tool_result.get(k), list) and len(prior_tool_result[k]) > 0
+                for k in _COLLECTION_LIST_KEYS
+            ) or bool(prior_tool_result.get("by_branch") or prior_tool_result.get("monthly_breakdown") or prior_tool_result.get("channels_breakdown"))
+            if has_detail_keys:
+                return True
+
+    if not messages:
+        return False
+
+    prior_msgs = list(messages)
+    if prior_msgs and (getattr(prior_msgs[-1], "type", "") in ("human", "user") or isinstance(prior_msgs[-1], HumanMessage)):
+        prior_msgs = prior_msgs[:-1]
+
+    for msg in reversed(prior_msgs):
+        msg_type = getattr(msg, "type", "")
+        if msg_type != "ai" and not isinstance(msg, AIMessage):
+            continue
+        content = str(getattr(msg, "content", "") or "").strip()
+        if not content:
+            continue
+
+        # Exclude greeting/guardrail/error notices from counting as analyzable ERP data
+        if any(
+            marker in content
+            for marker in (
+                "Halo! Saya adalah Asisten AI FastPrint ERP",
+                "Permintaan di Luar Cakupan",
+                "Data Tidak Ditemukan",
+                "Kendala Akses Data ERP",
+                "Tagihan Pelanggan (Customer)",
+            )
+        ):
+            return False
+
+        # Detailed markdown tables (>= 4 data rows beyond header+separator)
+        table_lines = [ln for ln in content.splitlines() if ln.strip().startswith("|")]
+        if len(table_lines) >= 6:
+            return True
+
+        # Multi-section structured analytical or summary output
+        if ("#### Rincian" in content or "### Laporan" in content or "### Ringkasan" in content or "### Analisis" in content) and len(content) >= 400:
+            return True
+
+        # Brief 1-sentence summary (e.g. Turn 1 P&L summary without breakdown) is NOT sufficient
+        return False
+
     return False
 

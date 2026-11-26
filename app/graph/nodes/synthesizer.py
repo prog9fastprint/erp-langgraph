@@ -8,13 +8,18 @@ import logging
 import os
 import re
 import sys
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 from langchain_core.callbacks import adispatch_custom_event
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from app.core.branches import COMPANY_NAME_MAP
-from app.core.context import get_current_erp_date
+from app.core.context import (
+    extract_period_from_messages,
+    get_current_erp_date,
+    is_analytical_thinking_query,
+    trim_conversation_messages,
+)
 from app.graph.nodes.formatters import (
     _append_pagination_footer,
     _append_zero_branch_footnote,
@@ -631,6 +636,10 @@ def format_deterministic_answer(state: AgentState) -> str:
             )
         return _format_rag_section(rag_context, rag_sources)
 
+    # 2.5 Contextual Analytical Follow-up (prior report data without new tool execution)
+    if query_mode == "contextual_analysis" and not is_multi:
+        return _build_deterministic_analytical_fallback(state)
+
     # 3. General Domain / Guardrail Inquiries / Session Meta-Questions
     if (domain == "general" or not tool) and not is_multi:
         meta_answer = _format_meta_question_answer(state)
@@ -980,9 +989,9 @@ def generate_deterministic_followups(state: AgentState) -> List[Dict[str, str]]:
     """
     suggestions: List[Dict[str, str]] = []
     status = state.get("verification_status")
-    domain = state.get("detected_domain") or ""
-    tool = state.get("detected_tool") or ""
-    params = state.get("extracted_params") or {}
+    domain = state.get("detected_domain") or state.get("prior_detected_domain") or ""
+    tool = state.get("detected_tool") or state.get("prior_detected_tool") or ""
+    params = state.get("extracted_params") or state.get("prior_extracted_params") or {}
 
     # Inspect parameters in active_tools if empty in extracted_params
     if not params:
@@ -1390,14 +1399,21 @@ def _should_keep_verbatim_deterministic(
     is_multi_q: bool,
 ) -> bool:
     """Return True when Markdown tables must not be collapsed into short LLM prose summaries."""
-    if state.get("is_multi_company", False) or is_multi_q or len(deterministic_answer) > 1500:
+    if state.get("query_mode") == "contextual_analysis":
+        return False
+    if re.search(
+        r"#### (?:Analisis Proyeksi Target|Ringkasan Evaluasi Dampak|Rekomendasi Segera Di-Order)",
+        deterministic_answer,
+    ):
         return True
-    if re.search(r"#### (?:Analisis Proyeksi Target|Ringkasan Evaluasi Dampak)", deterministic_answer):
+    if _EXPLICIT_TABULAR_BREAKDOWN_RE.search(user_query or ""):
+        return True
+    if is_analytical_thinking_query(user_query):
+        return False
+    if state.get("is_multi_company", False) or is_multi_q or len(deterministic_answer) > 1500:
         return True
     if "\n|" not in deterministic_answer:
         return False
-    if _EXPLICIT_TABULAR_BREAKDOWN_RE.search(user_query or ""):
-        return True
     ext_params = state.get("extracted_params") or {}
     return bool(isinstance(ext_params, dict) and ext_params.get("include_breakdown") and len(deterministic_answer) > 600)
 
@@ -1564,6 +1580,412 @@ def _prepare_synthesis_context(
     )
 
 
+def _parse_indonesian_rupiah(raw: str) -> Optional[float]:
+    """Parse Indonesian formatted Rupiah string (e.g. 'Rp -2.667.690.147,11') to float."""
+    if not raw or not isinstance(raw, str):
+        return None
+    cleaned = raw.replace("Rp", "").replace("**", "").replace("*", "").strip()
+    m = re.search(r"-?[\d\.]+(?:,\d+)?", cleaned)
+    if not m:
+        return None
+    num_str = m.group(0).replace(".", "").replace(",", ".")
+    try:
+        return float(num_str)
+    except ValueError:
+        return None
+
+
+def _parse_pnl_from_markdown(text: str) -> Optional[Dict[str, Any]]:
+    """Reconstruct P&L summary and account breakdown rows from a prior Markdown P&L report."""
+    if not text or ("Laporan Laba Rugi" not in text and "Pendapatan Usaha" not in text):
+        return None
+
+    summary: Dict[str, Any] = {}
+    metric_patterns = {
+        "total_revenue": r"Pendapatan Usaha \(Revenue\)\**\s*\|\s*([^|\n]+)",
+        "cogs": r"Beban Pokok Penjualan[^|\n]*\|\s*([^|\n]+)",
+        "gross_profit": r"Laba Kotor \(Gross Profit\)\**\s*\|\s*([^|\n]+)",
+        "operating_expenses": r"Beban Operasional\**\s*\|\s*([^|\n]+)",
+        "operating_profit": r"Laba Operasional\**\s*\|\s*([^|\n]+)",
+        "other_net": r"Pendapatan / Beban Lain-Lain Bersih\**\s*\|\s*([^|\n]+)",
+        "net_profit": r"Laba Bersih Periode Berjalan[^|\n]*\|\s*([^|\n]+)",
+    }
+    for key, pat in metric_patterns.items():
+        m = re.search(pat, text, re.IGNORECASE)
+        if m:
+            val = _parse_indonesian_rupiah(m.group(1))
+            if val is not None:
+                summary[key] = val
+
+    m_gm = re.search(r"Gross Profit Margin\*?\s*\|\s*\*?(-?[\d.,]+)\s*%", text, re.IGNORECASE)
+    if m_gm:
+        try:
+            summary["gross_margin_percent"] = float(m_gm.group(1).replace(",", "."))
+        except ValueError:
+            pass
+
+    if not summary:
+        return None
+
+    m_per = re.search(
+        r"Periode\s*:\s*`?(\d{4}-\d{2}-\d{2})`?\s*(?:s/d|-|to)\s*`?(\d{4}-\d{2}-\d{2})`?",
+        text,
+        re.IGNORECASE,
+    )
+    groups_map: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+    for line in text.splitlines():
+        if not line.strip().startswith("|"):
+            continue
+        parts = [p.strip() for p in line.strip().strip("|").split("|")]
+        if len(parts) != 5 or parts[0].startswith(":") or parts[0].lower() == "grup akun":
+            continue
+        grp_name, tp_name, raw_code, acc_name, raw_bal = parts
+        bal = _parse_indonesian_rupiah(raw_bal)
+        if bal is None:
+            continue
+        code = raw_code.strip("`").strip()
+        groups_map.setdefault((grp_name, tp_name), []).append({
+            "account_code": code,
+            "account_name": acc_name,
+            "balance": bal,
+        })
+
+    breakdown: List[Dict[str, Any]] = []
+    if groups_map:
+        by_group: Dict[str, List[Dict[str, Any]]] = {}
+        for (g_n, t_n), accs in groups_map.items():
+            by_group.setdefault(g_n, []).append({"type_name": t_n, "accounts": accs})
+        for g_n, t_list in by_group.items():
+            breakdown.append({"group_name": g_n, "types": t_list})
+
+    return {
+        "date_from": m_per.group(1) if m_per else None,
+        "date_to": m_per.group(2) if m_per else None,
+        "summary": summary,
+        "breakdown": breakdown,
+    }
+
+
+def _collect_pnl_accounts(pnl_data: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], int]:
+    """Flatten non-zero P&L breakdown accounts and count zero-balance entries."""
+    accounts: List[Dict[str, Any]] = []
+    zero_count = 0
+    for grp in pnl_data.get("breakdown") or []:
+        grp_name = str(grp.get("group_name") or grp.get("name") or "-")
+        for tp in grp.get("types", []):
+            tp_name = str(tp.get("type_name") or tp.get("name") or "-")
+            for acc in tp.get("accounts", []):
+                bal = float(acc.get("balance", 0.0) or 0.0)
+                if abs(bal) <= 0.01:
+                    zero_count += 1
+                    continue
+                accounts.append({
+                    "group": grp_name,
+                    "type": tp_name,
+                    "code": str(acc.get("account_code") or "-"),
+                    "name": str(acc.get("account_name") or "-"),
+                    "balance": bal,
+                })
+    return accounts, zero_count
+
+
+def _build_pnl_analytical_digest(pnl_data: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+    """Compute structured P&L analytical metrics, top cost drivers, and anomaly flags."""
+    summary = pnl_data.get("summary") or {}
+    rev = float(summary.get("total_revenue", 0.0) or 0.0)
+    cogs = float(summary.get("cogs", 0.0) or 0.0)
+    gross = float(summary.get("gross_profit", 0.0) or 0.0)
+    gm = float(summary.get("gross_margin_percent", 0.0) or 0.0)
+    opex = float(summary.get("operating_expenses", 0.0) or 0.0)
+    op_profit = float(summary.get("operating_profit", 0.0) or 0.0)
+    other_net = float(summary.get("other_net", 0.0) or 0.0)
+    net_profit = float(summary.get("net_profit", 0.0) or 0.0)
+
+    accounts, zero_count = _collect_pnl_accounts(pnl_data)
+    opex_accounts = [
+        a for a in accounts
+        if a["group"].lower() == "expense" and "cost of revenue" not in a["type"].lower()
+    ]
+    positive_opex = sorted([a for a in opex_accounts if a["balance"] > 0], key=lambda x: x["balance"], reverse=True)
+    negative_opex = sorted([a for a in opex_accounts if a["balance"] < 0], key=lambda x: x["balance"])
+    negative_income = [
+        a for a in accounts
+        if a["group"].lower() == "income" and "other income" not in a["type"].lower() and a["balance"] < 0
+    ]
+    cogs_accounts = [
+        a for a in accounts
+        if "cost of revenue" in a["type"].lower()
+    ]
+    other_income_accounts = sorted(
+        [a for a in accounts if "other" in a["type"].lower() or a["code"].startswith("41") or a["code"].startswith("52")],
+        key=lambda x: abs(x["balance"]),
+        reverse=True,
+    )
+
+    shown_opex_sum = sum(a["balance"] for a in opex_accounts)
+    opex_gap = opex - shown_opex_sum if opex_accounts else 0.0
+
+    d_from = pnl_data.get("date_from") or "-"
+    d_to = pnl_data.get("date_to") or "-"
+    digest_lines = [
+        f"Periode Laporan: {d_from} s/d {d_to}",
+        f"- Pendapatan Usaha (Revenue): {_format_rupiah(rev)}",
+        f"- HPP (COGS): {_format_rupiah(cogs)}",
+        f"- Laba Kotor (Gross Profit): {_format_rupiah(gross)} (Gross Margin: {gm:.1f}%)",
+        f"- Beban Operasional: {_format_rupiah(opex)}",
+        f"- Laba / (Rugi) Operasional: {_format_rupiah(op_profit)}",
+        f"- Pendapatan / Beban Lain-Lain Bersih: {_format_rupiah(other_net)}",
+        f"- Laba / (Rugi) Bersih: {_format_rupiah(net_profit)}",
+    ]
+
+    if positive_opex:
+        digest_lines.append("\nPos Beban Operasional Terbesar:")
+        for a in positive_opex[:10]:
+            pct_rev = f" ({(a['balance'] / rev * 100.0):.1f}% dari revenue)" if rev > 0 else ""
+            digest_lines.append(f"- `{a['code']}` {a['name']}: {_format_rupiah(a['balance'])}{pct_rev}")
+
+    if negative_income or negative_opex:
+        digest_lines.append("\nPos Pengurang Pendapatan / Penyesuaian Negatif:")
+        for a in negative_income:
+            digest_lines.append(f"- [Contra/Negatif Income] `{a['code']}` {a['name']}: {_format_rupiah(a['balance'])}")
+        for a in negative_opex:
+            digest_lines.append(f"- [Kredit/Offset Beban] `{a['code']}` {a['name']}: {_format_rupiah(a['balance'])}")
+
+    if cogs_accounts:
+        digest_lines.append("\nRincian HPP (COGS):")
+        for a in sorted(cogs_accounts, key=lambda x: abs(x["balance"]), reverse=True)[:5]:
+            digest_lines.append(f"- `{a['code']}` {a['name']}: {_format_rupiah(a['balance'])}")
+
+    if other_income_accounts:
+        digest_lines.append("\nPos Pendapatan / Beban Lain-Lain Terbesar:")
+        for a in other_income_accounts[:5]:
+            digest_lines.append(f"- `{a['code']}` {a['name']}: {_format_rupiah(a['balance'])}")
+
+    if opex_accounts and abs(opex_gap) > 1000.0:
+        digest_lines.append(
+            f"\nCatatan Kelengkapan Data: Jumlah pos beban operasional yang tampil ({_format_rupiah(shown_opex_sum)}) "
+            f"memiliki selisih {_format_rupiah(opex_gap)} terhadap total Beban Operasional ({_format_rupiah(opex)}), "
+            f"menandakan sebagian akun di bawah baris terakhir tidak tercantum pada rincian."
+        )
+    if zero_count > 0:
+        digest_lines.append(f"Catatan: {zero_count} akun bersaldo Rp 0,00 diabaikan dari ringkasan analisis.")
+
+    meta = {
+        "rev": rev,
+        "cogs": cogs,
+        "gross": gross,
+        "gm": gm,
+        "opex": opex,
+        "op_profit": op_profit,
+        "other_net": other_net,
+        "net_profit": net_profit,
+        "positive_opex": positive_opex,
+        "negative_income": negative_income,
+        "negative_opex": negative_opex,
+        "opex_accounts": opex_accounts,
+        "shown_opex_sum": shown_opex_sum,
+        "opex_gap": opex_gap,
+        "d_from": d_from,
+        "d_to": d_to,
+    }
+    return "\n".join(digest_lines), meta
+
+
+def _format_pnl_analytical_fallback(pnl_data: Dict[str, Any]) -> str:
+    """Deterministic causal P&L explanation with compact summary and top drivers when LLM is unavailable."""
+    _, meta = _build_pnl_analytical_digest(pnl_data)
+    rev = meta["rev"]
+    cogs = meta["cogs"]
+    gross = meta["gross"]
+    gm = meta["gm"]
+    opex = meta["opex"]
+    op_profit = meta["op_profit"]
+    other_net = meta["other_net"]
+    net_profit = meta["net_profit"]
+    d_from = meta["d_from"]
+    d_to = meta["d_to"]
+
+    lines: List[str] = []
+    if net_profit < 0:
+        if gross > 0 and opex > gross:
+            excess = opex - gross
+            lead = (
+                f"Laba bersih periode **{d_from} s/d {d_to}** tercatat minus **{_format_rupiah(net_profit)}** "
+                f"karena Beban Operasional (**{_format_rupiah(opex)}**) lebih besar **{_format_rupiah(excess)}** "
+                f"dibandingkan Laba Kotor (**{_format_rupiah(gross)}**, margin **{gm:.1f}%**), sehingga "
+                f"menimbulkan Rugi Operasional **{_format_rupiah(op_profit)}**."
+            )
+            if other_net > 0:
+                lead += f" Pendapatan/beban lain-lain bersih (**{_format_rupiah(other_net)}**) hanya menutup sebagian rugi operasional tersebut."
+        elif gross <= 0:
+            lead = (
+                f"Laba bersih periode **{d_from} s/d {d_to}** minus **{_format_rupiah(net_profit)}** "
+                f"karena HPP (**{_format_rupiah(cogs)}**) sudah melebihi Pendapatan Usaha (**{_format_rupiah(rev)}**)."
+            )
+        else:
+            lead = (
+                f"Laba bersih periode **{d_from} s/d {d_to}** tercatat minus **{_format_rupiah(net_profit)}** "
+                f"meskipun Laba Operasional sebesar **{_format_rupiah(op_profit)}**, karena tergerus pos lain-lain bersih "
+                f"(**{_format_rupiah(other_net)}**)."
+            )
+    else:
+        lead = (
+            f"Laba bersih periode **{d_from} s/d {d_to}** positif sebesar **{_format_rupiah(net_profit)}** "
+            f"dari Laba Kotor **{_format_rupiah(gross)}** (margin **{gm:.1f}%**) setelah dikurangi Beban Operasional **{_format_rupiah(opex)}**."
+        )
+    lines.append(lead)
+    lines.append("")
+    lines.append("| Komponen Laba Rugi | Nominal |")
+    lines.append("|:---|:---|")
+    lines.append(f"| Pendapatan Usaha (Revenue) | {_format_rupiah(rev)} |")
+    lines.append(f"| Beban Pokok Penjualan (HPP) | {_format_rupiah(cogs)} |")
+    lines.append(f"| Laba Kotor (Margin {gm:.1f}%) | **{_format_rupiah(gross)}** |")
+    lines.append(f"| Beban Operasional | {_format_rupiah(opex)} |")
+    lines.append(f"| Laba / (Rugi) Operasional | **{_format_rupiah(op_profit)}** |")
+    lines.append(f"| Pendapatan / Beban Lain-Lain Bersih | {_format_rupiah(other_net)} |")
+    lines.append(f"| **Laba / (Rugi) Bersih** | **{_format_rupiah(net_profit)}** |")
+
+    pos_opex = meta["positive_opex"]
+    if pos_opex:
+        lines.append("\n#### Pemicu Beban Operasional Terbesar:")
+        for a in pos_opex[:5]:
+            share_opex = f" ({(a['balance'] / opex * 100.0):.1f}% dari beban operasional)" if opex > 0 else ""
+            lines.append(f"- `{a['code']}` **{a['name']}**: **{_format_rupiah(a['balance'])}**{share_opex}")
+
+    anomalies: List[str] = []
+    for a in meta["negative_income"]:
+        anomalies.append(f"Pos pengurang/negatif pada pendapatan: `{a['code']}` {a['name']} ({_format_rupiah(a['balance'])}).")
+    for a in meta["negative_opex"]:
+        anomalies.append(f"Pos kredit/offset pada beban: `{a['code']}` {a['name']} ({_format_rupiah(a['balance'])}).")
+    if meta["opex_accounts"] and abs(meta["opex_gap"]) > 1000.0:
+        anomalies.append(
+            f"Selisih **{_format_rupiah(meta['opex_gap'])}** antara total Beban Operasional ({_format_rupiah(opex)}) "
+            f"dan penjumlahan pos beban yang tercantum ({_format_rupiah(meta['shown_opex_sum'])})."
+        )
+    if anomalies:
+        lines.append("\n#### Catatan & Anomali Data:")
+        for note in anomalies[:5]:
+            lines.append(f"- {note}")
+
+    return "\n".join(lines)
+
+
+def _extract_latest_erp_report_message(messages: Optional[Sequence[Any]]) -> str:
+    """Return content of the most recent substantive ERP AIMessage from conversation history."""
+    if not messages:
+        return ""
+    prior_msgs = list(messages)
+    if prior_msgs and (getattr(prior_msgs[-1], "type", "") in ("human", "user") or isinstance(prior_msgs[-1], HumanMessage)):
+        prior_msgs = prior_msgs[:-1]
+
+    for msg in reversed(prior_msgs):
+        msg_type = getattr(msg, "type", "")
+        if msg_type != "ai" and not isinstance(msg, AIMessage):
+            continue
+        content = str(getattr(msg, "content", "") or "").strip()
+        if not content:
+            continue
+        if any(
+            marker in content
+            for marker in (
+                "Halo! Saya adalah Asisten AI FastPrint ERP",
+                "Permintaan di Luar Cakupan",
+                "Data Tidak Ditemukan",
+                "Kendala Akses Data ERP",
+            )
+        ):
+            continue
+        return content
+    return ""
+
+
+def _build_deterministic_analytical_fallback(state: AgentState) -> str:
+    """Provide grounded analytical fallback without LLM for contextual_analysis or analytical tool turns."""
+    tool_result = state.get("tool_result") or state.get("prior_tool_result")
+    tool = state.get("detected_tool") or state.get("prior_detected_tool")
+    if tool == "get_profit_and_loss" and isinstance(tool_result, dict) and tool_result.get("summary"):
+        return _format_pnl_analytical_fallback(tool_result)
+
+    latest_ai = _extract_latest_erp_report_message(state.get("messages"))
+    parsed_pnl = _parse_pnl_from_markdown(latest_ai)
+    if parsed_pnl:
+        return _format_pnl_analytical_fallback(parsed_pnl)
+
+    if latest_ai:
+        # Return concise non-empty slice without repeating giant full tables
+        non_zero_lines = [
+            ln for ln in latest_ai.splitlines()
+            if ln.strip() and "| Rp 0,00 |" not in ln
+        ]
+        if len(non_zero_lines) > 25:
+            return "\n".join(non_zero_lines[:25]) + "\n\n*(Ringkasan dipotong dari laporan sebelumnya.)*"
+        return "\n".join(non_zero_lines)
+
+    return "Tidak terdapat data laporan ERP sebelumnya yang cukup untuk dianalisis lebih lanjut."
+
+
+def _build_analytical_data_context(
+    state: AgentState,
+    deterministic_answer: str,
+    max_chars: int = 12000,
+) -> str:
+    """Build structured, zero-clutter ERP data context for analytical LLM reasoning."""
+    query_mode = state.get("query_mode")
+    tool_result = state.get("tool_result") or state.get("prior_tool_result")
+    tool = state.get("detected_tool") or state.get("prior_detected_tool")
+    latest_ai = _extract_latest_erp_report_message(state.get("messages"))
+
+    if tool == "get_profit_and_loss" and isinstance(tool_result, dict) and tool_result.get("summary"):
+        digest, _ = _build_pnl_analytical_digest(tool_result)
+        raw_table = deterministic_answer if query_mode != "contextual_analysis" else latest_ai
+        if not raw_table and tool_result:
+            raw_table = format_deterministic_answer({**state, "tool_result": tool_result, "detected_tool": "get_profit_and_loss", "verification_status": "VALID"})
+        filtered_table = "\n".join(ln for ln in (raw_table or "").splitlines() if "| Rp 0,00 |" not in ln)
+        combined = f"{digest}\n\nRincian Laporan:\n{filtered_table}" if filtered_table else digest
+        return combined[:max_chars]
+
+    if query_mode == "contextual_analysis":
+        parsed_pnl = _parse_pnl_from_markdown(latest_ai)
+        if parsed_pnl:
+            digest, _ = _build_pnl_analytical_digest(parsed_pnl)
+            filtered_ai = "\n".join(ln for ln in latest_ai.splitlines() if "| Rp 0,00 |" not in ln)
+            return f"{digest}\n\nLaporan Sebelumnya:\n{filtered_ai}"[:max_chars]
+        source_text = latest_ai or deterministic_answer
+        filtered = "\n".join(ln for ln in source_text.splitlines() if "| Rp 0,00 |" not in ln)
+        return filtered[:max_chars]
+
+    filtered_det = "\n".join(ln for ln in (deterministic_answer or "").splitlines() if "| Rp 0,00 |" not in ln)
+    return filtered_det[:max_chars]
+
+
+def _build_analytical_prompt(
+    user_query: Any,
+    data_context: str,
+    history_excerpt: str = "",
+) -> str:
+    """Build analytical reasoning prompt grounded strictly in ERP data."""
+    hist_block = f"Konteks Percakapan Sebelumnya:\n{history_excerpt}\n\n" if history_excerpt else ""
+    return (
+        "Anda adalah Analis Keuangan & Operasional FastPrint ERP yang presisi, lugas, dan bebas basa-basi (ZERO AI SLOP).\n"
+        "Tugas Anda adalah MENJAWAB pertanyaan analitis/berpikir pengguna secara langsung berdasarkan data ERP terlampir — BUKAN mengulang tabel laporan mentah.\n\n"
+        "ATURAN KETAT ANALISIS:\n"
+        "1. LANGSUNG KE POKOK JAWABAN (Lead with the answer): Pada kalimat pertama, langsung jawab penyebab utama, temuan inti, atau jawaban dari pertanyaan pengguna.\n"
+        "2. KUTIP ANGKA & KODE AKUN/SKU SECARA PERSIS: Wajib hanya menggunakan angka, kode akun, kode SKU, nama cabang, dan nominal yang tertera pada data ERP terlampir. DILARANG mengarang angka atau berspekulasi tentang penyebab eksternal di luar data.\n"
+        "3. RINGKASAN PEMICU UTAMA (Compact Top Drivers): Sajikan maksimal 4-7 pos/faktor pemicu terbesar beserta nominal (dan persentase bila relevan). DILARANG mengulang tabel rincian panjang (80+ baris) kecuali pengguna meminta tabel.\n"
+        "4. SOROT ANOMALI DATA JIKA ADA: Jika terlihat pos tidak lazim pada rincian (misal pendapatan bersaldo negatif/contra, akun beban bersaldo negatif/offset penyusutan, atau selisih antara penjumlahan pos yang tampil dengan total ringkasan), jelaskan secara faktual.\n"
+        "5. ZERO AI SLOP & TANPA EMOJI: Dilarang basa-basi pembuka/penutup ('Tentu!', 'Berdasarkan data...', 'Semoga membantu!') dan dilarang karakter emoji apapun.\n\n"
+        "Sertakan 2 hingga 3 rekomendasi pertanyaan lanjutan READ-ONLY yang spesifik terhadap pos/entitas pada temuan di atas dalam blok JSON:\n"
+        "```json:followups\n"
+        "[\n"
+        '  {"label": "Label Singkat (1-3 kata)", "query": "Prompt lengkap READ-ONLY", "icon": "fa-arrow-right"}\n'
+        "]\n"
+        "```\n\n"
+        f"{hist_block}"
+        f"Pertanyaan Pengguna: {user_query}\n\n"
+        f"Data ERP Terstruktur:\n{data_context}"
+    )
+
+
 def _build_followup_only_prompt(user_query: Any, deterministic_answer: str) -> str:
     """Build prompt that requests ONLY json:followups suggestions without repeating report tables."""
     return (
@@ -1638,6 +2060,64 @@ def _finalize_synthesis_output(
     return out_dict
 
 
+def _build_synthesis_plan(
+    state: AgentState,
+    user_query: Any,
+    status: Optional[str],
+    deterministic_answer: str,
+    is_multi_q: bool,
+    model: Optional[BaseChatModel],
+) -> Tuple[bool, bool, bool, bool, Optional[str]]:
+    """Determine synthesis mode (verbatim, polish, or analytical) and resolve prompt if LLM runs."""
+    is_contextual_analysis = state.get("query_mode") == "contextual_analysis"
+    is_large_deterministic = _should_keep_verbatim_deterministic(
+        deterministic_answer, user_query, state, is_multi_q
+    )
+    is_analytical = is_contextual_analysis or (
+        status == "VALID"
+        and is_analytical_thinking_query(str(user_query or ""))
+        and not is_large_deterministic
+    )
+    should_llm_synthesize = model is not None and (is_contextual_analysis or status == "VALID")
+    should_polish = should_llm_synthesize and (not is_large_deterministic or is_analytical)
+
+    if not should_llm_synthesize:
+        return is_large_deterministic, is_contextual_analysis, is_analytical, should_polish, None
+
+    if is_large_deterministic and not is_analytical:
+        prompt = _build_followup_only_prompt(user_query, deterministic_answer)
+    elif is_analytical:
+        data_context = _build_analytical_data_context(state, deterministic_answer)
+        raw_hist = (state.get("messages") or [])[:-1]
+        trimmed_hist = trim_conversation_messages(raw_hist, max_messages=4)
+        hist_lines = []
+        for m in trimmed_hist:
+            if isinstance(m, HumanMessage) or getattr(m, "type", "") in ("human", "user"):
+                hist_lines.append(f"User: {str(getattr(m, 'content', '') or '').strip()}")
+        prompt = _build_analytical_prompt(
+            user_query=user_query,
+            data_context=data_context,
+            history_excerpt="\n".join(hist_lines),
+        )
+    else:
+        prompt = _build_polish_prompt(user_query, deterministic_answer)
+
+    return is_large_deterministic, is_contextual_analysis, is_analytical, should_polish, prompt
+
+
+def _resolve_fallback_text_on_missing_or_failed_llm(
+    state: AgentState,
+    deterministic_answer: str,
+    is_analytical: bool,
+) -> str:
+    """Use grounded analytical fallback for analytical queries instead of dumping giant raw tables."""
+    if is_analytical:
+        tool = state.get("detected_tool") or state.get("prior_detected_tool")
+        if state.get("query_mode") == "contextual_analysis" or tool in ("get_profit_and_loss", "get_balance_sheet"):
+            return _build_deterministic_analytical_fallback(state)
+    return deterministic_answer
+
+
 async def asynthesizer_node(
     state: AgentState,
     llm: Optional[BaseChatModel] = None,
@@ -1686,25 +2166,26 @@ async def asynthesizer_node(
                 deterministic_answer = updated_det
                 final_text = deterministic_answer
 
-    is_large_deterministic = _should_keep_verbatim_deterministic(
-        deterministic_answer, user_query, state, is_multi_q
-    )
-    should_polish = model is not None and status == "VALID" and not is_large_deterministic
+    (
+        is_large_deterministic,
+        is_contextual_analysis,
+        is_analytical,
+        should_polish,
+        prompt,
+    ) = _build_synthesis_plan(state, user_query, status, deterministic_answer, is_multi_q, model)
+
+    if is_analytical and model is None:
+        final_text = _resolve_fallback_text_on_missing_or_failed_llm(state, deterministic_answer, is_analytical)
 
     # Immediate <10ms token dispatch for non-polished deterministic/multi-company/multi-question paths
-    if not should_polish and deterministic_answer:
+    if not should_polish and final_text:
         try:
-            await adispatch_custom_event("token", {"content": _apply_retry_header(deterministic_answer, retry_header)})
+            await adispatch_custom_event("token", {"content": _apply_retry_header(final_text, retry_header)})
         except Exception as dispatch_err:
             logger.debug(f"Could not dispatch deterministic_chunk: {dispatch_err}")
 
-    if model is not None and status == "VALID":
+    if prompt is not None and model is not None:
         try:
-            prompt = (
-                _build_followup_only_prompt(user_query, deterministic_answer)
-                if is_large_deterministic
-                else _build_polish_prompt(user_query, deterministic_answer)
-            )
             response = await model.ainvoke(
                 [
                     SystemMessage(content="Anda adalah Asisten AI FastPrint ERP yang presisi, lugas, dan bebas AI slop."),
@@ -1718,7 +2199,7 @@ async def asynthesizer_node(
             content = getattr(response, "content", None)
             if content and isinstance(content, str) and content.strip():
                 clean_ans, llm_followups = _extract_llm_followups(content.strip())
-                if not is_large_deterministic:
+                if not is_large_deterministic or is_analytical:
                     clean_ans = _clean_ai_slop(clean_ans)
                     if clean_ans:
                         final_text = clean_ans
@@ -1726,7 +2207,7 @@ async def asynthesizer_node(
                     followups = llm_followups
         except Exception as exc:
             logger.warning(f"LLM synthesis failed, falling back to deterministic output: {exc}")
-            final_text = deterministic_answer
+            final_text = _resolve_fallback_text_on_missing_or_failed_llm(state, deterministic_answer, is_analytical)
 
     out_dict = _finalize_synthesis_output(
         final_text=final_text,
@@ -1737,6 +2218,8 @@ async def asynthesizer_node(
         retry_header=retry_header,
         state=state,
     )
+    if is_contextual_analysis and not out_dict.get("verification_status"):
+        out_dict["verification_status"] = state.get("verification_status") or "VALID"
     if should_polish and out_dict["final_answer"]:
         try:
             await adispatch_custom_event("token", {"content": out_dict["final_answer"]})
@@ -1800,17 +2283,19 @@ def synthesizer_node(
                 deterministic_answer = updated_det
                 final_text = deterministic_answer
 
-    is_large_deterministic = _should_keep_verbatim_deterministic(
-        deterministic_answer, user_query, state, is_multi_q
-    )
+    (
+        is_large_deterministic,
+        is_contextual_analysis,
+        is_analytical,
+        _,
+        prompt,
+    ) = _build_synthesis_plan(state, user_query, status, deterministic_answer, is_multi_q, model)
 
-    if model is not None and status == "VALID":
+    if is_analytical and model is None:
+        final_text = _resolve_fallback_text_on_missing_or_failed_llm(state, deterministic_answer, is_analytical)
+
+    if prompt is not None and model is not None:
         try:
-            prompt = (
-                _build_followup_only_prompt(user_query, deterministic_answer)
-                if is_large_deterministic
-                else _build_polish_prompt(user_query, deterministic_answer)
-            )
             response = model.invoke([
                 SystemMessage(content="Anda adalah Asisten AI FastPrint ERP yang presisi, lugas, dan bebas AI slop."),
                 HumanMessage(content=prompt),
@@ -1821,7 +2306,7 @@ def synthesizer_node(
             content = getattr(response, "content", None)
             if content and isinstance(content, str) and content.strip():
                 clean_ans, llm_followups = _extract_llm_followups(content.strip())
-                if not is_large_deterministic:
+                if not is_large_deterministic or is_analytical:
                     clean_ans = _clean_ai_slop(clean_ans)
                     if clean_ans:
                         final_text = clean_ans
@@ -1829,9 +2314,9 @@ def synthesizer_node(
                     followups = llm_followups
         except Exception as exc:
             logger.warning(f"LLM synthesis failed, falling back to deterministic output: {exc}")
-            final_text = deterministic_answer
+            final_text = _resolve_fallback_text_on_missing_or_failed_llm(state, deterministic_answer, is_analytical)
 
-    return _finalize_synthesis_output(
+    out_dict = _finalize_synthesis_output(
         final_text=final_text,
         deterministic_answer=deterministic_answer,
         followups=followups,
@@ -1840,6 +2325,9 @@ def synthesizer_node(
         retry_header=retry_header,
         state=state,
     )
+    if is_contextual_analysis and not out_dict.get("verification_status"):
+        out_dict["verification_status"] = state.get("verification_status") or "VALID"
+    return out_dict
 
 __all__ = [
     "_build_evaluative_verdict",

@@ -26,8 +26,14 @@ from app.core.branches import (
     resolve_prior_multi_company_scope,
     strip_company_scope_keywords,
 )
-from app.core.context import has_anaphoric_reference
+from app.core.context import (
+    extract_period_from_messages,
+    has_anaphoric_reference,
+    has_sufficient_prior_erp_context,
+    is_analytical_thinking_query,
+)
 from app.graph.nodes.extractors.accounting import resolve_pnl_drilldown_from_history
+from app.graph.nodes.extractors.common import resolve_relative_dates
 from app.graph.nodes.router_decomposer import (
     _extract_sub_queries,
     _split_conjunction_clauses,
@@ -122,9 +128,9 @@ class RouterDecision(BaseModel):
         ...,
         description="Target ERP module domain: 'accounting', 'inventory', 'sales', 'marketplace', 'knowledge' (SOPs, specs, policies), 'general' (greetings/help), or 'out_of_scope' (unrelated queries outside ERP)."
     )
-    query_mode: Literal["live_erp", "vector_rag", "hybrid", "general", "out_of_scope"] = Field(
+    query_mode: Literal["live_erp", "vector_rag", "hybrid", "general", "out_of_scope", "contextual_analysis"] = Field(
         "live_erp",
-        description="Execution mode: 'vector_rag' for SOP/policies/specs, 'live_erp' for real-time transactions/stock, 'hybrid' for combined questions, 'general', or 'out_of_scope'."
+        description="Execution mode: 'vector_rag' for SOP/policies/specs, 'live_erp' for real-time transactions/stock, 'hybrid' for combined questions, 'contextual_analysis' for follow-up analytical questions on prior report data, 'general', or 'out_of_scope'."
     )
     tool: Optional[str] = Field(
         None,
@@ -153,9 +159,9 @@ class MultiRouterDecision(BaseModel):
         ...,
         description="Primary target ERP module domain: 'accounting', 'inventory', 'sales', 'marketplace', 'knowledge', 'general', or 'out_of_scope'."
     )
-    query_mode: Literal["live_erp", "vector_rag", "hybrid", "general", "out_of_scope"] = Field(
+    query_mode: Literal["live_erp", "vector_rag", "hybrid", "general", "out_of_scope", "contextual_analysis"] = Field(
         "live_erp",
-        description="Execution mode: 'vector_rag', 'live_erp', 'hybrid', 'general', or 'out_of_scope'."
+        description="Execution mode: 'vector_rag', 'live_erp', 'hybrid', 'contextual_analysis', 'general', or 'out_of_scope'."
     )
     tool: Optional[str] = Field(
         None,
@@ -177,7 +183,7 @@ class MultiRouterDecision(BaseModel):
     @model_validator(mode="after")
     def reconcile_and_clean_tools(self) -> "MultiRouterDecision":
         """Clean tools on non-tool domains and synchronize primary tool with planned_tools."""
-        if self.domain in ("general", "out_of_scope", "knowledge") or self.query_mode == "vector_rag":
+        if self.domain in ("general", "out_of_scope", "knowledge") or self.query_mode in ("vector_rag", "contextual_analysis"):
             self.tool = None
             self.planned_tools = []
             return self
@@ -1609,8 +1615,9 @@ def _router_single_and_llm_steps(
                 "1. 'vector_rag' / domain='knowledge': Qualitative questions about SOPs, return policies, product technical specifications (GSM, size), warranty, or contract terms. tool=null, planned_tools=[].\n"
                 "2. 'live_erp': Numerical / real-time operational inquiries about stock on hand, cash balances, journal ledger, vendor bills/invoices, sales orders/revenue, or marketplace operations/diagnostics.\n"
                 "3. 'hybrid': Combined queries asking about both SOP/specs rules AND live ERP numbers/stock. Plan live ERP tool(s) in planned_tools and set rag_query.\n"
-                "4. 'general': Pure greetings, polite chitchat, or asking about bot capabilities. tool=null, planned_tools=[].\n"
-                "5. 'out_of_scope': Inquiries unrelated to FastPrint ERP data or write/mutation requests (e.g., pushing stock/price to Shopee/TikTok or merging Kilat orders). tool=null, planned_tools=[].\n\n"
+                "4. 'contextual_analysis': Analytical or 'why' follow-up questions about detailed ERP report data already shown in conversation history when no new branch/period/tool is requested. Set domain to the prior ERP domain ('accounting', 'inventory', 'sales', 'marketplace'), tool=null, planned_tools=[].\n"
+                "5. 'general': Pure greetings, polite chitchat, or asking about bot capabilities. tool=null, planned_tools=[].\n"
+                "6. 'out_of_scope': Inquiries unrelated to FastPrint ERP data or write/mutation requests (e.g., pushing stock/price to Shopee/TikTok or merging Kilat orders). tool=null, planned_tools=[].\n\n"
                 "CONTEXT AWARENESS:\n"
                 "Evaluate user query in context of conversational history.\n"
                 "If user asks to retry or follow up, infer intended domain and target ERP tools from history.\n\n"
@@ -1668,7 +1675,7 @@ def _router_single_and_llm_steps(
 
             active_tools: List[Dict[str, Any]] = []
 
-            if detected_domain in ("general", "out_of_scope", "knowledge") or query_mode == "vector_rag":
+            if detected_domain in ("general", "out_of_scope", "knowledge") or query_mode in ("vector_rag", "contextual_analysis"):
                 detected_tool = None
                 raw_planned_tools = []
 
@@ -1788,6 +1795,152 @@ def _general_fallback_result() -> Dict[str, Any]:
     }
 
 
+_LIVE_DIAGNOSTIC_OR_DRILLDOWN_TOOLS = {
+    "get_sync_execution_logs",
+    "get_kilat_order_diagnostics",
+    "get_fee_and_escrow_anomalies",
+    "get_inventory_velocity_forecast",
+    "get_general_ledger",
+    "get_stock_sync_simulation",
+    "get_price_comparison",
+}
+
+
+def _infer_prior_erp_domain_and_tool(
+    history_messages: List[BaseMessage],
+    state: AgentState,
+) -> Tuple[Optional[str], Optional[str]]:
+    """Resolve prior ERP domain and tool from checkpoint snapshot, prior HumanMessage, or prior AIMessage heading."""
+    prior_domain = state.get("prior_detected_domain")
+    prior_tool = state.get("prior_detected_tool")
+    if prior_domain in ("accounting", "inventory", "sales", "marketplace") and prior_tool:
+        return prior_domain, prior_tool
+
+    prior_q = _find_previous_erp_query(history_messages)
+    if prior_q:
+        try:
+            prior_probe = classify_query_rule_based(prior_q)
+            if isinstance(prior_probe, dict) and prior_probe.get("detected_domain") in (
+                "accounting", "inventory", "sales", "marketplace"
+            ):
+                return prior_probe.get("detected_domain"), prior_probe.get("detected_tool")
+        except Exception:
+            pass
+
+    for msg in reversed(history_messages[:-1]):
+        if getattr(msg, "type", "") != "ai" and msg.__class__.__name__ != "AIMessage":
+            continue
+        txt = str(getattr(msg, "content", "") or "").lower()
+        if "laba rugi" in txt or "profit & loss" in txt:
+            return "accounting", "get_profit_and_loss"
+        if "neraca keuangan" in txt or "balance sheet" in txt:
+            return "accounting", "get_balance_sheet"
+        if "buku besar" in txt or "general ledger" in txt:
+            return "accounting", "get_general_ledger"
+        if "rekonsiliasi bank" in txt:
+            return "accounting", "get_bank_reconciliation_summary"
+        if "tagihan faktur vendor" in txt or "vendor bills" in txt:
+            return "accounting", "get_vendor_bills"
+        if "ringkasan eksekutif penjualan" in txt or "sales summary" in txt:
+            return "sales", "get_sales_summary"
+        if "perputaran stok" in txt or "velocity" in txt:
+            return "inventory", "get_inventory_velocity_forecast"
+        if "marketplace" in txt or "potongan fee" in txt or "saldo dompet" in txt:
+            return "marketplace", prior_tool
+        if "stok" in txt:
+            return "inventory", prior_tool
+        break
+    return prior_domain, prior_tool
+
+
+def _try_route_contextual_analysis(
+    user_query: str,
+    state: AgentState,
+) -> Optional[Dict[str, Any]]:
+    """
+    Route pure analytical/thinking follow-ups directly to synthesizer when detailed
+    ERP data is already present in conversation history and no scope/period/tool changed.
+    """
+    history_messages = state.get("messages") or []
+    if len(history_messages) <= 1:
+        return None
+    if not is_analytical_thinking_query(user_query):
+        return None
+
+    clean_uq = user_query.strip().rstrip("?!.,;:'\"> ").lower()
+    if is_retry_query(clean_uq) or is_meta_question(clean_uq):
+        return None
+    if _CASUAL_NON_ERP_INTERROGATIVE_RE.search(clean_uq):
+        return None
+    if (
+        _match_any(OUT_OF_SCOPE_PATTERNS, clean_uq)
+        or _match_any(GREETING_PATTERNS, clean_uq)
+        or _match_any(GENERAL_INQUIRY_PATTERNS, clean_uq)
+        or _match_any(MARKETPLACE_WRITE_PATTERNS, clean_uq)
+    ):
+        return None
+    if resolve_pnl_drilldown_from_history(user_query, history_messages):
+        return None
+
+    # Any explicit branch or company scope change requires fresh tool execution
+    if resolve_branch_company_id(user_query) is not None:
+        return None
+    multi_cids, is_all = resolve_all_branch_company_ids(user_query)
+    if multi_cids or is_all:
+        return None
+
+    # Any new date/period different from prior displayed period requires fresh tool execution
+    df, dt = resolve_relative_dates(user_query)
+    if df is not None or dt is not None:
+        prior_df, prior_dt, prior_asof = extract_period_from_messages(history_messages)
+        if not ((df, dt) == (prior_df, prior_dt) and (prior_df or prior_dt)) and not (
+            dt and dt == prior_asof
+        ):
+            return None
+
+    prior_domain, prior_tool = _infer_prior_erp_domain_and_tool(history_messages, state)
+    if prior_domain not in ("accounting", "inventory", "sales", "marketplace"):
+        return None
+
+    # Defer if the query targets guardrails, RAG knowledge, or a different/live diagnostic tool
+    probe = classify_query_rule_based(user_query)
+    if probe is not None:
+        p_domain = probe.get("detected_domain")
+        p_mode = probe.get("query_mode")
+        p_tools = probe.get("detected_tools") or []
+        if p_domain in ("general", "out_of_scope", "knowledge") or p_mode in ("vector_rag", "hybrid"):
+            return None
+        if any(t in _LIVE_DIAGNOSTIC_OR_DRILLDOWN_TOOLS for t in p_tools) and prior_tool not in p_tools:
+            return None
+        if prior_tool and any(t != prior_tool for t in p_tools):
+            return None
+        if not prior_tool and p_tools:
+            return None
+
+    if not has_sufficient_prior_erp_context(
+        history_messages,
+        prior_tool_result=state.get("prior_tool_result"),
+        prior_tool_name=prior_tool,
+    ):
+        return None
+
+    return {
+        "detected_domain": prior_domain,
+        "detected_tool": None,
+        "query_mode": "contextual_analysis",
+        "verification_status": "VALID",
+        "rag_query": None,
+        "rag_queries": [],
+        "is_multi_tool": False,
+        "detected_domains": [prior_domain],
+        "detected_tools": [],
+        "active_tools": [],
+        "available_tools": [],
+        "sub_questions": [user_query],
+        "non_tool_questions": [],
+    }
+
+
 def _router_node_impl(
     state: AgentState,
     llm: Optional[BaseChatModel] = None,
@@ -1800,6 +1953,11 @@ def _router_node_impl(
     )
     if early_res is not None:
         return early_res
+
+    if not is_retry:
+        ctx_res = _try_route_contextual_analysis(eff_query, state)
+        if ctx_res is not None:
+            return ctx_res
 
     clauses = decompose_user_query(eff_query)
     if len(clauses) > 1:
@@ -1860,6 +2018,11 @@ async def _arouter_node_impl(
     )
     if early_res is not None:
         return early_res
+
+    if not is_retry:
+        ctx_res = _try_route_contextual_analysis(eff_query, state)
+        if ctx_res is not None:
+            return ctx_res
 
     clauses = decompose_user_query(eff_query)
     if len(clauses) > 1:

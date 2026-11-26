@@ -70,7 +70,9 @@ def decide_after_router(state: AgentState) -> str:
     sub_questions = state.get("sub_questions") or []
     non_tool_questions = state.get("non_tool_questions") or []
 
-    # 1. Pure single-question guardrail: general & out_of_scope inquiries NEVER invoke tool extraction
+    # 1. Pure single-question guardrail & contextual analysis: skip tool extraction
+    if query_mode == "contextual_analysis" and not non_tool_questions and len(sub_questions) <= 1:
+        return "synthesizer"
     if (
         detected_domain in ("general", "out_of_scope")
         and not non_tool_questions
@@ -505,6 +507,22 @@ async def _prepare_workflow_execution(
         is_multi_company=is_multi_company,
         messages=hydrated_messages,
     )
+    if checkpoint_values:
+        prev_q_mode = checkpoint_values.get("query_mode")
+        if checkpoint_values.get("tool_result") is not None:
+            initial_state["prior_tool_result"] = checkpoint_values.get("tool_result")
+            initial_state["prior_detected_tool"] = checkpoint_values.get("detected_tool")
+            initial_state["prior_detected_domain"] = checkpoint_values.get("detected_domain")
+            initial_state["prior_extracted_params"] = checkpoint_values.get("extracted_params")
+        elif prev_q_mode == "contextual_analysis" and checkpoint_values.get("prior_tool_result") is not None:
+            initial_state["prior_tool_result"] = checkpoint_values.get("prior_tool_result")
+            initial_state["prior_detected_tool"] = checkpoint_values.get("prior_detected_tool")
+            initial_state["prior_detected_domain"] = checkpoint_values.get("prior_detected_domain")
+            initial_state["prior_extracted_params"] = checkpoint_values.get("prior_extracted_params")
+        elif checkpoint_values.get("detected_domain"):
+            initial_state["prior_detected_domain"] = checkpoint_values.get("detected_domain")
+            initial_state["prior_detected_tool"] = checkpoint_values.get("detected_tool")
+            initial_state["prior_extracted_params"] = checkpoint_values.get("extracted_params")
     return active_graph, config, initial_state, is_ephemeral, effective_thread_id
 
 

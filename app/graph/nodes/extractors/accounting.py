@@ -5,6 +5,7 @@ from datetime import date
 import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 from langchain_core.messages import HumanMessage
+from app.core.context import extract_period_from_messages, is_analytical_thinking_query
 from app.graph.nodes.extractors.common import (
     VENDOR_DELIMITERS,
     VENDOR_NAME_STOPWORDS,
@@ -156,6 +157,9 @@ def _fallback_extract_journal_entries(
     return params
 
 
+_ACCOUNT_CODE_PATTERN = r"[1-6]\d{2,7}(?:[A-Za-z]{1,6})?(?:[\.\-][A-Za-z0-9]{1,8})*"
+
+
 def resolve_pnl_drilldown_from_history(
     query: str,
     messages: Optional[Sequence[Any]] = None,
@@ -191,11 +195,11 @@ def resolve_pnl_drilldown_from_history(
         content = str(getattr(msg, "content", "") or "")
         if not content:
             continue
-        for m_row in re.finditer(r"`?([1-6]\d{2,7}(?:[\.\-]\d+)*)`?\s*\|\s*([^|\n]+)", content):
+        for m_row in re.finditer(rf"`?({_ACCOUNT_CODE_PATTERN})`?\s*\|\s*([^|\n]+)", content):
             account_candidates.append((m_row.group(1).strip(), m_row.group(2).strip()))
-        for m_dash in re.finditer(r"`?([1-6]\d{2,7}(?:[\.\-]\d+)*)`?\s*[-–:]\s*([^\n(|]+)", content):
+        for m_dash in re.finditer(rf"(?<![\d\-])`?({_ACCOUNT_CODE_PATTERN})`?\s*[-–:]\s+([^\n(|]+)", content):
             account_candidates.append((m_dash.group(1).strip(), m_dash.group(2).strip()))
-        for m_paren in re.finditer(r"([^\n(|]+?)\s*\(\s*`?([1-6]\d{2,7}(?:[\.\-]\d+)*)`?\s*\)", content):
+        for m_paren in re.finditer(rf"([^\n(|]+?)\s*\(\s*`?({_ACCOUNT_CODE_PATTERN})`?\s*\)", content):
             account_candidates.append((m_paren.group(2).strip(), m_paren.group(1).strip()))
         if account_candidates:
             break
@@ -226,7 +230,7 @@ def _fallback_extract_general_ledger(
     """Deterministic heuristic extraction for general ledger inquiries."""
     params: Dict[str, Any] = {"limit": 50, "offset": 0}
     cleaned = (query or "").strip()
-    acc_codes = re.findall(r"\b([1-6]\d{2,7}(?:[\.\-]\d+)*)\b", cleaned)
+    acc_codes = re.findall(rf"\b({_ACCOUNT_CODE_PATTERN})\b", cleaned)
     if acc_codes:
         params["account_code"] = acc_codes[0]
     elif messages:
@@ -260,13 +264,21 @@ def _fallback_extract_general_ledger(
     return params
 
 
-def _fallback_extract_profit_and_loss(query: str, ref_date: Optional[date] = None) -> Dict[str, Any]:
+def _fallback_extract_profit_and_loss(
+    query: str,
+    ref_date: Optional[date] = None,
+    messages: Optional[Sequence[Any]] = None,
+) -> Dict[str, Any]:
     """Deterministic heuristic extraction for profit and loss inquiries (compact by default)."""
     params: Dict[str, Any] = {"include_breakdown": False}
     cleaned = query.strip().lower()
-    if any(k in cleaned for k in ("rincian", "detail", "breakdown", "per akun", "daftar akun", "hierarki")):
+    if any(k in cleaned for k in ("rincian", "detail", "breakdown", "per akun", "daftar akun", "hierarki")) or is_analytical_thinking_query(query):
         params["include_breakdown"] = True
     date_from, date_to = resolve_relative_dates(query, ref_date)
+    if not date_from and not date_to and messages:
+        prior_df, prior_dt, _ = extract_period_from_messages(messages)
+        if prior_df or prior_dt:
+            date_from, date_to = prior_df, prior_dt
     if date_from:
         params["date_from"] = date_from
     if date_to:
@@ -274,17 +286,27 @@ def _fallback_extract_profit_and_loss(query: str, ref_date: Optional[date] = Non
     return params
 
 
-def _fallback_extract_balance_sheet(query: str, ref_date: Optional[date] = None) -> Dict[str, Any]:
+def _fallback_extract_balance_sheet(
+    query: str,
+    ref_date: Optional[date] = None,
+    messages: Optional[Sequence[Any]] = None,
+) -> Dict[str, Any]:
     """Deterministic heuristic extraction for balance sheet inquiries (compact by default)."""
     params: Dict[str, Any] = {"include_breakdown": False}
     cleaned = query.strip().lower()
-    if any(k in cleaned for k in ("rincian", "detail", "breakdown", "per akun", "daftar akun", "hierarki")):
+    if any(k in cleaned for k in ("rincian", "detail", "breakdown", "per akun", "daftar akun", "hierarki")) or is_analytical_thinking_query(query):
         params["include_breakdown"] = True
     date_from, date_to = resolve_relative_dates(query, ref_date)
     if date_to:
         params["as_of_date"] = date_to
     elif date_from:
         params["as_of_date"] = date_from
+    elif messages:
+        _, prior_dt, prior_asof = extract_period_from_messages(messages)
+        if prior_asof:
+            params["as_of_date"] = prior_asof
+        elif prior_dt:
+            params["as_of_date"] = prior_dt
     return params
 
 

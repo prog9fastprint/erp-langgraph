@@ -231,6 +231,40 @@ def format_get_general_ledger(
     return "\n".join(lines)
 
 
+def _append_hierarchical_account_breakdown(
+    lines: List[str],
+    breakdown: List[Dict[str, Any]],
+    section_heading: str,
+    group_col_label: str,
+    type_col_label: str,
+) -> None:
+    """Append P&L or Balance Sheet account breakdown rows, omitting zero-balance accounts."""
+    if not breakdown:
+        return
+    lines.append(f"\n{section_heading}")
+    lines.append(f"| {group_col_label} | {type_col_label} | Kode Akun | Nama Akun | Saldo |")
+    lines.append("|:---|:---|:---|:---|:---|")
+    zero_count = 0
+    written_rows = 0
+    for grp in breakdown:
+        grp_name = grp.get("group_name") or grp.get("name") or "-"
+        for tp in grp.get("types", []):
+            tp_name = tp.get("type_name") or tp.get("name") or "-"
+            for acc in tp.get("accounts", []):
+                raw_bal = float(acc.get("balance", 0.0) or 0.0)
+                if abs(raw_bal) <= 0.01:
+                    zero_count += 1
+                    continue
+                acc_c = acc.get("account_code") or "-"
+                acc_n = acc.get("account_name") or "-"
+                lines.append(f"| {grp_name} | {tp_name} | `{acc_c}` | {acc_n} | {_format_rupiah(raw_bal)} |")
+                written_rows += 1
+    if written_rows == 0:
+        lines.append("| - | - | - | *Seluruh akun pada rincian ini bersaldo Rp 0,00* | Rp 0,00 |")
+    elif zero_count > 0:
+        lines.append(f"\n*Catatan: {zero_count} akun bersaldo Rp 0,00 tidak ditampilkan.*")
+
+
 def format_get_profit_and_loss(
     tool: str,
     tool_result: Any,
@@ -258,19 +292,13 @@ def format_get_profit_and_loss(
     lines.append(f"| **Laba Bersih Periode Berjalan (Net Profit)** | **{_format_rupiah(summary.get('net_profit', 0.0))}** |")
 
     breakdown = tool_result.get("breakdown") or []
-    if breakdown:
-        lines.append("\n#### Rincian Hierarki Laba Rugi:")
-        lines.append("| Grup Akun | Tipe / Sub-Tipe | Kode Akun | Nama Akun | Saldo |")
-        lines.append("|:---|:---|:---|:---|:---|")
-        for grp in breakdown:
-            grp_name = grp.get("group_name") or grp.get("name") or "-"
-            for tp in grp.get("types", []):
-                tp_name = tp.get("type_name") or tp.get("name") or "-"
-                for acc in tp.get("accounts", []):
-                    acc_c = acc.get("account_code") or "-"
-                    acc_n = acc.get("account_name") or "-"
-                    bal = _format_rupiah(acc.get("balance", 0.0))
-                    lines.append(f"| {grp_name} | {tp_name} | `{acc_c}` | {acc_n} | {bal} |")
+    _append_hierarchical_account_breakdown(
+        lines,
+        breakdown,
+        section_heading="#### Rincian Hierarki Laba Rugi:",
+        group_col_label="Grup Akun",
+        type_col_label="Tipe / Sub-Tipe",
+    )
     return "\n".join(lines)
 
 
@@ -305,19 +333,13 @@ def format_get_balance_sheet(
         lines.append(f"- **Status**: **TIDAK SEIMBANG** (Selisih: {_format_rupiah(diff)})")
 
     breakdown = tool_result.get("breakdown") or []
-    if breakdown:
-        lines.append("\n#### Rincian Akun Neraca:")
-        lines.append("| Kategori | Tipe Aset/Kewajiban | Kode Akun | Nama Akun | Saldo |")
-        lines.append("|:---|:---|:---|:---|:---|")
-        for grp in breakdown:
-            grp_name = grp.get("group_name") or grp.get("name") or "-"
-            for tp in grp.get("types", []):
-                tp_name = tp.get("type_name") or tp.get("name") or "-"
-                for acc in tp.get("accounts", []):
-                    acc_c = acc.get("account_code") or "-"
-                    acc_n = acc.get("account_name") or "-"
-                    bal = _format_rupiah(acc.get("balance", 0.0))
-                    lines.append(f"| {grp_name} | {tp_name} | `{acc_c}` | {acc_n} | {bal} |")
+    _append_hierarchical_account_breakdown(
+        lines,
+        breakdown,
+        section_heading="#### Rincian Akun Neraca:",
+        group_col_label="Kategori",
+        type_col_label="Tipe Aset/Kewajiban",
+    )
     return "\n".join(lines)
 
 

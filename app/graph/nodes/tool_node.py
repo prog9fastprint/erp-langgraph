@@ -506,8 +506,9 @@ async def _execute_single_tool(
                 pass
 
     preserve_keys = {"is_active"} if tool_name == "get_account_health" else None
+    max_rec = 200 if tool_name in ("get_profit_and_loss", "get_balance_sheet") else 50
     final_result = (
-        sanitize_erp_payload(raw_result, preserve_fields=preserve_keys)
+        sanitize_erp_payload(raw_result, max_records=max_rec, preserve_fields=preserve_keys)
         if settings.ENABLE_PAYLOAD_SANITIZATION
         else raw_result
     )
