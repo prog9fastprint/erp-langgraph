@@ -130,6 +130,14 @@ _PAGINATED_COLLECTION_KEYS: Set[str] = {
     "competitors",
     "log_entry_candidates",
     "quotation_note_candidates",
+    "fast_moving",
+    "slow_moving",
+    "restock_recommendations",
+    "by_branch",
+    "monthly_breakdown",
+    "cancel_reason_summary",
+    "error_breakdown_by_type",
+    "error_breakdown_by_company",
 }
 
 _TOTAL_FOUND_COLLECTION_KEYS: Set[str] = {"locations", "alerts"}
@@ -237,6 +245,8 @@ def sanitize_erp_payload(
                     "orders", "contacts", "records", "mappings", "exceptions", "simulations", "stock_logs", "price_logs",
                     "pcls_logs", "anomalies", "by_deduction_category", "by_store", "cashflow_logs",
                     "competitors", "unassigned_company_errors", "log_entry_candidates", "quotation_note_candidates",
+                    "fast_moving", "slow_moving", "restock_recommendations", "by_branch", "monthly_breakdown",
+                    "cancel_reason_summary", "error_breakdown_by_type", "error_breakdown_by_company",
                 ):
                     sanitized_dict[key] = cleaned_val
             else:

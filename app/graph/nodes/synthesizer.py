@@ -3,6 +3,7 @@ Synthesizer Node for FastPrint ERP LangGraph Agent Workflow (TASK-4.5).
 Generates structured, professional final answers formatted in Indonesian Markdown
 based on state verification status, tool execution data, calculations, and error messages.
 """
+from datetime import date, datetime
 import json
 import logging
 import os
@@ -13,10 +14,265 @@ from langchain_core.callbacks import adispatch_custom_event
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
+from app.core.context import get_current_erp_date
 from app.graph.state import AgentState
 from app.services.llm import get_chat_model
 
 logger = logging.getLogger("synthesizer_node")
+
+_EVALUATIVE_QUERY_RE = re.compile(
+    r"\b(?:menurutmu|bisa\s+(?:engga|enggak|gak|tidak|kah)|tercapai|tembus|target|proyeksi|"
+    r"run[\s\-]?rate|impact|dampak|pengaruh|signifikan|alasannya|kenapa)\b",
+    re.IGNORECASE,
+)
+
+
+def _parse_sales_target_idr(query: str) -> Optional[float]:
+    """Extract numeric monetary target in IDR from Indonesian shorthand (e.g. '6M', '6 miliar', '500 jt')."""
+    if not query:
+        return None
+    q_low = query.lower()
+    m = re.search(
+        r"(?:(?:target|tembus|mencapai|capaian|sebesar|senilai|rp)\s*)*(\d+(?:[.,]\d+)?)\s*(miliar|milyar|m\b|juta|jt\b|ribu|rb\b)",
+        q_low,
+    )
+    if not m:
+        return None
+    raw_num, unit = m.group(1), m.group(2)
+    if unit == "m" and not re.search(r"\b(?:target|tembus|mencapai|omzet|omset|penjualan|rp)\b", q_low):
+        return None
+    try:
+        val = float(raw_num.replace(",", "."))
+    except ValueError:
+        return None
+    if unit in ("miliar", "milyar", "m"):
+        return val * 1_000_000_000.0
+    if unit in ("juta", "jt"):
+        return val * 1_000_000.0
+    if unit in ("ribu", "rb"):
+        return val * 1_000.0
+    return None
+
+
+def _parse_iso_date_safe(val: Any) -> Optional[date]:
+    if isinstance(val, date) and not isinstance(val, datetime):
+        return val
+    if isinstance(val, datetime):
+        return val.date()
+    if isinstance(val, str) and re.match(r"^\d{4}-\d{2}-\d{2}", val.strip()):
+        try:
+            return date.fromisoformat(val.strip()[:10])
+        except ValueError:
+            return None
+    return None
+
+
+def _build_evaluative_verdict(
+    user_query: str,
+    tool_entries: List[Tuple[str, Any, Optional[Dict[str, Any]]]],
+) -> str:
+    """Compute deterministic run-rate projection & marketplace impact verdicts when user asks an evaluative question."""
+    if not user_query or not _EVALUATIVE_QUERY_RE.search(user_query):
+        return ""
+
+    sales_entry: Optional[Tuple[Dict[str, Any], Optional[Dict[str, Any]]]] = None
+    ded_res: Optional[Dict[str, Any]] = None
+    ah_res: Optional[Dict[str, Any]] = None
+
+    for t_name, res, params in tool_entries:
+        if not isinstance(res, dict):
+            continue
+        if t_name == "get_sales_summary":
+            sales_entry = (res, params)
+        elif t_name == "get_deduction_and_settlement_summary":
+            ded_res = res
+        elif t_name == "get_account_health":
+            ah_res = res
+
+    verdict_blocks: List[str] = []
+    q_low = user_query.lower()
+
+    # 1. Target / Run-rate / Pace Evaluation
+    target_val = _parse_sales_target_idr(user_query)
+    if sales_entry and (target_val is not None or re.search(r"\b(?:target|proyeksi|run[\s\-]?rate|tembus|tercapai|bisa\s+(?:engga|enggak|gak))\b", q_low)):
+        s_res, s_params = sales_entry
+        conf = s_res.get("confirmed_metrics") or {}
+        real_rev = float(conf.get("realized_revenue") or 0.0)
+        period_blk = s_res.get("period") if isinstance(s_res.get("period"), dict) else {}
+        df_s = period_blk.get("date_from") or (s_params.get("date_from") if isinstance(s_params, dict) else None)
+        dt_s = period_blk.get("date_to") or (s_params.get("date_to") if isinstance(s_params, dict) else None)
+        p_start = _parse_iso_date_safe(df_s)
+        p_end = _parse_iso_date_safe(dt_s)
+        today = get_current_erp_date()
+
+        if p_start and p_end and p_end >= p_start:
+            obs_end = min(today, p_end) if today >= p_start else p_start
+            elapsed_days = max(1, (obs_end - p_start).days + 1) if today >= p_start else 0
+            remaining_days = max(0, (p_end - obs_end).days) if today >= p_start else (p_end - p_start).days + 1
+            daily_rate = (real_rev / elapsed_days) if elapsed_days > 0 else 0.0
+            linear_proj = real_rev + (daily_rate * remaining_days)
+
+            b_lines = ["#### Analisis Proyeksi Target & Run-Rate\n"]
+            b_lines.append(
+                f"- **Periode Evaluasi**: `{p_start.isoformat()}` s/d `{p_end.isoformat()}` "
+                f"({elapsed_days} hari berjalan s/d `{obs_end.isoformat()}`, sisa {remaining_days} hari)"
+            )
+            b_lines.append(f"- **Realisasi Berjalan**: **{_format_rupiah(real_rev)}**")
+            b_lines.append(f"- **Run-Rate Harian Berjalan**: **{_format_rupiah(daily_rate)}** / hari")
+            b_lines.append(f"- **Proyeksi Linear Akhir Periode**: **{_format_rupiah(linear_proj)}**")
+            if target_val and target_val > 0:
+                gap = max(0.0, target_val - real_rev)
+                pct = (real_rev / target_val) * 100.0
+                req_pace = (gap / remaining_days) if remaining_days > 0 and gap > 0 else 0.0
+                if real_rev >= target_val:
+                    verdict_str = "Tercapai / Melebihi Target"
+                elif linear_proj >= target_val * 0.95:
+                    verdict_str = "Berpotensi Tercapai (On-Track)"
+                else:
+                    verdict_str = "Berisiko Tidak Tercapai pada Laju Saat Ini"
+                b_lines.append(f"- **Target**: **{_format_rupiah(target_val)}** (Tercapai **{pct:.1f}%**, Gap **{_format_rupiah(gap)}**)")
+                if gap > 0 and remaining_days > 0:
+                    b_lines.append(f"- **Laju Harian Dibutuhkan (Sisa {remaining_days} Hari)**: **{_format_rupiah(req_pace)}** / hari")
+                b_lines.append(f"- **Kesimpulan**: **{verdict_str}**")
+            verdict_blocks.append("\n".join(b_lines))
+
+    # 2. Marketplace Pull Failure & Deduction Impact Evaluation
+    if (ded_res or ah_res) and re.search(r"\b(?:impact|dampak|pengaruh|signifikan|gagal|potongan|deduction|omzet|omset)\b", q_low):
+        i_lines = ["#### Ringkasan Evaluasi Dampak ke Omzet & Operasional Marketplace\n"]
+        has_content = False
+        if ah_res:
+            ah_sum = ah_res.get("summary") or {}
+            err_cnt = int(ah_sum.get("recent_fetch_errors_count") or 0)
+            pulled_cnt = ah_sum.get("pulled_orders_count")
+            err_ratio = ah_sum.get("error_to_pulled_order_ratio")
+            ratio_note = ""
+            if pulled_cnt is not None:
+                pulled_int = int(pulled_cnt)
+                pct_val = (err_cnt / pulled_int * 100.0) if pulled_int > 0 else (float(err_ratio or 0.0) * 100.0)
+                ratio_note = f" vs **{pulled_int:,} order** berhasil ditarik (rasio **{pct_val:.2f}%**)"
+            by_type = ah_res.get("error_breakdown_by_type") or []
+            top_type = f" — dominan `{by_type[0].get('error_type')}` ({by_type[0].get('count')}x)" if by_type else ""
+            i_lines.append(f"- **Dampak Penarikan Order Marketplace**: Tercatat **{err_cnt:,} event error fetch**{ratio_note}{top_type}.")
+            has_content = True
+        if ded_res:
+            d_sum = ded_res.get("summary") or {}
+            tot_gross = float(d_sum.get("total_gross") or 0.0)
+            tot_ded = abs(float(d_sum.get("total_deduction") or 0.0))
+            tot_nett = float(d_sum.get("total_nett") or 0.0)
+            eff_pct = float(d_sum.get("effective_deduction_pct") or 0.0)
+            if eff_pct >= 10.0:
+                severity = "signifikan (tinggi, >= 10%)"
+            elif eff_pct >= 5.0:
+                severity = "moderat (5% - 10%)"
+            else:
+                severity = "rendah (< 5%)"
+            sales_share_note = ""
+            if sales_entry:
+                s_rev = float((sales_entry[0].get("confirmed_metrics") or {}).get("realized_revenue") or 0.0)
+                if s_rev > 0:
+                    share_pct = (tot_ded / s_rev) * 100.0
+                    sales_share_note = f" (setara **{share_pct:.2f}%** dari total omzet ERP {_format_rupiah(s_rev)})"
+            i_lines.append(
+                f"- **Dampak Potongan Fee Marketplace**: Total potongan **{_format_rupiah(tot_ded)}** dari Gross **{_format_rupiah(tot_gross)}** "
+                f"(efektif **{eff_pct:.2f}%** — tingkat **{severity}**, Nett **{_format_rupiah(tot_nett)}**){sales_share_note}."
+            )
+            has_content = True
+        if has_content:
+            verdict_blocks.append("\n".join(i_lines))
+
+    return "\n\n".join(verdict_blocks)
+
+
+def _format_meta_question_answer(state: AgentState) -> Optional[str]:
+    """Answer deterministic session meta-questions about period, company scope, or latest ERP date."""
+    user_query = (state.get("user_query") or "").strip()
+    if not user_query:
+        return None
+    try:
+        from app.graph.nodes.router import is_meta_question
+    except Exception:
+        return None
+    if not is_meta_question(user_query):
+        return None
+
+    q_low = user_query.lower()
+    today = get_current_erp_date()
+    messages = state.get("messages") or []
+
+    # 1. Active Period Meta-Question
+    if re.search(r"\b(?:periode|rentang\s+(?:waktu|tanggal)|tanggal\s+(?:data\s+)?(?:yang|yg))\b", q_low):
+        found_period: Optional[Tuple[str, str]] = None
+        ext_p = state.get("extracted_params") or {}
+        if ext_p.get("date_from") or ext_p.get("date_to"):
+            found_period = (str(ext_p.get("date_from") or "-"), str(ext_p.get("date_to") or "-"))
+        if not found_period:
+            for msg in reversed(messages):
+                content = str(getattr(msg, "content", "") or "")
+                m_per = re.search(
+                    r"Periode(?:\s+Evaluasi)?\s*[:\s]\s*`?(\d{4}-\d{2}-\d{2})`?\s*(?:s/d|-|to)\s*`?(\d{4}-\d{2}-\d{2})`?",
+                    content,
+                    re.IGNORECASE,
+                )
+                if m_per:
+                    found_period = (m_per.group(1), m_per.group(2))
+                    break
+        if found_period:
+            return (
+                f"### Periode Data Aktif\n\n"
+                f"Periode data yang dipakai pada penelusuran terakhir adalah **{found_period[0]} s/d {found_period[1]}** "
+                f"(tanggal acuan sistem saat ini: `{today.isoformat()}`)."
+            )
+        return (
+            f"### Periode Data Aktif\n\n"
+            f"Belum ada rentang tanggal spesifik yang diterapkan pada sesi ini (mengikuti filter default masing-masing modul). "
+            f"Tanggal acuan ERP saat ini adalah **`{today.isoformat()}`**."
+        )
+
+    # 2. Active Company Scope Meta-Question
+    if re.search(r"\b(?:company|perusahaan|cabang)\b", q_low):
+        from app.graph.nodes.extractor import COMPANY_NAME_MAP
+        cids = [int(c) for c in (state.get("company_ids") or []) if c]
+        active_cid = state.get("company_id")
+        if not cids and active_cid:
+            cids = [int(active_cid)]
+        auth_cids = [int(c) for c in (state.get("authorized_company_ids") or []) if c]
+
+        lines = ["### Cakupan Perusahaan / Cabang (Company Scope)\n"]
+        if cids:
+            names = [f"{COMPANY_NAME_MAP.get(cid, f'Company #{cid}')} (`ID {cid}`)" for cid in cids]
+            lines.append(f"- **Perusahaan Aktif Dipakai**: {', '.join(names)}")
+        if auth_cids:
+            lines.append("\n| Company ID | Nama Cabang / Entitas |")
+            lines.append("|:---:|:---|")
+            for cid in sorted(dict.fromkeys(auth_cids)):
+                lines.append(f"| `{cid}` | {COMPANY_NAME_MAP.get(cid, f'Company #{cid}')} |")
+        else:
+            lines.append("\n| Company ID | Nama Cabang / Entitas |")
+            lines.append("|:---:|:---|")
+            for cid, cname in sorted(COMPANY_NAME_MAP.items()):
+                lines.append(f"| `{cid}` | {cname} |")
+        return "\n".join(lines)
+
+    # 3. Latest ERP Date Meta-Question
+    latest_seen: Optional[str] = None
+    all_dates: List[str] = []
+    for msg in reversed(messages):
+        content = str(getattr(msg, "content", "") or "")
+        for d_str in re.findall(r"\b(20\d{2}-\d{2}-\d{2})\b", content):
+            if d_str <= today.isoformat():
+                all_dates.append(d_str)
+        if all_dates:
+            break
+    if all_dates:
+        latest_seen = max(all_dates)
+
+    lines = [
+        "### Informasi Tanggal Acuan & Data Terbaru\n",
+        f"- **Tanggal Acuan ERP Saat Ini**: **`{today.isoformat()}`**",
+    ]
+    if latest_seen:
+        lines.append(f"- **Tanggal Transaksi Terbaru pada Hasil Penelusuran Terakhir**: **`{latest_seen}`**")
+    return "\n".join(lines)
 
 
 def _format_rupiah(value: Any) -> str:
@@ -574,8 +830,10 @@ def _format_single_tool_presentation(
 
     # 3. Stock Level
     if tool == "get_stock_level":
-        lines.append("### Informasi Ketersediaan Stok Barang (Inventory)\n")
-        if isinstance(tool_result, dict) and "products" in tool_result and isinstance(tool_result["products"], list):
+        mode = tool_result.get("mode") if isinstance(tool_result, dict) else None
+        if isinstance(tool_result, dict) and "items" in tool_result and isinstance(tool_result["items"], list):
+            items = tool_result["items"]
+        elif isinstance(tool_result, dict) and "products" in tool_result and isinstance(tool_result["products"], list):
             items = tool_result["products"]
         elif isinstance(tool_result, list):
             items = tool_result
@@ -583,8 +841,18 @@ def _format_single_tool_presentation(
             items = [tool_result]
         total_count = _extract_total_count(tool_result, len(items))
 
+        if mode == "multi_match":
+            q_label = tool_result.get("query") or (extracted_params or {}).get("code") or "-"
+            lines.append(f"### Daftar Varian Produk Cocok (Top {len(items)}) — \"{q_label}\"\n")
+            lines.append("Ditemukan beberapa varian yang cocok. Sebutkan **SKU spesifik** di bawah ini untuk rincian lokasi/rak:\n")
+        elif mode == "company_scan":
+            comp_hdr = tool_result.get("company_name") or f"Company #{tool_result.get('company_id', 1)}"
+            lines.append(f"### Daftar Stok Produk Gudang ({comp_hdr} — Top {len(items)} dari {total_count} Item)\n")
+        else:
+            lines.append("### Informasi Ketersediaan Stok Barang (Inventory)\n")
+
         # Tier 1: Single item stock presentation (Direct KPI + Bullet List)
-        if len(items) == 1:
+        if len(items) == 1 and mode not in ("company_scan", "location_scan", "multi_match"):
             st_item = items[0]
             code = st_item.get("code") or st_item.get("sku") or "-"
             name = st_item.get("name") or st_item.get("product_name") or "-"
@@ -648,11 +916,23 @@ def _format_single_tool_presentation(
                 or (tool_result.get("company_name") if isinstance(tool_result, dict) else None)
                 or f"Company #{st_item.get('company_id', tool_result.get('company_id', 1) if isinstance(tool_result, dict) else 1)}"
             )
-            loc = (
+            wh_name = st_item.get("warehouse_name")
+            raw_loc = (
                 st_item.get("location_name")
                 or (tool_result.get("location_name") if isinstance(tool_result, dict) else None)
-                or (f"Location #{st_item.get('location_id')}" if st_item.get("location_id") else "Semua Lokasi")
+                or (f"Location #{st_item.get('location_id')}" if st_item.get("location_id") else None)
             )
+            if not raw_loc and isinstance(st_item.get("breakdown"), list) and st_item["breakdown"]:
+                bd_strs = [
+                    f"{b.get('warehouse_name') or 'WH'}/{b.get('location_name') or '-'}: {float(b.get('qty') or 0):g}"
+                    for b in st_item["breakdown"][:3]
+                    if isinstance(b, dict)
+                ]
+                loc = "; ".join(bd_strs) if bd_strs else "Semua Lokasi"
+            elif wh_name and raw_loc:
+                loc = f"{wh_name} — {raw_loc}"
+            else:
+                loc = wh_name or raw_loc or "Semua Lokasi"
             qty = st_item.get("qty_on_hand") or st_item.get("quantity") or 0.0
             lines.append(f"| `{code}` | {name} | {comp} | {loc} | **{qty} unit** |")
 
@@ -1079,6 +1359,78 @@ def _format_single_tool_presentation(
             )
         return "\n".join(lines)
 
+    # 12.5 Inventory Velocity & Restock Forecast
+    if tool == "get_inventory_velocity_forecast":
+        if not isinstance(tool_result, dict):
+            return "Data analisis perputaran stok tidak tersedia."
+        dw = tool_result.get("date_window") or {}
+        summary = tool_result.get("summary") or {}
+        d_from = dw.get("date_from") or "-"
+        d_to = dw.get("date_to") or "-"
+        lb_days = int(dw.get("lookback_days") or 90)
+        lt_days = int(tool_result.get("lead_time_days") or 7)
+        cov_days = int(tool_result.get("target_cover_days") or 30)
+
+        lines.append(f"### Analisis Kecepatan Perputaran Stok & Rekomendasi Restock ({d_from} s/d {d_to}, {lb_days} Hari)\n")
+        lines.append(
+            f"- **Total SKU Terjual**: **{summary.get('total_storable_skus_sold', 0):,} SKU** "
+            f"({float(summary.get('total_units_sold') or 0):g} unit) | "
+            f"**SKU Berstok**: {summary.get('total_storable_skus_in_stock', 0):,} SKU"
+        )
+        lines.append(
+            f"- **Butuh Restock Segera (Cover <= {lt_days} Hari / Habis)**: **{summary.get('urgent_restock_count', 0):,} SKU** | "
+            f"**Dead Stock (0 Terjual)**: **{summary.get('zero_sales_in_stock_count', 0):,} SKU** "
+            f"(Target Cover: {cov_days} hari)\n"
+        )
+
+        restock_recs = tool_result.get("restock_recommendations") or []
+        lines.append("#### Rekomendasi Produk Segera di-Order (Urgent Restock):\n")
+        if restock_recs:
+            lines.append("| No | SKU | Nama Produk | Terjual | Avg/Hari | Stok Saat Ini | Cover | Saran Order | Alasan |")
+            lines.append("|:---:|:---|:---|:---:|:---:|:---:|:---:|:---:|:---|")
+            for idx, r in enumerate(restock_recs, start=1):
+                doc_s = f"{r['days_of_cover']:g}h" if r.get("days_of_cover") is not None else "0h"
+                lines.append(
+                    f"| {idx} | `{r.get('code', '-')}` | {r.get('name', '-')} | "
+                    f"{float(r.get('total_qty_sold') or 0):g} | {float(r.get('avg_daily_sales') or 0):.2f} | "
+                    f"**{float(r.get('qty_on_hand') or 0):g}** | {doc_s} | "
+                    f"**{int(r.get('recommended_order_qty') or 0):,} {r.get('uom') or 'Pcs'}** | {r.get('reason') or '-'} |"
+                )
+        else:
+            lines.append("*Tidak ada produk dengan cover kritis di bawah lead time pada periode ini.*")
+
+        fast_list = tool_result.get("fast_moving") or []
+        lines.append("\n#### Produk Fast-Moving (Perputaran Cepat):\n")
+        if fast_list:
+            lines.append("| No | SKU | Nama Produk | Kategori | Terjual | Omzet | Avg/Hari | Stok | Cover | Status |")
+            lines.append("|:---:|:---|:---|:---|:---:|:---|:---:|:---:|:---:|:---|")
+            for idx, f_item in enumerate(fast_list, start=1):
+                doc_s = f"{f_item['days_of_cover']:g}h" if f_item.get("days_of_cover") is not None else "-"
+                lines.append(
+                    f"| {idx} | `{f_item.get('code', '-')}` | {f_item.get('name', '-')} | {f_item.get('category', '-')} | "
+                    f"{float(f_item.get('total_qty_sold') or 0):g} | **{_format_rupiah(f_item.get('total_revenue', 0))}** | "
+                    f"{float(f_item.get('avg_daily_sales') or 0):.2f} | {float(f_item.get('qty_on_hand') or 0):g} | "
+                    f"{doc_s} | `{f_item.get('stock_status', '-')}` |"
+                )
+        else:
+            lines.append("*Belum ada data penjualan produk storable pada periode ini.*")
+
+        slow_list = tool_result.get("slow_moving") or []
+        lines.append("\n#### Produk Slow-Moving / Dead Stock (Perputaran Lambat):\n")
+        if slow_list:
+            lines.append(f"| No | SKU | Nama Produk | Kategori | Stok Mengendap | Terjual ({lb_days}h) | Status |")
+            lines.append("|:---:|:---|:---|:---|:---:|:---:|:---|")
+            for idx, s_item in enumerate(slow_list, start=1):
+                st_lbl = "DEAD STOCK" if s_item.get("is_dead_stock") else "SLOW MOVING"
+                lines.append(
+                    f"| {idx} | `{s_item.get('code', '-')}` | {s_item.get('name', '-')} | {s_item.get('category', '-')} | "
+                    f"**{float(s_item.get('qty_on_hand') or 0):g}** | {float(s_item.get('total_qty_sold') or 0):g} | `{st_lbl}` |"
+                )
+        else:
+            lines.append("*Tidak ditemukan stok mengendap pada filter ini.*")
+
+        return "\n".join(lines)
+
     # 13. Sales: Top Selling Products
     if tool == "get_top_selling_products":
         products = tool_result.get("products") if isinstance(tool_result, dict) else (
@@ -1149,10 +1501,17 @@ def _format_single_tool_presentation(
             )
 
         lines.append(f"### Daftar Pesanan Penjualan & Quotation ({len(orders)} dari {total_cnt} Dokumen, Status: `{st_filter}`{period_note})\n")
+        show_cancel_col = st_filter in ("cancel", "cancelled") or any(bool(o.get("cancel_reason")) for o in orders)
         if orders:
-            if has_company:
+            if has_company and show_cancel_col:
+                lines.append("| No | Cabang | No. SO / Quotation | Tanggal | Pelanggan | Kontak HP | Channel | Status | Alasan Batal | Total Nominal |")
+                lines.append("|:---:|:---|:---|:---:|:---|:---|:---|:---:|:---|:---|")
+            elif has_company:
                 lines.append("| No | Cabang | No. SO / Quotation | Tanggal | Pelanggan | Kontak HP | Channel | Status | Total Nominal |")
                 lines.append("|:---:|:---|:---|:---:|:---|:---|:---|:---:|:---|")
+            elif show_cancel_col:
+                lines.append("| No | No. SO / Quotation | Tanggal | Pelanggan | Kontak HP | Channel | Status | Alasan Batal | Total Nominal |")
+                lines.append("|:---:|:---|:---:|:---|:---|:---|:---:|:---|:---|")
             else:
                 lines.append("| No | No. SO / Quotation | Tanggal | Pelanggan | Kontak HP | Channel | Status | Total Nominal |")
                 lines.append("|:---:|:---|:---:|:---|:---|:---|:---:|:---|")
@@ -1163,16 +1522,33 @@ def _format_single_tool_presentation(
                 c_phone = o.get("customer_phone") or o.get("sales_phone") or "-"
                 ch = o.get("channel_name") or "Direct"
                 st = o.get("status") or "-"
+                cr = o.get("cancel_reason") or "-"
                 tot = float(o.get("total_amount") or 0.0)
-                if has_company:
+                if has_company and show_cancel_col:
+                    comp_n = o.get("company_name") or "-"
+                    lines.append(f"| {idx} | **{comp_n}** | `{so_num}` | {dt} | {cust} | {c_phone} | {ch} | `{st}` | {cr} | **{_format_rupiah(tot)}** |")
+                elif has_company:
                     comp_n = o.get("company_name") or "-"
                     lines.append(f"| {idx} | **{comp_n}** | `{so_num}` | {dt} | {cust} | {c_phone} | {ch} | `{st}` | **{_format_rupiah(tot)}** |")
+                elif show_cancel_col:
+                    lines.append(f"| {idx} | `{so_num}` | {dt} | {cust} | {c_phone} | {ch} | `{st}` | {cr} | **{_format_rupiah(tot)}** |")
                 else:
                     lines.append(f"| {idx} | `{so_num}` | {dt} | {cust} | {c_phone} | {ch} | `{st}` | **{_format_rupiah(tot)}** |")
-            if has_company:
+            if has_company and show_cancel_col:
+                lines.append(f"| | **TOTAL** | | | | | | | | **{_format_rupiah(tot_sum)}** |")
+            elif has_company:
+                lines.append(f"| | **TOTAL** | | | | | | | **{_format_rupiah(tot_sum)}** |")
+            elif show_cancel_col:
                 lines.append(f"| | **TOTAL** | | | | | | | **{_format_rupiah(tot_sum)}** |")
             else:
                 lines.append(f"| | **TOTAL** | | | | | | **{_format_rupiah(tot_sum)}** |")
+            cancel_sum = tool_result.get("cancel_reason_summary") if isinstance(tool_result, dict) else None
+            if cancel_sum and isinstance(cancel_sum, list):
+                lines.append("\n#### Rekapitulasi Alasan Pembatalan:")
+                lines.append("| Alasan Pembatalan | Jumlah Dokumen |")
+                lines.append("|:---|:---:|")
+                for cr_row in cancel_sum[:10]:
+                    lines.append(f"| {cr_row.get('reason') or '-'} | {int(cr_row.get('count') or 0):,} |")
             _append_pagination_footer(
                 lines,
                 len(orders),
@@ -1333,11 +1709,37 @@ def _format_single_tool_presentation(
         canc_val = float(canc.get("cancelled_value") or 0.0)
 
         lines.append(f"### Ringkasan Eksekutif Penjualan & Omzet{p_str}\n")
+        eval_verdict = _build_evaluative_verdict(user_query or "", [("get_sales_summary", tool_result, extracted_params)])
+        if eval_verdict:
+            lines.append(f"{eval_verdict}\n")
         lines.append(f"- **Total Omzet Terealisasi**: **{_format_rupiah(real_rev)}**")
         lines.append(f"- **Volume Pesanan Dikonfirmasi**: **{orders_cnt:,} pesanan**")
         lines.append(f"- **Average Order Value (AOV)**: **{_format_rupiah(aov)}** / order")
         lines.append(f"- **Pipeline Penawaran (Quotation)**: {pipe_cnt} draft ({_format_rupiah(pipe_val)})")
         lines.append(f"- **Pesanan Dibatalkan (Cancel)**: {canc_cnt} order ({_format_rupiah(canc_val)})\n")
+
+        by_branch = tool_result.get("by_branch") or []
+        if by_branch:
+            lines.append("#### Kontribusi Omzet per Cabang:\n")
+            lines.append("| Cabang | Jumlah Order | Total Omzet | Rata-Rata Order (AOV) | Kontribusi |")
+            lines.append("|:---|:---:|:---|:---|:---:|")
+            for br in by_branch:
+                b_name = br.get("company_name") or f"Company #{br.get('company_id', '-')}"
+                b_cnt = int(br.get("order_count") or 0)
+                b_rev = float(br.get("total_revenue") or 0.0)
+                b_aov = float(br.get("average_order_value") or 0.0)
+                b_pct = (b_rev / real_rev * 100.0) if real_rev > 0 else 0.0
+                lines.append(f"| **{b_name}** | {b_cnt:,} | **{_format_rupiah(b_rev)}** | {_format_rupiah(b_aov)} | {b_pct:.1f}% |")
+            lines.append("")
+
+        monthly_bd = tool_result.get("monthly_breakdown") or []
+        if monthly_bd:
+            lines.append("#### Tren Omzet Bulanan (Confirmed):\n")
+            lines.append("| Bulan | Jumlah Order | Total Omzet |")
+            lines.append("|:---:|:---:|:---|")
+            for mb in monthly_bd:
+                lines.append(f"| `{mb.get('month', '-')}` | {int(mb.get('order_count') or 0):,} | **{_format_rupiah(mb.get('total_revenue') or 0.0)}** |")
+            lines.append("")
 
         channels = tool_result.get("channels_breakdown") or []
         if channels:
@@ -1358,7 +1760,22 @@ def _format_single_tool_presentation(
         summary = tool_result.get("summary") or {}
         accounts = tool_result.get("accounts") or []
         win_h = tool_result.get("error_window_hours", 24)
-        lines.append(f"### Kesehatan Akun & Token Marketplace (Window Error: {win_h} Jam)\n")
+        ew = tool_result.get("error_window") or {}
+        ew_note = (
+            f"Periode: {ew.get('date_from') or '-'} s/d {ew.get('date_to') or '-'}"
+            if (isinstance(ew, dict) and (ew.get("date_from") or ew.get("date_to")))
+            else f"Window Error: {win_h} Jam"
+        )
+        lines.append(f"### Kesehatan Akun & Token Marketplace ({ew_note})\n")
+        pulled_cnt = summary.get("pulled_orders_count")
+        err_cnt_s = int(summary.get("recent_fetch_errors_count") or 0)
+        err_ratio = summary.get("error_to_pulled_order_ratio")
+        if pulled_cnt is not None:
+            pulled_int = int(pulled_cnt)
+            ratio_pct = (err_cnt_s / pulled_int * 100.0) if pulled_int > 0 else (float(err_ratio or 0.0) * 100.0)
+            pull_metric_str = f" | **Order Berhasil Ditarik**: {pulled_int:,} (**Rasio Error**: {ratio_pct:.2f}%)"
+        else:
+            pull_metric_str = ""
         lines.append(
             f"- **Total Akun**: {summary.get('total_accounts', len(accounts))} | "
             f"**Aktif**: {summary.get('active_accounts', 0)} | "
@@ -1369,7 +1786,7 @@ def _format_single_tool_presentation(
             f"- **Token Expired**: {summary.get('expired_tokens', 0)} | "
             f"**Akan Expired (<24j)**: {summary.get('expiring_soon_tokens', 0)} | "
             f"**Konfigurasi Kurang**: {summary.get('missing_configs_count', 0)} | "
-            f"**Error Fetch Order**: {summary.get('recent_fetch_errors_count', 0)}\n"
+            f"**Error Fetch Order**: {summary.get('recent_fetch_errors_count', 0)}{pull_metric_str}\n"
         )
         if accounts:
             lines.append("| No | Akun | Platform | Cabang | State | Token | Sisa Jam | Status Toko | Issues |")
@@ -1387,6 +1804,20 @@ def _format_single_tool_presentation(
                 lines.append(f"| {idx} | **{acc_n}** | {mp} | {comp} | `{st}` | `{tok}` | {hrs_str} | `{shop_st}` | {iss} |")
         else:
             lines.append("Semua akun marketplace terpantau sehat dan tidak ada kendala pada filter ini.")
+        err_by_type = tool_result.get("error_breakdown_by_type") or []
+        if err_by_type:
+            lines.append("\n#### Rincian Error Penarikan per Jenis:\n")
+            lines.append("| Jenis Error | Jumlah Kejadian |")
+            lines.append("|:---|:---:|")
+            for et in err_by_type:
+                lines.append(f"| `{et.get('error_type') or '-'}` | {int(et.get('count') or 0):,} |")
+        err_by_comp = tool_result.get("error_breakdown_by_company") or []
+        if err_by_comp:
+            lines.append("\n#### Rincian Error Penarikan per Cabang:\n")
+            lines.append("| Cabang / Entitas | Jumlah Error |")
+            lines.append("|:---|:---:|")
+            for ec in err_by_comp:
+                lines.append(f"| {ec.get('company_name') or '-'} | {int(ec.get('count') or 0):,} |")
         unassigned = tool_result.get("unassigned_company_errors") or []
         if unassigned:
             lines.append("\n#### Error Fetch Marketplace Tingkat Perusahaan:")
@@ -2352,6 +2783,21 @@ def _format_multi_company_presentation(state: AgentState) -> str:
         aov_grand = (tot_rev / tot_orders) if tot_orders > 0 else 0.0
         lines.append(f"| **TOTAL GABUNGAN** | **{_format_rupiah(tot_rev)}** | **{tot_orders:,}** | **{_format_rupiah(aov_grand)}** | **{_format_rupiah(tot_pipe)}** |")
         _append_zero_branch_footnote(lines, zero_branches)
+        mc_df = ext_params.get("date_from") or next(
+            (r["period"].get("date_from") for r in mc_results.values() if isinstance(r, dict) and isinstance(r.get("period"), dict) and r["period"].get("date_from")),
+            None,
+        )
+        mc_dt = ext_params.get("date_to") or next(
+            (r["period"].get("date_to") for r in mc_results.values() if isinstance(r, dict) and isinstance(r.get("period"), dict) and r["period"].get("date_to")),
+            None,
+        )
+        combined_pseudo = {
+            "period": {"date_from": mc_df, "date_to": mc_dt},
+            "confirmed_metrics": {"realized_revenue": tot_rev, "orders_count": tot_orders, "average_order_value": aov_grand},
+        }
+        mc_verdict = _build_evaluative_verdict(state.get("user_query") or "", [("get_sales_summary", combined_pseudo, ext_params)])
+        if mc_verdict:
+            lines.insert(1, f"{mc_verdict}\n")
 
     elif tool == "get_sales_orders":
         merged_orders: List[Dict[str, Any]] = []
@@ -2397,15 +2843,28 @@ def _format_multi_company_presentation(state: AgentState) -> str:
                 f"sebesar **{_format_rupiah(float(top_o.get('total_amount') or 0.0))}**.\n"
             )
             lines.append(f"### Daftar Quotation & Pesanan Penjualan Lintas Cabang{period_note}\n")
-            lines.append("| No | Cabang | No. SO / Quotation | Tanggal | Pelanggan | Kontak HP | Channel | Status | Total Nominal |")
-            lines.append("|:---:|:---|:---|:---:|:---|:---|:---|:---:|:---|")
+            show_mc_cancel = any(bool(o.get("cancel_reason")) for o in merged_orders[:20])
+            if show_mc_cancel:
+                lines.append("| No | Cabang | No. SO / Quotation | Tanggal | Pelanggan | Kontak HP | Channel | Status | Alasan Batal | Total Nominal |")
+                lines.append("|:---:|:---|:---|:---:|:---|:---|:---|:---:|:---|:---|")
+            else:
+                lines.append("| No | Cabang | No. SO / Quotation | Tanggal | Pelanggan | Kontak HP | Channel | Status | Total Nominal |")
+                lines.append("|:---:|:---|:---|:---:|:---|:---|:---|:---:|:---|")
             for idx, o in enumerate(merged_orders[:20], start=1):
                 c_phone = o.get("customer_phone") or o.get("sales_phone") or "-"
-                lines.append(
-                    f"| {idx} | **{o.get('company_name') or '-'}** | `{o.get('so_number') or '-'}` | "
-                    f"{o.get('quotation_date') or '-'} | {o.get('customer_name') or '-'} | {c_phone} | "
-                    f"{o.get('channel_name') or 'Direct'} | `{o.get('status') or '-'}` | **{_format_rupiah(float(o.get('total_amount') or 0.0))}** |"
-                )
+                if show_mc_cancel:
+                    lines.append(
+                        f"| {idx} | **{o.get('company_name') or '-'}** | `{o.get('so_number') or '-'}` | "
+                        f"{o.get('quotation_date') or '-'} | {o.get('customer_name') or '-'} | {c_phone} | "
+                        f"{o.get('channel_name') or 'Direct'} | `{o.get('status') or '-'}` | {o.get('cancel_reason') or '-'} | "
+                        f"**{_format_rupiah(float(o.get('total_amount') or 0.0))}** |"
+                    )
+                else:
+                    lines.append(
+                        f"| {idx} | **{o.get('company_name') or '-'}** | `{o.get('so_number') or '-'}` | "
+                        f"{o.get('quotation_date') or '-'} | {o.get('customer_name') or '-'} | {c_phone} | "
+                        f"{o.get('channel_name') or 'Direct'} | `{o.get('status') or '-'}` | **{_format_rupiah(float(o.get('total_amount') or 0.0))}** |"
+                    )
             lines.append("")
 
         lines.append(f"### Ringkasan Pesanan Penjualan Multi-Cabang{period_note}\n")
@@ -2830,8 +3289,19 @@ def _build_question_ordered_answer(
         return None
 
     ordered_indices = sorted(buckets.keys())
+    eval_entries: List[Tuple[str, Any, Optional[Dict[str, Any]]]] = []
+    for idx_p, plan in enumerate(active_tools):
+        if isinstance(plan, dict) and plan.get("tool"):
+            tn = plan["tool"]
+            ekey = f"{tn}_{idx_p}" if tool_counts.get(tn, 0) > 1 else tn
+            eres = plan.get("result") or multi_results.get(ekey) or multi_results.get(tn)
+            if isinstance(eres, dict):
+                eval_entries.append((tn, eres, plan.get("params")))
+    multi_verdict = _build_evaluative_verdict(user_query, eval_entries)
+
     if len(ordered_indices) == 1:
-        return "\n\n---\n\n".join(buckets[ordered_indices[0]])
+        body_one = "\n\n---\n\n".join(buckets[ordered_indices[0]])
+        return f"{multi_verdict}\n\n---\n\n{body_one}" if multi_verdict else body_one
 
     final_sections: List[str] = []
     for display_num, q_idx in enumerate(ordered_indices, start=1):
@@ -2841,7 +3311,8 @@ def _build_question_ordered_answer(
             final_sections.append(f"#### Pertanyaan {display_num}: {label}\n\n{body}")
         else:
             final_sections.append(body)
-    return "\n\n---\n\n".join(final_sections)
+    joined = "\n\n---\n\n".join(final_sections)
+    return f"{multi_verdict}\n\n---\n\n{joined}" if multi_verdict else joined
 
 
 def format_deterministic_answer(state: AgentState) -> str:
@@ -2997,8 +3468,11 @@ def format_deterministic_answer(state: AgentState) -> str:
             )
         return _format_rag_section(rag_context, rag_sources)
 
-    # 3. General Domain / Guardrail Inquiries
+    # 3. General Domain / Guardrail Inquiries / Session Meta-Questions
     if (domain == "general" or not tool) and not is_multi:
+        meta_answer = _format_meta_question_answer(state)
+        if meta_answer:
+            return meta_answer
         query_lower = user_query.lower()
         billing_terms = (
             "pelanggan", "customer", "piutang", "tagihan",
@@ -3204,7 +3678,17 @@ def format_deterministic_answer(state: AgentState) -> str:
                     )
 
         if sections:
-            return "\n\n---\n\n".join(sections)
+            eval_entries_legacy: List[Tuple[str, Any, Optional[Dict[str, Any]]]] = []
+            for idx_p, plan in enumerate(active_tools):
+                if isinstance(plan, dict) and plan.get("tool"):
+                    tn = plan["tool"]
+                    ekey = f"{tn}_{idx_p}" if len(active_tools) > 1 else tn
+                    eres = plan.get("result") or multi_results.get(ekey) or multi_results.get(tn)
+                    if isinstance(eres, dict):
+                        eval_entries_legacy.append((tn, eres, plan.get("params")))
+            legacy_verdict = _build_evaluative_verdict(user_query, eval_entries_legacy)
+            joined_legacy = "\n\n---\n\n".join(sections)
+            return f"{legacy_verdict}\n\n---\n\n{joined_legacy}" if legacy_verdict else joined_legacy
 
     # 5. Single-Tool Valid Data Presentation (Backward Compatibility)
     return _format_single_tool_presentation(
@@ -3793,6 +4277,8 @@ def _should_keep_verbatim_deterministic(
 ) -> bool:
     """Return True when Markdown tables must not be collapsed into short LLM prose summaries."""
     if state.get("is_multi_company", False) or is_multi_q or len(deterministic_answer) > 1500:
+        return True
+    if re.search(r"#### (?:Analisis Proyeksi Target|Ringkasan Evaluasi Dampak)", deterministic_answer):
         return True
     if "\n|" not in deterministic_answer:
         return False

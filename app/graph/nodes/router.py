@@ -311,6 +311,10 @@ SALES_SUMMARY_PATTERNS = [
     r"\b(?:total|berapa)\s+(?:omzet|omset|penjualan)\b",
     r"\b(?:omzet|omset)\s+(?:penjualan|bulan\s+ini|tahun\s+ini|hari\s+ini|kemarin|periode)\b",
     r"\b(?:omzet|omset)\s+(?:cabang|perusahaan|toko)\b",
+    r"\b(?:omzet|omset|penjualan|sales)\s+(?:q[1-4]|kuartal\s*[1-4]|triwulan\s*[1-4]|semester\s*[12])\b",
+    r"\b(?:target|proyeksi|run[\s\-]?rate|pencapaian|tembus)\s+.*?(?:omzet|omset|penjualan|sales|target)\b",
+    r"\b(?:omzet|omset|penjualan|sales)\s+.*?(?:target|tembus|mencapai|proyeksi|run[\s\-]?rate|impact|dampak)\b",
+    r"\b(?:impact|dampak|pengaruh)(?:nya)?(?:\s+[a-z0-9\-]+){0,3}\s+(?:ke|terhadap)\s+(?:omzet|omset|penjualan)\b",
     r"\b(?:rata-rata|aov)\s+(?:nilai\s+order|pesanan|penjualan)\b",
 ]
 
@@ -327,6 +331,10 @@ SALES_CONTACTS_PATTERNS = [
     r"\b(?:detail|info|data|cek|cari|lihat|daftar|list)\s+(?:contact|kontak)(?:nya)?\b",
     r"\b(?:contact|kontak)(?:nya)?\s+(?:siapa(?:\s+saja)?|mana(?:\s+saja)?|apa(?:\s+saja)?)\b",
     r"\bsiapa\s+(?:saja\s+)?(?:contact|kontak|pelanggan|customer|pembeli|buyer)(?:nya)?\b",
+    r"\b(?:daftar|list|top|peringkat(?:\s+teratas)?|rangking|ranking)\s+\d*\s*(?:contact|kontak|pelanggan|customer|pembeli|buyer)\b",
+    r"\b\d*\s*(?:pelanggan|customer|pembeli|buyer)\s+(?:dengan\s+)?(?:pembelian|belanja|order|transaksi|nilai)\s+(?:terbanyak|tertinggi|terbesar|teratas|paling\s+(?:banyak|besar|tinggi))\b",
+    r"\b(?:pelanggan|customer|pembeli|buyer)\s+.*?(?:paling\s+banyak\s+beli|paling\s+sering\s+beli|pembelian\s+terbanyak|belanja\s+terbesar|top\s+spender)\b",
+    r"\bsiapa\s+(?:saja\s+)?(?:(?:pelanggan|customer|pembeli|buyer)\s+)?(?:yang|yg)\s+paling\s+(?:banyak|sering)\s+(?:beli|belanja|order|transaksi)\b",
     r"\b(?:nomor|no\.?)\s*(?:hp|wa|whatsapp|telp|telepon)\s+(?:contact|kontak|pelanggan|customer|pembeli)\b",
     r"\b(?:contact|kontak)\s+(?:dari\s+|di\s+)?(?:wa|whatsapp|shopee|tiktok|tokopedia|lazada)\b",
     r"\b(?:contact|kontak)\s+[a-zA-Z0-9]",
@@ -353,6 +361,9 @@ MARKETPLACE_ACCOUNT_HEALTH_PATTERNS = [
     r"\b(token\s+(?:oauth\s+)?(?:marketplace|shopee|tiktok(?:\s*shop)?|tokopedia|lazada)|token\s+(?:expired|kadaluarsa|habis|akan\s+habis|expiring))\b",
     r"\b(gagal\s+fetch\s+order|fetch\s+order\s+error|moderasi\s+toko|accountorder|accountproperties)\b",
     r"\b(akun\s+(?:marketplace|shopee|tiktok(?:\s*shop)?|tokopedia|lazada)\s+(?:mana\s+yang|yang\s+)?(?:bermasalah|error|expired|nonaktif|inactive|gagal))\b",
+    r"\b(penarikan\s+(?:data\s+|order\s+)?(?:marketplace|shopee|tiktok(?:\s*shop)?|tokopedia|lazada)|(?:nota|order|pesanan)\s+(?:marketplace|shopee|tiktok(?:\s*shop)?|tokopedia|lazada)\s+.*?(?:gagal|error|tertarik|di\s*tarik|di\s*proses))\b",
+    r"\b(?:gagal|error|bermasalah)\s+(?:di\s*)?(?:tarik|penarikan|proses|fetch|sync|sinkron)\s*.*?(?:marketplace|shopee|tiktok(?:\s*shop)?|tokopedia|lazada)\b",
+    r"\b(?:marketplace|shopee|tiktok(?:\s*shop)?|tokopedia|lazada)\s+.*?(?:gagal\s+(?:di\s*)?(?:tarik|proses|fetch)|penarikan\s+.*?gagal)\b",
 ]
 
 MARKETPLACE_KILAT_PATTERNS = [
@@ -391,7 +402,9 @@ MARKETPLACE_FEE_ANOMALIES_PATTERNS = [
 ]
 
 MARKETPLACE_DEDUCTION_SETTLEMENT_PATTERNS = [
-    r"\b(?:rekap(?:itulasi)?|ringkasan|total|laporan|berapa)\s+(?:potongan(?:\s+fee)?|deduction|komisi|biaya\s+layanan)\s+(?:marketplace|shopee|tiktok(?:\s*shop)?|tokopedia|lazada)\b",
+    r"\b(?:rekap(?:itulasi)?|ringkasan|total|laporan|berapa|cek|lihat)\s+(?:potongan(?:\s+fee|\s+biaya)?|deduction|komisi|biaya\s+(?:layanan|admin|penanganan)|fee)\s+(?:marketplace|shopee|tiktok(?:\s*shop)?|tokopedia|lazada)\b",
+    r"\b(?:potongan(?:\s+fee|\s+biaya)?|deduction|biaya\s+(?:layanan|admin)|fee)\s+(?:dari\s+)?(?:marketplace|shopee|tiktok(?:\s*shop)?|tokopedia|lazada)\b",
+    r"\b(?:impact|dampak|pengaruh)(?:nya)?\s+.*?(?:potongan|deduction|fee|biaya\s+layanan|komisi|gagal\s+tarik|penarikan)\b",
     r"\b(settlement\s+(?:marketplace\s+)?(?:mana\s+yang\s+)?belum\s+(?:ter-?)?posting|unposted\s+journal|revenue\s+history|gross\s+vs\s+nett)\b",
 ]
 
@@ -417,6 +430,14 @@ ALL_MARKETPLACE_PATTERN_GROUPS = (
     + MARKETPLACE_CASHFLOW_BALANCE_PATTERNS
     + MARKETPLACE_COMPETITOR_PATTERNS
 )
+
+INVENTORY_VELOCITY_FORECAST_PATTERNS = [
+    r"\b(fast\s*[-]?\s*moving|slow\s*[-]?\s*moving|low\s*[-]?\s*moving|dead\s+stock)\b",
+    r"\b(forecast(?:ing)?)\s+.*?(?:stok|stock|order|produk|barang|restock|penjualan|permintaan)\b",
+    r"\b(?:stok|stock|produk|barang)\s+.*?(?:fast\s*[-]?\s*moving|slow\s*[-]?\s*moving|low\s*[-]?\s*moving|forecast(?:ing)?|perputaran|turnover)\b",
+    r"\b(?:mana\s+yang\s+|produk\s+(?:mana\s+)?(?:yang\s+)?)?(?:harus\s+(?:segera\s+)?di\s*[-]?\s*order|segera\s+di\s*[-]?\s*restock|rekomendasi\s+(?:restock|order))\b",
+    r"\bperputaran\s+(?:stok|stock|barang|produk)\b",
+]
 
 INVENTORY_PRODUCT_PATTERNS = [
     r"\bproduk(nya)?\b",
@@ -458,8 +479,31 @@ GREETING_PATTERNS = [
 ]
 
 GENERAL_INQUIRY_PATTERNS = [
-    r"^(bisa\s+bantu\s+apa|kamu\s+siapa|fitur\s+apa|menu|help|bantuan|siapa\s+kamu|apa\s+yang\s+bisa\s+kamu\s+lakukan)\b",
+    r"^(bisa\s+(?:bantu\s+apa|apa\s+aja|melakukan\s+apa)|kamu\s+(?:siapa|bisa\s+apa(?:\s+aja)?)|anda\s+bisa\s+apa(?:\s+aja)?|fitur\s+apa(?:\s+aja)?|menu|help|bantuan|siapa\s+kamu|apa\s+yang\s+bisa\s+(?:kamu|anda)\s+(?:lakukan|bantu))\b",
 ]
+
+_META_QUESTION_RE = re.compile(
+    r"^(?:(?:jadi|terus|lalu|nah|oh\s+ya)\s+)?(?:"
+    r"(?:periode|rentang\s+(?:waktu|tanggal)|tanggal)\s+(?:data\s+)?(?:yang|yg)\s+(?:kamu\s+|anda\s+)?(?:pakai|gunakan|dicek|cek|tampilkan|ditampilkan)\s+(?:kapan|berapa|mana)"
+    r"|kapan\s+periode\s+(?:data\s+)?(?:yang|yg)\s+(?:kamu\s+|anda\s+)?(?:pakai|gunakan)"
+    r"|(?:company|perusahaan|cabang)\s+(?:mana\s+(?:aja|saja)|apa\s+(?:aja|saja))(?:\s+(?:yang|yg)\s+(?:kamu\s+|anda\s+)?(?:pakai|gunakan|aktif|terdaftar|ada|tersedia|dicek))?"
+    r"|(?:yang|yg)\s+(?:kamu\s+|anda\s+)?pakai\s+(?:company|perusahaan|cabang)\s+(?:mana|apa)"
+    r"|(?:data|database|erp|sistem)\s+(?:terbaru|terakhir|paling\s+baru|cutoff|update)(?:\s+(?:tanggal|tgl|sampai|sejak|dari))?(?:\s+(?:kapan|berapa))?"
+    r"|(?:tanggal|tgl)\s+(?:data|update)\s+(?:terbaru|terakhir)(?:\s+(?:kapan|berapa))?"
+    r"|sampai\s+tanggal\s+berapa\s+data(?:\s+erp)?(?:\s+(?:tersedia|ada|terbaru))?"
+    r")$",
+    re.IGNORECASE,
+)
+
+_CASUAL_NON_ERP_INTERROGATIVE_RE = re.compile(
+    r"\b(?:(?:kamu|anda|lu|elo)\s+(?:tau|tahu|kenal|suka|pernah|bisa\s+masak|nonton)|(?:tau|tahu)\s+(?:enggak|nggak|gak|ga)\s+(?:tentang|soal)?)\b",
+    re.IGNORECASE,
+)
+
+def is_meta_question(text: str) -> bool:
+    """Return True if user asks about active session period, company scope, or latest ERP date."""
+    cleaned = re.sub(r"[?!.,;:'\"]+$", "", (text or "").strip())
+    return bool(_META_QUESTION_RE.match(cleaned))
 
 OUT_OF_SCOPE_PATTERNS = [
     r"\b(system\s*design|arsitektur\s*(sistem)?|source\s*code|prompt\s*(kamu|anda)|system\s*prompt)\b",
@@ -546,6 +590,12 @@ def _split_conjunction_clauses(segment: str) -> List[str]:
         # Never split inside protected domain phrases (e.g. 'laba dan rugi', 'semua cabang dan HO')
         window = segment[max(0, m.start() - 25):min(len(segment), m.end() + 25)]
         if _PROTECTED_CONJUNCTION_PAIR_RE.search(window):
+            continue
+        # Keep evaluative/velocity clauses cohesive (e.g. 'forecasting ... fastmoving ... dan berikan kenapa alasannya')
+        if re.search(r"\b(?:fast\s*[-]?\s*moving|slow\s*[-]?\s*moving|low\s*[-]?\s*moving|dead\s+stock|forecast(?:ing)?|segera\s+di\s*[-]?\s*order|rekomendasi\s+(?:restock|order))\b", left_part, re.IGNORECASE):
+            if re.match(r"^(?:mana\s+produk\b|(?:berikan|jelaskan|sebutkan|tolong|kasih\s+tau)?\s*(?:kenapa|mengapa)?\s*alasannya\b)", right_part, re.IGNORECASE):
+                continue
+        if re.match(r"^(?:(?:berikan|jelaskan|sebutkan|tolong|kasih\s+tau)\s+)?(?:kenapa|mengapa)?\s*alasannya\b", right_part, re.IGNORECASE):
             continue
         # Do not split off pure greetings ('Halo, cek stok...')
         if _PURE_GREETING_ONLY_RE.match(left_part):
@@ -690,7 +740,10 @@ _NON_PRODUCT_SALES_TOKENS = {
     "surabaya", "jakarta", "bandung", "medan", "makassar", "makasar", "bekasi",
     "tangerang", "malang", "mainstore", "main", "store", "headoffice", "head", "office",
     "ho", "ms", "sby", "jkt", "bdg", "mdn", "mks", "bks", "tgr", "mlg", "fastmart",
-    "ytd", "mtd",
+    "ytd", "mtd", "q1", "q2", "q3", "q4", "kuartal", "triwulan", "semester",
+    "nya", "list", "daftar", "target", "bisa", "engga", "enggak", "gak", "tidak",
+    "ya", "yg", "yang", "menurutmu", "owner", "minta", "m", "miliar", "milyar",
+    "jt", "juta", "terhadap", "sekarang", "saat", "apakah", "impact", "dampak",
 }
 
 _EXPLICIT_PL_RE = re.compile(
@@ -720,7 +773,10 @@ def _has_product_scoped_sales_intent(cleaned: str) -> bool:
     if m_post:
         phrase_tokens = m_post.group(1).split()
         first_tok = phrase_tokens[0]
-        if first_tok not in _NON_PRODUCT_SALES_TOKENS and not re.match(r"^20\d\d$", first_tok):
+        if (
+            first_tok not in _NON_PRODUCT_SALES_TOKENS
+            and not re.match(r"^(?:20\d\d|q[1-4]|\d+(?:[.,]\d+)?(?:m|jt|rb|k)?)$", first_tok)
+        ):
             return True
     return False
 
@@ -737,7 +793,18 @@ def classify_query_rule_based(query: str) -> Optional[Dict[str, Any]]:
     has_purchase_invoice = any(kw in cleaned for kw in PURCHASE_INVOICE_TERMS)
     is_rag = _match_any(KNOWLEDGE_RAG_PATTERNS, cleaned)
 
-    # 0. Sapaan / Percakapan Kasual / Bantuan Cepat
+    # 0. Sapaan / Percakapan Kasual / Bantuan Cepat / Meta-Questions
+    if is_meta_question(cleaned):
+        return {
+            "detected_domain": "general",
+            "detected_tool": None,
+            "query_mode": "general",
+            "rag_query": None,
+            "is_multi_tool": False,
+            "detected_domains": ["general"],
+            "detected_tools": [],
+            "active_tools": [],
+        }
     if _match_any(GREETING_PATTERNS, cleaned) or _match_any(GENERAL_INQUIRY_PATTERNS, cleaned):
         has_erp_intent = (
             _match_any(ACCOUNTING_BALANCE_PATTERNS, cleaned)
@@ -897,9 +964,14 @@ def classify_query_rule_based(query: str) -> Optional[Dict[str, Any]]:
     if m_categories:
         candidates.append(("get_product_categories", "inventory", m_categories.start()))
 
+    # Inventory: Velocity & Restock Forecast (Fast-Moving / Slow-Moving / Restock)
+    m_velocity = _find_first_match(INVENTORY_VELOCITY_FORECAST_PATTERNS, cleaned)
+    if m_velocity:
+        candidates.append(("get_inventory_velocity_forecast", "inventory", m_velocity.start()))
+
     # Inventory: Stock levels (Physical on-hand inventory)
     m_stock = _find_first_match(INVENTORY_STOCK_PATTERNS, cleaned)
-    if m_stock and not m_history and not m_low_stock and not m_adjustments and not m_scrap:
+    if m_stock and not m_history and not m_low_stock and not m_adjustments and not m_scrap and not m_velocity:
         candidates.append(("get_stock_level", "inventory", m_stock.start()))
 
     # Inventory: Locations (Rak / Lokasi Penyimpanan)
@@ -918,35 +990,37 @@ def classify_query_rule_based(query: str) -> Optional[Dict[str, Any]]:
         else:
             candidates.append(("get_locations", "inventory", m_loc.start()))
 
-    # Sales: Contacts (Contact details & channel/product buyer lookup)
+    # Sales: Contacts (Contact details & channel/product buyer lookup, Top N customers)
     m_sales_contacts = _find_first_match(SALES_CONTACTS_PATTERNS, cleaned)
     if m_sales_contacts and not any(kw in cleaned for kw in CUSTOMER_BILLING_TERMS):
         candidates.append(("get_contacts", "sales", m_sales_contacts.start()))
 
     # Sales: Top selling products by revenue / qty (and product-scoped sales/omzet queries)
     m_top_sales = _find_first_match(SALES_TOP_PRODUCTS_PATTERNS, cleaned)
-    is_product_sales = _has_product_scoped_sales_intent(cleaned) and not m_sales_contacts
+    if m_top_sales and m_sales_contacts and not re.search(r"\b(?:produk|barang|item|sku)\b", cleaned):
+        m_top_sales = None
+    is_product_sales = _has_product_scoped_sales_intent(cleaned) and not m_sales_contacts and not m_velocity
     if m_top_sales or is_product_sales:
         pos = m_top_sales.start() if m_top_sales else max(0, cleaned.find("penjualan"))
         candidates.append(("get_top_selling_products", "sales", pos))
 
     # Sales: Summary / Omzet (only when NOT scoped to a specific product or SKU)
     m_sales_summary = _find_first_match(SALES_SUMMARY_PATTERNS, cleaned)
-    if m_sales_summary and not m_top_sales and not is_product_sales and not m_sales_contacts:
+    if m_sales_summary and not m_top_sales and not is_product_sales and not m_sales_contacts and not m_velocity:
         candidates.append(("get_sales_summary", "sales", m_sales_summary.start()))
 
-    # Suppress 'omzet'-only Profit & Loss trigger when sales domain owns the omzet query
+    # Suppress 'omzet'-only Profit & Loss trigger when sales domain or marketplace+omzet owns the query
     if (m_sales_summary or m_top_sales or is_product_sales) and not _EXPLICIT_PL_RE.search(cleaned):
         candidates = [c for c in candidates if c[0] != "get_profit_and_loss"]
 
     # Sales: Order Detail
     m_sales_detail = _find_first_match(SALES_ORDER_DETAIL_PATTERNS, cleaned)
-    if m_sales_detail and not m_top_sales and not is_product_sales and not m_sales_summary and not m_sales_contacts:
+    if m_sales_detail and not m_top_sales and not is_product_sales and not m_sales_summary and not m_sales_contacts and not m_velocity:
         candidates.append(("get_sales_order_detail", "sales", m_sales_detail.start()))
 
     # Sales: Orders List & Quotations
     m_sales_orders = _find_first_match(SALES_ORDERS_PATTERNS, cleaned)
-    if m_sales_orders and not m_top_sales and not is_product_sales and not m_sales_summary and not m_sales_detail and not m_sales_contacts:
+    if m_sales_orders and not m_top_sales and not is_product_sales and not m_sales_summary and not m_sales_detail and not m_sales_contacts and not m_velocity:
         candidates.append(("get_sales_orders", "sales", m_sales_orders.start()))
 
     # Marketplace Domain: 11 Specialized Operational & Financial Diagnostic Tools
@@ -999,6 +1073,7 @@ def classify_query_rule_based(query: str) -> Optional[Dict[str, Any]]:
     # Inventory: Product info
     if (
         not is_rag
+        and not m_velocity
         and not m_top_sales
         and not is_product_sales
         and not m_sales_summary
@@ -1484,12 +1559,25 @@ def _route_decomposed_clauses(
                 logger.warning("Dynamic retrieval error for clause '%s': %s", clause, exc)
 
         if c_res is None:
-            non_tool_questions.append({
-                "question_index": q_idx,
-                "question_text": clause,
-                "category": "general",
-                "domain": "general",
-            })
+            c_low = clause.lower().strip()
+            if (
+                _match_any(GREETING_PATTERNS, c_low)
+                or _match_any(GENERAL_INQUIRY_PATTERNS, c_low)
+                or is_meta_question(c_low)
+            ):
+                non_tool_questions.append({
+                    "question_index": q_idx,
+                    "question_text": clause,
+                    "category": "general",
+                    "domain": "general",
+                })
+            else:
+                non_tool_questions.append({
+                    "question_index": q_idx,
+                    "question_text": clause,
+                    "category": "out_of_scope",
+                    "domain": "out_of_scope",
+                })
             continue
 
         c_mode = c_res.get("query_mode")
@@ -1778,11 +1866,54 @@ def _router_node_impl(
     except Exception as exc:
         logger.warning(f"Error in rule-based classifier for query '{user_query}': {exc}")
 
+    # Step 1.2: P&L / Balance Sheet Account Drill-Down Follow-up (e.g. 'coba berikan detail dari Penjualan Surabaya')
+    history_messages = state.get("messages") or []
+    if len(history_messages) > 1:
+        from app.graph.nodes.extractor import (
+            resolve_pnl_drilldown_from_history,
+            resolve_branch_company_id,
+            resolve_all_branch_company_ids,
+        )
+        drill_match = resolve_pnl_drilldown_from_history(user_query, history_messages)
+        if drill_match:
+            from app.services.tool_registry_service import get_tool_registry_service
+            registry = get_tool_registry_service()
+            gl_meta = registry.get_tool_by_name("get_general_ledger")
+            drill_res: Dict[str, Any] = {
+                "detected_domain": "accounting",
+                "detected_tool": "get_general_ledger",
+                "query_mode": "live_erp",
+                "rag_query": None,
+                "rag_queries": [],
+                "is_multi_tool": False,
+                "detected_domains": ["accounting"],
+                "detected_tools": ["get_general_ledger"],
+                "active_tools": [{
+                    "tool": "get_general_ledger",
+                    "domain": "accounting",
+                    "sub_query": user_query,
+                    "params": {},
+                    "status": "pending",
+                }],
+                "available_tools": [gl_meta] if gl_meta else [],
+                "sub_questions": [user_query],
+                "non_tool_questions": [],
+            }
+            # Inherit branch scope from prior accounting turn if no explicit branch in current query
+            if resolve_branch_company_id(user_query) is None and not resolve_all_branch_company_ids(user_query)[1]:
+                prior_q_acc = _find_previous_erp_query(history_messages)
+                if prior_q_acc:
+                    prior_cid = resolve_branch_company_id(prior_q_acc)
+                    if prior_cid is not None:
+                        drill_res["company_id"] = prior_cid
+                        drill_res["company_ids"] = [prior_cid]
+                        drill_res["is_multi_company"] = False
+            return drill_res
+
     # Step 1.5: Fast Conversational Follow-up / Slot Refinement Check
     # Matches branch/location mentions ('di mainstore', 'di cabang bandung'),
     # retry/check follow-ups ('coba cek lagi dimainstore'), or entity refinements
     # when an active ERP inquiry exists in prior messages.
-    history_messages = state.get("messages") or []
     if len(history_messages) > 1:
         prior_q = _find_previous_erp_query(history_messages)
         if prior_q:
@@ -1793,6 +1924,7 @@ def _router_node_impl(
             )
 
             clean_uq = user_query.strip().rstrip("?!.,;:'\"> ").lower()
+            is_casual_oos = bool(_CASUAL_NON_ERP_INTERROGATIVE_RE.search(clean_uq))
             is_location_interrogative = clean_uq in {
                 "dimana", "di mana", "cabang mana", "toko mana", "gudang mana", "outlet mana",
             }
@@ -1800,6 +1932,7 @@ def _router_node_impl(
                 "wa", "whatsapp", "shopee", "tiktok", "tokopedia", "lazada", "goshop",
                 "website", "offline", "online", "quotation", "penawaran", "order", "so",
                 "contact", "kontak", "produk", "barang", "faktur", "invoice", "jurnal",
+                "akunting", "accounting", "keuangan", "inventori", "inventory", "penjualan", "sales", "marketplace",
                 "mana", "sini", "situ", "atas", "bawah", "dalam", "luar",
                 "tabel", "table", "semua", "cabang", "perusahaan", "sana",
             }
@@ -1816,7 +1949,7 @@ def _router_node_impl(
                 or _match_any(SALES_ORDERS_PATTERNS, clean_uq)
                 or any(term in clean_uq for term in ("contact", "kontak", "quotation", "penawaran"))
             )
-            is_short_followup = len(clean_uq.split()) <= 7 and not has_sales_entity_shift and (
+            is_short_followup = len(clean_uq.split()) <= 7 and not has_sales_entity_shift and not is_casual_oos and (
                 is_branch_mention or is_all_scope_followup or is_followup_retry or is_location_interrogative
             )
 
@@ -1870,7 +2003,7 @@ def _router_node_impl(
                 or _match_any(ACCOUNTING_JOURNAL_PATTERNS, clean_uq)
                 or _match_any(KNOWLEDGE_RAG_PATTERNS, clean_uq)
             )
-            if len(clean_uq.split()) <= 6 and not has_new_domain_intent:
+            if len(clean_uq.split()) <= 6 and not has_new_domain_intent and not is_casual_oos and not is_meta_question(clean_uq):
                 try:
                     prior_result = classify_query_rule_based(prior_q)
                     if prior_result is not None and prior_result.get("detected_domain") in ("accounting", "inventory", "sales", "marketplace"):
@@ -2096,14 +2229,14 @@ def _router_node_impl(
         except Exception as exc:
             logger.warning(f"Error in dynamic semantic tool retrieval during router execution: {exc}")
 
-    # Default fallback when unclassified
+    # Default fallback when unclassified (non-greeting, non-meta, non-billing, non-ERP -> out_of_scope)
     return {
-        "detected_domain": "general",
+        "detected_domain": "out_of_scope",
         "detected_tool": None,
-        "query_mode": "general",
+        "query_mode": "out_of_scope",
         "rag_query": None,
         "is_multi_tool": False,
-        "detected_domains": ["general"],
+        "detected_domains": ["out_of_scope"],
         "detected_tools": [],
         "active_tools": [],
         "available_tools": [],

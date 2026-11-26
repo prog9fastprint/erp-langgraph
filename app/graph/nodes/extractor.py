@@ -45,6 +45,7 @@ from app.schemas.tools import (
     ScrapRecordsFilterSchema,
     WarehousesFilterSchema,
     ProductCategoriesFilterSchema,
+    InventoryVelocityForecastFilterSchema,
     TopSellingProductsFilterSchema,
     SalesOrdersFilterSchema,
     SalesOrderDetailFilterSchema,
@@ -85,6 +86,7 @@ TOOL_SCHEMA_REGISTRY: Dict[str, Type[BaseModel]] = {
     "get_scrap_records": ScrapRecordsFilterSchema,
     "get_warehouses": WarehousesFilterSchema,
     "get_product_categories": ProductCategoriesFilterSchema,
+    "get_inventory_velocity_forecast": InventoryVelocityForecastFilterSchema,
     "get_top_selling_products": TopSellingProductsFilterSchema,
     "get_sales_orders": SalesOrdersFilterSchema,
     "get_sales_order_detail": SalesOrderDetailFilterSchema,
@@ -757,6 +759,20 @@ def _fallback_extract_stock_level(
             params["code"] = clean_tokens[0]
             return params
 
+    if (
+        not params.get("code")
+        and not params.get("codes")
+        and not params.get("product_id")
+        and not params.get("location_name")
+        and re.search(r"\bgudang\b", cleaned, re.IGNORECASE)
+        and not has_anaphoric_reference(cleaned)
+        and not re.search(r"\b(?:itu|tersebut|tadi)\b", cleaned, re.IGNORECASE)
+        and resolve_branch_company_id(cleaned) is None
+    ):
+        params["allow_company_scan"] = True
+        params["limit"] = 50
+        return params
+
     is_referential = (
         has_anaphoric_reference(cleaned)
         or any(ref in cleaned.lower() for ref in ("itu", "tersebut", "tadi", "produk", "barang", "coba lagi", "cek lagi", "periksa lagi", "cari lagi", "ulang", "retry"))
@@ -916,10 +932,33 @@ def _fallback_extract_account_balance(
     """Deterministic heuristic extraction for account balance inquiries."""
     params: Dict[str, Any] = {}
     cleaned = query.strip()
+    q_low = cleaned.lower()
 
     acc_codes = re.findall(r"\b([1-6]\d{3,7})\b", cleaned)
     if acc_codes:
         params["account_code"] = acc_codes[0]
+
+    has_bank_word = bool(re.search(r"\b(?:rekening\s*bank|bank(?:\s*(?:&|and|dan)\s*cash)?|rekening)\b", q_low))
+    has_kas_word = bool(re.search(r"\b(?:kas|cash)\b", q_low))
+    if (
+        (has_bank_word and has_kas_word)
+        or re.search(
+            r"\b(?:rekening\s+bank|bank\s*(?:&|and|dan)\s*cash|kas\s*(?:&|dan)\s*(?:rekening\s+)?bank|semua\s+(?:bank|kas|rekening))\b",
+            q_low,
+        )
+    ):
+        params["account_type"] = "Bank and Cash"
+
+    if re.search(r"\b(?:aktif|non[\s\-]?zero|tidak\s+nol|berisi)\b", q_low):
+        params["non_zero_only"] = True
+
+    m_bank_brand = re.search(
+        r"\b(bca|mandiri|bri|bni|cimb(?:\s+niaga)?|permata|danamon|ocbc|bsi|btn|mega|panin|uob|maybank)\b",
+        q_low,
+    )
+    if m_bank_brand and not params.get("account_code"):
+        brand = m_bank_brand.group(1).strip()
+        params["search"] = brand.upper() if len(brand) <= 4 else brand.title()
 
     date_from, date_to = resolve_relative_dates(cleaned, ref_date)
     if date_from:
@@ -1096,14 +1135,145 @@ def _fallback_extract_product_categories(query: str) -> Dict[str, Any]:
     return params
 
 
-def _fallback_extract_general_ledger(query: str, ref_date: Optional[date] = None) -> Dict[str, Any]:
+def _fallback_extract_inventory_velocity_forecast(
+    query: str,
+    today: Optional[date] = None,
+) -> Dict[str, Any]:
+    """Deterministic heuristic extraction for inventory.get_inventory_velocity_forecast."""
+    ref_day = today or get_current_erp_date()
+    cleaned = (query or "").strip()
+    params: Dict[str, Any] = {"lead_time_days": 7, "target_cover_days": 30, "limit": 10}
+
+    df, dt = resolve_relative_dates(cleaned, ref_day)
+    if df or dt:
+        if df:
+            params["date_from"] = df
+        if dt:
+            params["date_to"] = dt
+    else:
+        params["date_from"] = (ref_day - timedelta(days=90)).strftime("%Y-%m-%d")
+        params["date_to"] = ref_day.strftime("%Y-%m-%d")
+
+    m_lim = re.search(r"\b(?:top|peringkat|limit)\s*(\d+)\b|\b(\d+)\s+(?:produk|barang|item)\b", cleaned, re.IGNORECASE)
+    if m_lim:
+        raw_lim = m_lim.group(1) or m_lim.group(2)
+        try:
+            params["limit"] = max(1, min(50, int(raw_lim)))
+        except ValueError:
+            pass
+
+    m_lt = re.search(r"\blead\s*time\s*(\d+)\s*hari\b", cleaned, re.IGNORECASE)
+    if m_lt:
+        params["lead_time_days"] = max(1, min(90, int(m_lt.group(1))))
+
+    m_cov = re.search(r"\bcover\s*(\d+)\s*hari\b", cleaned, re.IGNORECASE)
+    if m_cov:
+        params["target_cover_days"] = max(1, min(365, int(m_cov.group(1))))
+
+    m_sku = re.search(r"\bsku\s*[:#]?\s*([A-Za-z0-9._\-]{3,30})\b", cleaned, re.IGNORECASE)
+    if m_sku:
+        params["search"] = clean_product_identifier(m_sku.group(1))
+
+    return params
+
+
+def resolve_pnl_drilldown_from_history(
+    query: str,
+    messages: Optional[Sequence[Any]] = None,
+) -> Optional[Dict[str, str]]:
+    """Resolve an account code & name from prior P&L / Balance Sheet AI message for GL drill-down."""
+    if not query or not messages:
+        return None
+    q_clean = re.sub(r"[?!.,;:'\"]+$", "", query.strip())
+    m_req = re.match(
+        r"^(?:(?:coba|tolong|mohon|bisa)\s+)*(?:berikan|tampilkan|lihat(?:kan)?|cek|kasih|minta)\s+"
+        r"(?:detail|rincian|mutasi|transaksi|buku\s+besar)(?:\s+dari|\s+akun|\s+untuk)?\s+(.+)$",
+        q_clean,
+        re.IGNORECASE,
+    )
+    if not m_req:
+        return None
+    target_raw = re.sub(r"^(?:dari|akun|account)\s+", "", m_req.group(1).strip(), flags=re.IGNORECASE).strip()
+    if not target_raw or len(target_raw) < 3:
+        return None
+    if re.match(r"^(?:kontak|contact|customer|pelanggan|so|sales\s*order|order|pesanan|produk|barang|sku)\b", target_raw, re.IGNORECASE):
+        return None
+    target_low = target_raw.lower()
+
+    prior_msgs = list(messages)
+    if prior_msgs and (getattr(prior_msgs[-1], "content", "") or "").strip().lower() == query.strip().lower():
+        prior_msgs = prior_msgs[:-1]
+
+    account_candidates: List[Tuple[str, str]] = []
+    for msg in reversed(prior_msgs):
+        msg_type = getattr(msg, "type", "")
+        if msg_type != "ai" and msg.__class__.__name__ != "AIMessage":
+            continue
+        content = str(getattr(msg, "content", "") or "")
+        if not content:
+            continue
+        for m_row in re.finditer(r"`?([1-6]\d{2,7}(?:[\.\-]\d+)*)`?\s*\|\s*([^|\n]+)", content):
+            account_candidates.append((m_row.group(1).strip(), m_row.group(2).strip()))
+        for m_dash in re.finditer(r"`?([1-6]\d{2,7}(?:[\.\-]\d+)*)`?\s*[-–:]\s*([^\n(|]+)", content):
+            account_candidates.append((m_dash.group(1).strip(), m_dash.group(2).strip()))
+        for m_paren in re.finditer(r"([^\n(|]+?)\s*\(\s*`?([1-6]\d{2,7}(?:[\.\-]\d+)*)`?\s*\)", content):
+            account_candidates.append((m_paren.group(2).strip(), m_paren.group(1).strip()))
+        if account_candidates:
+            break
+
+    if not account_candidates:
+        return None
+
+    for code, name in account_candidates:
+        name_low = name.lower().strip()
+        code_low = code.lower().strip()
+        if target_low == code_low or target_low == name_low:
+            return {"account_code": code, "account_name": name}
+    target_tokens = [t for t in re.findall(r"[a-z0-9]+", target_low) if len(t) >= 2]
+    for code, name in account_candidates:
+        name_low = name.lower().strip()
+        if target_low in name_low or name_low in target_low:
+            return {"account_code": code, "account_name": name}
+        if target_tokens and all(t in name_low for t in target_tokens):
+            return {"account_code": code, "account_name": name}
+    return None
+
+
+def _fallback_extract_general_ledger(
+    query: str,
+    ref_date: Optional[date] = None,
+    messages: Optional[Sequence[Any]] = None,
+) -> Dict[str, Any]:
     """Deterministic heuristic extraction for general ledger inquiries."""
     params: Dict[str, Any] = {"limit": 50, "offset": 0}
-    cleaned = query.strip()
-    acc_codes = re.findall(r"\b([1-6]\d{3,7})\b", cleaned)
+    cleaned = (query or "").strip()
+    acc_codes = re.findall(r"\b([1-6]\d{2,7}(?:[\.\-]\d+)*)\b", cleaned)
     if acc_codes:
         params["account_code"] = acc_codes[0]
+    elif messages:
+        drill = resolve_pnl_drilldown_from_history(cleaned, messages)
+        if drill and drill.get("account_code"):
+            params["account_code"] = drill["account_code"]
+
     date_from, date_to = resolve_relative_dates(cleaned, ref_date)
+    if not date_from and not date_to and messages:
+        prior_msgs = list(messages)
+        if prior_msgs and (getattr(prior_msgs[-1], "content", "") or "").strip().lower() == cleaned.lower():
+            prior_msgs = prior_msgs[:-1]
+        for msg in reversed(prior_msgs):
+            content = str(getattr(msg, "content", "") or "")
+            m_per = re.search(r"Periode\s*:\s*(\d{4}-\d{2}-\d{2})\s*(?:s/d|-|to)\s*(\d{4}-\d{2}-\d{2})", content, re.IGNORECASE)
+            if m_per:
+                date_from, date_to = m_per.group(1), m_per.group(2)
+                params["_inherited_dates"] = True
+                break
+            if getattr(msg, "type", "") == "human" or isinstance(msg, HumanMessage):
+                h_df, h_dt = resolve_relative_dates(content, ref_date)
+                if h_df or h_dt:
+                    date_from, date_to = h_df, h_dt
+                    params["_inherited_dates"] = True
+                    break
+
     if date_from:
         params["date_from"] = date_from
     if date_to:
@@ -1168,6 +1338,19 @@ def _fallback_extract_bank_reconciliation(query: str, ref_date: Optional[date] =
     """Deterministic heuristic extraction for bank reconciliation summary."""
     params: Dict[str, Any] = {}
     cleaned = query.strip()
+    m_brand = re.search(
+        r"\b((?:bank\s+)?(?:bca|mandiri|bri|bni|cimb(?:\s+niaga)?|permata|danamon|ocbc|bsi|btn|mega|panin|uob|maybank)|kas\s+(?:kecil|besar))\b",
+        cleaned,
+        re.IGNORECASE,
+    )
+    if m_brand:
+        params["bank_name"] = m_brand.group(1).strip()
+    else:
+        m_generic_bank = re.search(r"\brekening\s+(?:bank\s+)?([A-Za-z0-9\-]{2,30})\b", cleaned, re.IGNORECASE)
+        if m_generic_bank:
+            cand = m_generic_bank.group(1).strip()
+            if cand.lower() not in {"koran", "bank", "ini", "itu", "mana", "cabang", "pusat", "yang", "perusahaan"}:
+                params["bank_name"] = cand
     date_from, date_to = resolve_relative_dates(cleaned, ref_date)
     if date_from:
         params["date_from"] = date_from
@@ -1441,9 +1624,9 @@ _CONTACT_STOPWORDS = {
     "pelanggan", "customer", "customers", "pembeli", "klien", "client", "vendor",
     "supplier", "pemasok", "toko", "no", "nomor", "hp", "telp", "telepon", "wa",
     "whatsapp", "alamat", "email", "kota", "shopee", "tokopedia", "tokped", "tiktok",
-    "lazada", "blibli", "website", "offline", "channel", "penjualan", "pembelian",
+    "lazada", "blibli", "website", "offline", "channel", "penjualan", "pembelian", "belanja",
     "paling", "banyak", "terbanyak", "terbesar", "tertinggi", "teratas", "top",
-    "peringkat", "ranking", "beli", "membeli", "belanja", "terbaru",
+    "peringkat", "ranking", "rangking", "frekuensi", "sering", "spender", "beli", "membeli", "terbaru",
     "kita", "kami", "maksutku", "maksudku", "nah", "sih", "buat", "buatin",
     "order", "transaksi", "bulan", "tahun", "hari", "minggu", "kemarin", "semua",
     "seluruh", "cabang", "perusahaan", "dong", "ya", "kak", "min", "tolong",
@@ -1462,6 +1645,27 @@ def _fallback_extract_contacts(
     cleaned = (query or "").strip()
     clean_q = cleaned.lower()
 
+    is_ranked_buyer = bool(
+        re.search(
+            r"\b(?:peringkat|ranking|rangking|top|teratas|terbanyak|terbesar|tertinggi|paling\s+(?:banyak|sering)\s+(?:beli|belanja|order))\b",
+            clean_q,
+        )
+    )
+    if is_ranked_buyer:
+        params["sort_by"] = "orders_count" if re.search(r"\bpaling\s+sering\b", clean_q) else "total_spent"
+        m_lim = re.search(
+            r"\b(?:top|peringkat|ranking|rangking)\s*(\d+)\b|\b(\d+)\s+(?:pelanggan|customer|pembeli|buyer|contact|kontak)\b",
+            clean_q,
+        )
+        if m_lim:
+            raw_lim = m_lim.group(1) or m_lim.group(2)
+            try:
+                params["limit"] = max(1, min(100, int(raw_lim)))
+            except ValueError:
+                params["limit"] = 10
+        else:
+            params["limit"] = 10
+
     ch = _extract_sales_channel(cleaned)
     if ch:
         params["channel_name"] = ch
@@ -1474,7 +1678,7 @@ def _fallback_extract_contacts(
         m_email = re.search(r"([A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,})", cleaned)
         if m_email:
             params["search"] = m_email.group(1)
-    else:
+    elif not is_ranked_buyer:
         # Strip structural prefixes and stopwords to isolate an entity name
         stripped = strip_company_scope_keywords(cleaned)
         # Preserve multi-word proper names after contact keyword if present
@@ -1507,7 +1711,16 @@ def _fallback_extract_contacts(
         or (bool(ch) and not params.get("search"))
         or bool(re.search(r"\b(?:siapa\s+(?:saja|aja)|contactnya|kontaknya|pembelinya|pelanggannya|customernya)\b", clean_q))
     )
-    if is_followup:
+    if is_ranked_buyer:
+        if "quotation" in clean_q or "penawaran" in clean_q:
+            params["status"] = "quotation"
+        elif "cancel" in clean_q or "batal" in clean_q:
+            params["status"] = "cancel"
+        elif "semua" in clean_q and not re.search(r"\b(?:semua|seluruh)\s+(?:cabang|perusahaan|toko|outlet|pelanggan|customer)\b", clean_q):
+            params["status"] = "all"
+        else:
+            params["status"] = "confirmed"
+    elif is_followup:
         prior_ctx = _extract_prior_sales_context(messages, today, state=state)
         if not params.get("search") and prior_ctx.get("product_search"):
             params["product_search"] = prior_ctx["product_search"]
@@ -1526,7 +1739,7 @@ def _fallback_extract_contacts(
     # Vendor scoping: customer/channel/sales queries set is_vendor=False; direct name lookup searches all (None)
     if re.search(r"\b(?:vendor|supplier|pemasok)\b", clean_q):
         params["is_vendor"] = True
-    elif params.get("channel_name") or params.get("product_search") or re.search(
+    elif is_ranked_buyer or params.get("channel_name") or params.get("product_search") or re.search(
         r"\b(?:pelanggan|customer|pembeli|penjualan|order|quotation)\b", clean_q
     ):
         params["is_vendor"] = False
@@ -1723,7 +1936,10 @@ def _extract_mp_sku_token(query: str) -> Optional[str]:
     return None
 
 
-def _fallback_extract_account_health(query: str) -> Dict[str, Any]:
+def _fallback_extract_account_health(
+    query: str,
+    today: Optional[date] = None,
+) -> Dict[str, Any]:
     """Deterministic extraction for marketplace.get_account_health."""
     params: Dict[str, Any] = {"only_issues": False, "error_window_hours": 24}
     cleaned = (query or "").lower()
@@ -1743,6 +1959,11 @@ def _fallback_extract_account_health(query: str) -> Dict[str, Any]:
         m_day = re.search(r"\b(\d+)\s*hari\b", cleaned)
         if m_day:
             params["error_window_hours"] = max(1, min(168, int(m_day.group(1)) * 24))
+    df, dt = resolve_relative_dates(query, today or get_current_erp_date())
+    if df:
+        params["date_from"] = df
+    if dt:
+        params["date_to"] = dt
     return params
 
 
@@ -2140,6 +2361,12 @@ def _extract_single_tool_params(
         fast_params = try_fast_path_stock_extraction(sub_query, user_query, state.get("company_id"))
         if fast_params:
             extracted_dict = dict(fast_params)
+        else:
+            scan_probe = _fallback_extract_stock_level(sub_query, state.get("messages"))
+            if scan_probe.get("allow_company_scan"):
+                extracted_dict = dict(scan_probe)
+    elif tool_name == "get_inventory_velocity_forecast" and retry_count == 0:
+        extracted_dict = _fallback_extract_inventory_velocity_forecast(sub_query, today)
     elif tool_name == "get_profit_and_loss" and retry_count == 0:
         fast_params = _fallback_extract_profit_and_loss(sub_query, today)
         if fast_params.get("date_from") or fast_params.get("date_to") or fast_params.get("include_breakdown"):
@@ -2255,7 +2482,7 @@ def _extract_single_tool_params(
         elif tool_name == "get_journal_entries":
             extracted_dict = _fallback_extract_journal_entries(sub_query, today)
         elif tool_name == "get_general_ledger":
-            extracted_dict = _fallback_extract_general_ledger(sub_query, today)
+            extracted_dict = _fallback_extract_general_ledger(sub_query, today, state.get("messages"))
         elif tool_name == "get_profit_and_loss":
             extracted_dict = _fallback_extract_profit_and_loss(sub_query, today)
         elif tool_name == "get_balance_sheet":
@@ -2278,6 +2505,8 @@ def _extract_single_tool_params(
             extracted_dict = _fallback_extract_warehouses(sub_query)
         elif tool_name == "get_product_categories":
             extracted_dict = _fallback_extract_product_categories(sub_query)
+        elif tool_name == "get_inventory_velocity_forecast":
+            extracted_dict = _fallback_extract_inventory_velocity_forecast(sub_query, today)
         elif tool_name == "get_top_selling_products":
             extracted_dict = _fallback_extract_top_selling_products(sub_query, today)
         elif tool_name == "get_sales_orders":
@@ -2289,7 +2518,7 @@ def _extract_single_tool_params(
         elif tool_name == "get_contacts":
             extracted_dict = _fallback_extract_contacts(sub_query, today, state.get("messages"), state=state)
         elif tool_name == "get_account_health":
-            extracted_dict = _fallback_extract_account_health(sub_query)
+            extracted_dict = _fallback_extract_account_health(sub_query, today)
         elif tool_name == "get_marketplace_orders":
             extracted_dict = _fallback_extract_marketplace_orders(sub_query, today)
         elif tool_name == "get_kilat_order_diagnostics":
@@ -2327,7 +2556,7 @@ def _extract_single_tool_params(
 
     # 3. 3-Tier Entity Resolution & Anaphora Handling
     if tool_name == "get_stock_level":
-        if not extracted_dict.get("code") and not extracted_dict.get("codes") and not extracted_dict.get("product_id"):
+        if not extracted_dict.get("code") and not extracted_dict.get("codes") and not extracted_dict.get("product_id") and not extracted_dict.get("allow_company_scan"):
             # Tier 1: Peer harvesting (Inventory domain)
             for peer in all_plans:
                 if peer is plan:
@@ -2508,7 +2737,7 @@ def _extract_single_tool_params(
     has_scope_temporal = has_temporal_expression(sub_query) or (
         (not is_decomposed_clause or has_explicit_anaphora) and has_temporal_expression(user_query)
     )
-    if supports_dates and not has_inherited_dates and not has_scope_temporal:
+    if supports_dates and not has_inherited_dates and not has_scope_temporal and tool_name != "get_inventory_velocity_forecast":
         extracted_dict.pop("date_from", None)
         extracted_dict.pop("date_to", None)
 

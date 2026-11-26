@@ -382,7 +382,7 @@ async def _execute_single_tool(
                         wh_err,
                     )
 
-            if not allow_empty_stock_params and not has_resolved_location and not has_location_name:
+            if not allow_empty_stock_params and not has_resolved_location and not has_location_name and not clean_params.get("allow_company_scan"):
                 return (
                     None,
                     "MISSING_PRODUCT_IDENTIFIER: Mohon sertakan kode SKU, nama produk, atau nama gudang/cabang.",
@@ -517,7 +517,7 @@ async def _execute_tool_multi_company(
     params_copy = dict(base_params or {})
     supports_native_mc = (
         TOOL_DOMAIN_MAP.get(tool_name) == "marketplace"
-        or tool_name in ("get_contacts", "get_sales_orders")
+        or tool_name in ("get_contacts", "get_sales_orders", "get_sales_summary", "get_inventory_velocity_forecast")
     )
     if supports_native_mc:
         primary_cid = target_company_ids[0]
@@ -658,6 +658,7 @@ async def tool_node(
             "get_scrap_records": erp_client.fetch_scrap_records,
             "get_warehouses": erp_client.fetch_warehouses,
             "get_product_categories": erp_client.fetch_product_categories,
+            "get_inventory_velocity_forecast": erp_client.fetch_inventory_velocity_forecast,
             "get_top_selling_products": erp_client.fetch_top_selling_products,
             "get_sales_orders": erp_client.fetch_sales_orders,
             "get_sales_order_detail": erp_client.fetch_sales_order_detail,

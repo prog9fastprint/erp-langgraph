@@ -29,6 +29,9 @@ class AccountBalanceFilterSchema(BaseModel):
     company_id: Optional[int] = Field(None, description="Company ID (defaults to default company if omitted)")
     account_id: Optional[int] = Field(None, description="Specific chart of account ID")
     account_code: Optional[str] = Field(None, description="Account code string (e.g. '111100')")
+    account_type: Optional[str] = Field(None, description="Optional account type filter (e.g. 'Bank and Cash', 'Receivable', 'Payable')")
+    search: Optional[str] = Field(None, description="Optional keyword filter matching account_code or account_name")
+    non_zero_only: Optional[bool] = Field(None, description="If True, exclude accounts with zero opening/debit/credit/ending balance")
     date_from: Optional[str] = Field(None, description="Start date filter in YYYY-MM-DD format")
     date_to: Optional[str] = Field(None, description="End date filter in YYYY-MM-DD format")
     include_breakdown: Optional[bool] = Field(None, description="Tampilkan rincian daftar akun (default True di backend). Jika False, hanya kembalikan blok totals")
@@ -136,6 +139,8 @@ class BankReconciliationFilterSchema(BaseModel):
     """Input filter schema for accounting.get_bank_reconciliation_summary."""
     company_id: Optional[int] = Field(None, description="Company ID")
     journal_id: Optional[int] = Field(None, description="ID buku jurnal bank (opsional)")
+    bank_name: Optional[str] = Field(None, description="Nama bank atau jurnal rekening (e.g. 'Bank BCA', 'BCA', 'Mandiri')")
+    journal_name: Optional[str] = Field(None, description="Alias untuk bank_name dalam pencarian buku jurnal bank")
     date_from: Optional[str] = Field(None, description="Tanggal awal rentang rekonsiliasi (YYYY-MM-DD)")
     date_to: Optional[str] = Field(None, description="Tanggal akhir rentang rekonsiliasi (YYYY-MM-DD)")
 
@@ -189,6 +194,7 @@ class StockLevelFilterSchema(BaseModel):
     location_name: Optional[str] = Field(None, description="Optional warehouse or location name (e.g. 'mainstore', 'gudang utama')")
     include_breakdown: Optional[bool] = Field(None, description="Menyertakan array rincian stok per lokasi/gudang")
     include_cost: Optional[bool] = Field(None, description="Menyertakan perhitungan HPP dan total valuasi nilai stok")
+    allow_company_scan: Optional[bool] = Field(None, description="Izinkan scan seluruh gudang perusahaan bila SKU dan ID lokasi tidak disebutkan secara spesifik")
     limit: int = Field(20, ge=1, le=100, description="Max records to return")
     offset: int = Field(0, ge=0, description="Offset for pagination")
 
@@ -202,6 +208,7 @@ class StockLevelFilterSchema(BaseModel):
             and self.warehouse_id is None
             and self.location_id is None
             and not self.location_name
+            and not self.allow_company_scan
         ):
             raise ValueError("Either 'product_id' or 'code' (SKU/name), 'warehouse_id', 'location_id', or batch list must be provided for stock check.")
         return self
@@ -347,6 +354,30 @@ class ProductCategoriesFilterSchema(BaseModel):
     search: Optional[str] = Field(None, description="Pencarian nama kategori produk")
 
 
+class InventoryVelocityForecastFilterSchema(BaseModel):
+    """Input filter schema for inventory.get_inventory_velocity_forecast."""
+    company_id: Optional[int] = Field(None, description="Company ID")
+    company_ids: Optional[List[int]] = Field(None, description="Optional list of authorized company IDs")
+    date_from: Optional[str] = Field(None, description="Tanggal awal periode observasi penjualan (YYYY-MM-DD)")
+    date_to: Optional[str] = Field(None, description="Tanggal akhir periode observasi penjualan (YYYY-MM-DD)")
+    category_id: Optional[int] = Field(None, description="Filter ID kategori produk")
+    warehouse_id: Optional[int] = Field(None, description="Filter ID gudang untuk perhitungan stok tersedia")
+    search: Optional[str] = Field(None, description="Keyword SKU atau nama produk")
+    lead_time_days: int = Field(7, ge=1, le=90, description="Asumsi lead time supplier dalam hari (default 7)")
+    target_cover_days: int = Field(30, ge=1, le=365, description="Target cakupan stok hari ke depan (default 30)")
+    limit: int = Field(10, ge=1, le=50, description="Jumlah top fast-moving / slow-moving / restock per daftar (1-50)")
+
+    @field_validator("date_from")
+    @classmethod
+    def validate_date_from(cls, v: Optional[str]) -> Optional[str]:
+        return _validate_date_str(v, "date_from")
+
+    @field_validator("date_to")
+    @classmethod
+    def validate_date_to(cls, v: Optional[str]) -> Optional[str]:
+        return _validate_date_str(v, "date_to")
+
+
 class TopSellingProductsFilterSchema(BaseModel):
     """Input filter schema for sales.get_top_selling_products."""
     company_id: Optional[int] = Field(None, description="Company ID")
@@ -412,6 +443,7 @@ class ContactsFilterSchema(BaseModel):
     date_to: Optional[str] = Field(None, description="Tanggal akhir transaksi (YYYY-MM-DD)")
     status: Optional[str] = Field(None, description="Filter status pesanan: 'active', 'confirmed', 'quotation', 'cancel', 'all'")
     is_vendor: Optional[bool] = Field(None, description="Filter kontak vendor (True) vs pelanggan (False)")
+    sort_by: Optional[str] = Field(None, description="Urutan peringkat kontak: 'recent', 'total_spent', atau 'orders_count'")
     limit: int = Field(20, ge=1, le=100, description="Batas jumlah kontak (1-100, default 20)")
     offset: int = Field(0, ge=0, description="Offset paginasi")
 
@@ -435,6 +467,7 @@ class SalesOrderDetailFilterSchema(BaseModel):
 class SalesSummaryFilterSchema(BaseModel):
     """Input filter schema for sales.get_sales_summary."""
     company_id: Optional[int] = Field(None, description="Company ID")
+    company_ids: Optional[List[int]] = Field(None, description="Optional list of authorized company IDs for multi-branch summary")
     date_from: Optional[str] = Field(None, description="Tanggal awal periode pelaporan (YYYY-MM-DD)")
     date_to: Optional[str] = Field(None, description="Tanggal akhir periode pelaporan (YYYY-MM-DD)")
     channel: Optional[str] = Field(None, description="Filter sales channel tertentu")
@@ -459,6 +492,18 @@ class AccountHealthFilterSchema(BaseModel):
     account_id: Optional[int] = Field(None, description="Optional single MarketplaceAccount ID")
     only_issues: bool = Field(False, description="Return only accounts with expired/expiring tokens, missing configs, inactive shops, or sync errors")
     error_window_hours: int = Field(24, ge=1, le=168, description="Lookback window in hours (1-168) for SystemLogEvent fetch errors")
+    date_from: Optional[str] = Field(None, description="Tanggal awal jendela observasi log error & order tertarik (YYYY-MM-DD)")
+    date_to: Optional[str] = Field(None, description="Tanggal akhir jendela observasi log error & order tertarik (YYYY-MM-DD)")
+
+    @field_validator("date_from")
+    @classmethod
+    def validate_date_from(cls, v: Optional[str]) -> Optional[str]:
+        return _validate_date_str(v, "date_from")
+
+    @field_validator("date_to")
+    @classmethod
+    def validate_date_to(cls, v: Optional[str]) -> Optional[str]:
+        return _validate_date_str(v, "date_to")
 
 
 class MarketplaceOrdersFilterSchema(BaseModel):
@@ -1294,6 +1339,7 @@ TOOL_DOMAIN_MAP: Dict[str, str] = {
     "get_scrap_records": "inventory",
     "get_warehouses": "inventory",
     "get_product_categories": "inventory",
+    "get_inventory_velocity_forecast": "inventory",
     "get_top_selling_products": "sales",
     "get_sales_orders": "sales",
     "get_sales_order_detail": "sales",

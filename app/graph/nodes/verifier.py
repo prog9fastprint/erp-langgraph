@@ -107,6 +107,7 @@ def _calculate_records_count(tool_result: Any) -> int:
             "transfers", "history", "adjustments", "scraps", "warehouses", "categories", "alerts", "bills", "orders", "contacts",
             "mappings", "exceptions", "simulations", "stock_logs", "price_logs", "pcls_logs",
             "anomalies", "by_store", "by_deduction_category", "cashflow_logs", "competitors",
+            "fast_moving", "slow_moving", "restock_recommendations",
         ):
             val = tool_result.get(list_key)
             if isinstance(val, list):

@@ -33,6 +33,7 @@ from app.schemas.tools import (
     ScrapRecordsFilterSchema,
     WarehousesFilterSchema,
     ProductCategoriesFilterSchema,
+    InventoryVelocityForecastFilterSchema,
     TopSellingProductsFilterSchema,
     SalesOrdersFilterSchema,
     SalesOrderDetailFilterSchema,
@@ -791,6 +792,21 @@ class DjangoCoreClient:
         return await self.execute_tool(
             domain="inventory",
             tool_name="get_product_categories",
+            params=_clean_params(params),
+            company_id=company_id,
+            user_token=user_token,
+        )
+
+    async def fetch_inventory_velocity_forecast(
+        self,
+        params: Optional[Union[InventoryVelocityForecastFilterSchema, Dict[str, Any]]] = None,
+        user_token: Optional[str] = None,
+        company_id: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Call inventory.get_inventory_velocity_forecast tool."""
+        return await self.execute_tool(
+            domain="inventory",
+            tool_name="get_inventory_velocity_forecast",
             params=_clean_params(params),
             company_id=company_id,
             user_token=user_token,
