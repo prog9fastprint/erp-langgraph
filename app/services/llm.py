@@ -2,10 +2,11 @@
 LLM Model Factory supporting OpenRouter (with free model catalog & auto-fallback) and OpenAI.
 """
 import asyncio
+import hashlib
 import logging
 import threading
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 import httpx
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_openai import ChatOpenAI
@@ -37,6 +38,28 @@ DEFAULT_CURATED_FREE_MODELS = [
 # Provider outage tracker for fast circuit-breaker failover
 _PROVIDER_OUTAGE_LOCK = threading.Lock()
 _PROVIDER_OUTAGE_UNTIL: Dict[str, float] = {}
+_PROVIDER_HEALTH_EPOCH: int = 0
+
+# Warm BaseChatModel cache (reuses underlying HTTP/TLS connection pools across requests)
+_CHAT_MODEL_CACHE_LOCK = threading.Lock()
+_CHAT_MODEL_CACHE: Dict[Tuple[Any, ...], BaseChatModel] = {}
+_CHAT_MODEL_CACHE_MAX_SIZE: int = 16
+
+
+def clear_chat_model_cache() -> None:
+    """Clear cached warm chat model instances."""
+    with _CHAT_MODEL_CACHE_LOCK:
+        _CHAT_MODEL_CACHE.clear()
+
+
+def _config_keys_fingerprint() -> str:
+    """Return a short hash of active provider API keys so test/env overrides never hit stale cached clients."""
+    raw = "|".join([
+        str(settings.OPENAI_API_KEY or ""),
+        str(settings.OPENROUTER_API_KEY or ""),
+        *settings.get_gemini_api_keys(),
+    ])
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
 
 def is_provider_unhealthy(provider: str) -> bool:
@@ -47,17 +70,23 @@ def is_provider_unhealthy(provider: str) -> bool:
 
 def mark_provider_unhealthy(provider: str, duration_sec: float = 900.0) -> None:
     """Temporarily mark a provider as unhealthy to bypass futile network calls."""
+    global _PROVIDER_HEALTH_EPOCH
     with _PROVIDER_OUTAGE_LOCK:
         _PROVIDER_OUTAGE_UNTIL[provider.lower().strip()] = time.time() + duration_sec
+        _PROVIDER_HEALTH_EPOCH += 1
+    clear_chat_model_cache()
 
 
 def reset_provider_health(provider: Optional[str] = None) -> None:
     """Reset unhealthy status for a specific provider or all providers."""
+    global _PROVIDER_HEALTH_EPOCH
     with _PROVIDER_OUTAGE_LOCK:
         if provider:
             _PROVIDER_OUTAGE_UNTIL.pop(provider.lower().strip(), None)
         else:
             _PROVIDER_OUTAGE_UNTIL.clear()
+        _PROVIDER_HEALTH_EPOCH += 1
+    clear_chat_model_cache()
 
 
 class CircuitBreakerChatOpenAI(ChatOpenAI):
@@ -347,25 +376,52 @@ def get_chat_model(
     enable_fallback: bool = True,
 ) -> BaseChatModel:
     """
-    Instantiate and return a ChatModel based on provider priority.
-
-    Supported providers:
-    - 'openai': Official OpenAI API (Priority 1).
-    - 'gemini': Google Gemini API via OpenAI-compatible endpoint with multi-key failover (Priority 2).
-    - 'openrouter': OpenRouter API with automatic free-model catalog fallback (Priority 3).
-
-    Args:
-        provider: 'openai', 'gemini', or 'openrouter' (defaults to settings.MODEL_PROVIDER).
-        model_name: Target model identifier.
-        temperature: Sampling temperature (default 0.0 for deterministic output).
-        fallback_models: Explicit list of fallback model IDs for OpenRouter.
-        enable_fallback: If True, attaches dynamic fallback models chain.
-
-    Returns:
-        Configured BaseChatModel instance.
+    Instantiate or return a cached warm ChatModel based on provider priority.
+    Cache automatically invalidates on API key changes or circuit-breaker transitions.
     """
     selected_provider = (provider or settings.MODEL_PROVIDER).lower().strip()
+    with _PROVIDER_OUTAGE_LOCK:
+        health_epoch = _PROVIDER_HEALTH_EPOCH
+    cache_key = (
+        selected_provider,
+        model_name,
+        float(temperature),
+        tuple(fallback_models) if fallback_models else (),
+        bool(enable_fallback),
+        settings.OPENAI_MODEL,
+        settings.GEMINI_MODEL,
+        settings.OPENROUTER_MODEL,
+        settings.REQUEST_TIMEOUT_SEC,
+        _config_keys_fingerprint(),
+        health_epoch,
+    )
+    with _CHAT_MODEL_CACHE_LOCK:
+        cached = _CHAT_MODEL_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
 
+    model = _build_chat_model_uncached(
+        selected_provider=selected_provider,
+        model_name=model_name,
+        temperature=temperature,
+        fallback_models=fallback_models,
+        enable_fallback=enable_fallback,
+    )
+    with _CHAT_MODEL_CACHE_LOCK:
+        if len(_CHAT_MODEL_CACHE) >= _CHAT_MODEL_CACHE_MAX_SIZE:
+            _CHAT_MODEL_CACHE.pop(next(iter(_CHAT_MODEL_CACHE)))
+        _CHAT_MODEL_CACHE[cache_key] = model
+    return model
+
+
+def _build_chat_model_uncached(
+    selected_provider: str,
+    model_name: Optional[str] = None,
+    temperature: float = 0.0,
+    fallback_models: Optional[List[str]] = None,
+    enable_fallback: bool = True,
+) -> BaseChatModel:
+    """Internal builder for get_chat_model without warm cache lookup."""
     if selected_provider == "openrouter":
         api_key = settings.OPENROUTER_API_KEY
         if not api_key:

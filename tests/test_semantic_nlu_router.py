@@ -302,6 +302,16 @@ class TestSemanticNLURouterPipeline(unittest.IsolatedAsyncioTestCase):
         self.assertIn("ATURAN KLARIFIKASI KONSERVATIF", prompt)
         self.assertIn("DILARANG KERAS meminta klarifikasi hanya karena cabang/company atau rentang tanggal", prompt)
 
+    def test_semantic_router_output_schema_is_compact_without_reasoning(self):
+        """SemanticRouterOutput omits unused reasoning/scalar tool fields to minimize router token latency."""
+        import json
+        from app.graph.nodes.router_semantic import SemanticRouterOutput
+
+        lean_schema = json.dumps(SemanticRouterOutput.model_json_schema())
+        legacy_schema = json.dumps(MultiRouterDecision.model_json_schema())
+        self.assertNotIn('"reasoning"', lean_schema)
+        self.assertLess(len(lean_schema), len(legacy_schema) * 0.6)
+
 
 class TestRouterModeDispatcherAndShadow(unittest.IsolatedAsyncioTestCase):
     """Test suite for Task 2.3 NLU_ROUTER_MODE dispatcher (legacy_regex, semantic_llm, shadow) and E2E workflow."""

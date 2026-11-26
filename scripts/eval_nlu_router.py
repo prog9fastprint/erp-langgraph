@@ -195,151 +195,157 @@ async def evaluate_golden_cases(
     cases: List[Dict[str, Any]],
     mode: str = "offline",
     llm: Optional[Any] = None,
+    concurrency: int = 5,
+    show_progress: bool = False,
 ) -> Dict[str, Any]:
     """Run repeatable evaluation over golden cases in 'offline' or 'live' mode."""
-    retrieval_total = 0
-    retrieval_hits = 0
-    legacy_total = 0
-    legacy_hits = 0
-    semantic_total = 0
-    semantic_hits = 0
-    clear_total = 0
-    false_clarifications = 0
-    clarify_total = 0
-    clarify_hits = 0
-    guardrail_total = 0
-    guardrail_regressions = 0
-
-    legacy_latencies_ms: List[float] = []
-    semantic_latencies_ms: List[float] = []
-    case_reports: List[Dict[str, Any]] = []
-
     live_model = llm
     if mode == "live" and live_model is None:
         live_model = get_chat_model()
 
-    for case in cases:
-        state = _build_state_for_case(case)
-        query = case["query"]
-        clauses = decompose_user_query(query) or [query]
-        expected_tools = case.get("expected_tools") or []
-        is_guardrail = bool(case.get("is_guardrail", False))
-        must_clarify = bool(case.get("must_clarify", False))
+    effective_concurrency = max(1, int(concurrency)) if mode == "live" else 1
+    sem = asyncio.Semaphore(effective_concurrency)
+    total_count = len(cases)
+    completed_count = 0
 
-        # 1. Retrieval Top-K Recall (for live_erp / hybrid cases with expected tools)
-        retrieval_hit: Optional[bool] = None
-        retrieved_names: List[str] = []
-        if expected_tools and not must_clarify:
-            retrieval_total += 1
+    async def _eval_one(case: Dict[str, Any]) -> Dict[str, Any]:
+        nonlocal completed_count
+        async with sem:
+            state = _build_state_for_case(case)
+            query = case["query"]
+            clauses = decompose_user_query(query) or [query]
+            expected_tools = case.get("expected_tools") or []
+            is_guardrail = bool(case.get("is_guardrail", False))
+            must_clarify = bool(case.get("must_clarify", False))
+
+            # 1. Legacy Regex Baseline
+            t0 = time.perf_counter()
+            with patch.object(settings, "NLU_ROUTER_MODE", "legacy_regex"):
+                legacy_res = await arouter_node(state, llm=None)
+            legacy_ms = (time.perf_counter() - t0) * 1000.0
+            legacy_match = None if must_clarify else _is_route_match(case, legacy_res)
+
+            # 2. Semantic Router + Single-Pass Retrieval Recall
+            semantic_res: Optional[Dict[str, Any]] = None
+            semantic_ms = 0.0
+            semantic_match: Optional[bool] = None
+            retrieval_hit: Optional[bool] = None
+            retrieved_names: List[str] = []
+
             if mode == "offline":
-                with patch.object(settings, "DYNAMIC_TOOL_RETRIEVAL_ENABLED", False):
-                    cands = await aretrieve_candidate_tools(query, clauses, state)
+                if expected_tools and not must_clarify:
+                    with patch.object(settings, "DYNAMIC_TOOL_RETRIEVAL_ENABLED", False):
+                        cands = await aretrieve_candidate_tools(query, clauses, state)
+                    retrieved_names = [c.get("tool_name") for c in cands if isinstance(c, dict)]
+                    hard_res = check_hard_guardrails(
+                        query, state, clauses, contextual_analysis_fn=_try_route_contextual_analysis
+                    )
+                    if hard_res and hard_res.get("detected_tool") in set(expected_tools):
+                        retrieval_hit = True
+                    else:
+                        retrieval_hit = _is_retrieval_hit(case, cands)
+
+                if is_guardrail:
+                    hard_res = check_hard_guardrails(
+                        query, state, clauses, contextual_analysis_fn=_try_route_contextual_analysis
+                    )
+                    semantic_res = hard_res
+                    semantic_match = _is_route_match(case, hard_res)
             else:
-                cands = await aretrieve_candidate_tools(query, clauses, state)
-            retrieved_names = [c.get("tool_name") for c in cands if isinstance(c, dict)]
-            # Strict doc-ID fast-path bypasses retrieval in production; count as recall hit
-            hard_res = check_hard_guardrails(
-                query, state, clauses, contextual_analysis_fn=_try_route_contextual_analysis
-            )
-            if hard_res and hard_res.get("detected_tool") in set(expected_tools):
-                retrieval_hit = True
-            else:
-                retrieval_hit = _is_retrieval_hit(case, cands)
-            if retrieval_hit:
-                retrieval_hits += 1
-
-        # 2. Legacy Regex Baseline
-        t0 = time.perf_counter()
-        with patch.object(settings, "NLU_ROUTER_MODE", "legacy_regex"):
-            legacy_res = await arouter_node(state, llm=None)
-        legacy_ms = (time.perf_counter() - t0) * 1000.0
-        legacy_latencies_ms.append(legacy_ms)
-
-        legacy_match: Optional[bool] = None
-        if not must_clarify:
-            legacy_total += 1
-            legacy_match = _is_route_match(case, legacy_res)
-            if legacy_match:
-                legacy_hits += 1
-
-        # 3. Semantic Router / Guardrail Check
-        semantic_res: Optional[Dict[str, Any]] = None
-        semantic_ms = 0.0
-        semantic_match: Optional[bool] = None
-
-        if mode == "offline":
-            if is_guardrail:
-                guardrail_total += 1
-                hard_res = check_hard_guardrails(
-                    query, state, clauses, contextual_analysis_fn=_try_route_contextual_analysis
+                t1 = time.perf_counter()
+                semantic_res = await aroute_semantic_nlu(
+                    state=state,
+                    user_query=query,
+                    get_model_fn=lambda: live_model,
+                    contextual_analysis_fn=_try_route_contextual_analysis,
+                    enforce_general_fn=_enforce_general_vs_out_of_scope,
                 )
-                if not _is_route_match(case, hard_res):
-                    guardrail_regressions += 1
-                semantic_res = hard_res
-                semantic_match = _is_route_match(case, hard_res)
-        else:
-            t1 = time.perf_counter()
-            semantic_res = await aroute_semantic_nlu(
-                state=state,
-                user_query=query,
-                get_model_fn=lambda: live_model,
-                contextual_analysis_fn=_try_route_contextual_analysis,
-                enforce_general_fn=_enforce_general_vs_out_of_scope,
-            )
-            semantic_ms = (time.perf_counter() - t1) * 1000.0
-            semantic_latencies_ms.append(semantic_ms)
+                semantic_ms = (time.perf_counter() - t1) * 1000.0
+                semantic_match = _is_route_match(case, semantic_res)
 
-            semantic_total += 1
-            semantic_match = _is_route_match(case, semantic_res)
-            if semantic_match:
-                semantic_hits += 1
+                if expected_tools and not must_clarify:
+                    avail = (semantic_res or {}).get("available_tools") or []
+                    retrieved_names = [c.get("tool_name") for c in avail if isinstance(c, dict)]
+                    if (semantic_res or {}).get("detected_tool") in set(expected_tools) and avail:
+                        retrieval_hit = _is_retrieval_hit(case, avail) or (
+                            set(expected_tools).issubset(set((semantic_res or {}).get("detected_tools") or []))
+                        )
+                    else:
+                        retrieval_hit = _is_retrieval_hit(case, avail)
 
-            got_clarify = bool(
-                isinstance(semantic_res, dict)
-                and (semantic_res.get("needs_clarification") or semantic_res.get("query_mode") == "clarification")
-            )
-            if must_clarify:
-                clarify_total += 1
-                if got_clarify:
-                    clarify_hits += 1
-            else:
-                clear_total += 1
-                if got_clarify:
-                    false_clarifications += 1
+            completed_count += 1
+            if show_progress and mode == "live":
+                status_tag = "OK" if semantic_match else "MISS"
+                print(
+                    f"[{completed_count}/{total_count}] {case['id']} {status_tag} ({semantic_ms:.0f}ms)",
+                    file=sys.stderr,
+                    flush=True,
+                )
 
-            if is_guardrail:
-                guardrail_total += 1
-                if not semantic_match:
-                    guardrail_regressions += 1
+            return {
+                "id": case["id"],
+                "category": case.get("category"),
+                "query": query,
+                "expected_domain": case.get("expected_domain"),
+                "expected_query_mode": case.get("expected_query_mode"),
+                "expected_tools": expected_tools,
+                "must_clarify": must_clarify,
+                "is_guardrail": is_guardrail,
+                "retrieval_hit": retrieval_hit,
+                "retrieved_tools": retrieved_names,
+                "legacy_match": legacy_match,
+                "legacy_tools": legacy_res.get("detected_tools") if isinstance(legacy_res, dict) else [],
+                "legacy_domain": legacy_res.get("detected_domain") if isinstance(legacy_res, dict) else None,
+                "legacy_ms": round(legacy_ms, 2),
+                "semantic_match": semantic_match,
+                "semantic_tools": semantic_res.get("detected_tools") if isinstance(semantic_res, dict) else [],
+                "semantic_domain": semantic_res.get("detected_domain") if isinstance(semantic_res, dict) else None,
+                "semantic_needs_clarification": bool(
+                    isinstance(semantic_res, dict)
+                    and (semantic_res.get("needs_clarification") or semantic_res.get("query_mode") == "clarification")
+                ),
+                "semantic_ms": round(semantic_ms, 2),
+            }
 
-        case_reports.append({
-            "id": case["id"],
-            "category": case.get("category"),
-            "query": query,
-            "expected_domain": case.get("expected_domain"),
-            "expected_query_mode": case.get("expected_query_mode"),
-            "expected_tools": expected_tools,
-            "must_clarify": must_clarify,
-            "is_guardrail": is_guardrail,
-            "retrieval_hit": retrieval_hit,
-            "retrieved_tools": retrieved_names,
-            "legacy_match": legacy_match,
-            "legacy_tools": legacy_res.get("detected_tools") if isinstance(legacy_res, dict) else [],
-            "legacy_domain": legacy_res.get("detected_domain") if isinstance(legacy_res, dict) else None,
-            "legacy_ms": round(legacy_ms, 2),
-            "semantic_match": semantic_match,
-            "semantic_tools": semantic_res.get("detected_tools") if isinstance(semantic_res, dict) else [],
-            "semantic_domain": semantic_res.get("detected_domain") if isinstance(semantic_res, dict) else None,
-            "semantic_needs_clarification": bool(
-                isinstance(semantic_res, dict) and semantic_res.get("needs_clarification")
-            ),
-            "semantic_ms": round(semantic_ms, 2),
-        })
+    if effective_concurrency > 1:
+        case_reports = list(await asyncio.gather(*(_eval_one(c) for c in cases)))
+    else:
+        case_reports = [await _eval_one(c) for c in cases]
+
+    retrieval_total = sum(1 for r in case_reports if r["retrieval_hit"] is not None)
+    retrieval_hits = sum(1 for r in case_reports if r["retrieval_hit"] is True)
+    legacy_total = sum(1 for r in case_reports if r["legacy_match"] is not None)
+    legacy_hits = sum(1 for r in case_reports if r["legacy_match"] is True)
+
+    legacy_latencies_ms = [float(r["legacy_ms"]) for r in case_reports]
+    semantic_latencies_ms = [float(r["semantic_ms"]) for r in case_reports] if mode == "live" else []
+
+    if mode == "offline":
+        semantic_total = 0
+        semantic_hits = 0
+        clarify_total = 0
+        clarify_hits = 0
+        clear_total = 0
+        false_clarifications = 0
+        guardrail_total = sum(1 for r in case_reports if r["is_guardrail"])
+        guardrail_regressions = sum(1 for r in case_reports if r["is_guardrail"] and not r["semantic_match"])
+    else:
+        semantic_total = len(case_reports)
+        semantic_hits = sum(1 for r in case_reports if r["semantic_match"] is True)
+        clarify_total = sum(1 for r in case_reports if r["must_clarify"])
+        clarify_hits = sum(1 for r in case_reports if r["must_clarify"] and r["semantic_needs_clarification"])
+        clear_total = sum(1 for r in case_reports if not r["must_clarify"])
+        false_clarifications = sum(
+            1 for r in case_reports if not r["must_clarify"] and r["semantic_needs_clarification"]
+        )
+        guardrail_total = sum(1 for r in case_reports if r["is_guardrail"])
+        guardrail_regressions = sum(1 for r in case_reports if r["is_guardrail"] and not r["semantic_match"])
 
     def _pct(num: int, den: int) -> float:
         return round((num / den) * 100.0, 2) if den > 0 else 0.0
 
     legacy_p95 = _percentile(legacy_latencies_ms, 95)
+    semantic_p50 = _percentile(semantic_latencies_ms, 50)
     semantic_p95 = _percentile(semantic_latencies_ms, 95)
 
     summary: Dict[str, Any] = {
@@ -359,6 +365,7 @@ async def evaluate_golden_cases(
         "guardrail_cases": guardrail_total,
         "guardrail_regressions": guardrail_regressions,
         "legacy_p95_ms": legacy_p95,
+        "semantic_p50_ms": semantic_p50,
         "semantic_p95_ms": semantic_p95,
         "p95_latency_delta_ms": round(max(0.0, semantic_p95 - legacy_p95), 2) if mode == "live" else 0.0,
     }
@@ -387,7 +394,7 @@ def format_markdown_report(report: Dict[str, Any]) -> str:
         f"| False-Clarification Rate | {s['false_clarification_rate_pct']}% ({s['false_clarification_count']}/{s['clear_cases']}) |",
         f"| Guardrail Regressions | {s['guardrail_regressions']} / {s['guardrail_cases']} |",
         f"| Legacy P95 Latency | {s['legacy_p95_ms']} ms |",
-        f"| Semantic P95 Latency | {s['semantic_p95_ms']} ms (delta: {s['p95_latency_delta_ms']} ms) |",
+        f"| Semantic Latency | P50 {s.get('semantic_p50_ms', 0.0)} ms / P95 {s['semantic_p95_ms']} ms (delta: {s['p95_latency_delta_ms']} ms) |",
         "",
         "## Exit Gates",
         "",
@@ -405,6 +412,7 @@ async def _cli_main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--mode", choices=["offline", "live"], default="offline")
     parser.add_argument("--dataset", type=Path, default=DEFAULT_DATASET_PATH)
     parser.add_argument("--limit", type=int, default=None, help="Optional limit on number of cases to run.")
+    parser.add_argument("--concurrency", type=int, default=5, help="Max concurrent cases in live mode (default 5).")
     parser.add_argument("--output", type=Path, default=None, help="Optional path to write full JSON report.")
     parser.add_argument("--markdown", type=Path, default=None, help="Optional path to write Markdown summary.")
     parser.add_argument("--fail-on-gate", action="store_true", help="Exit with code 1 if any exit gate fails.")
@@ -414,7 +422,12 @@ async def _cli_main(argv: Optional[List[str]] = None) -> int:
     if args.limit is not None and args.limit > 0:
         cases = cases[: args.limit]
 
-    report = await evaluate_golden_cases(cases, mode=args.mode)
+    report = await evaluate_golden_cases(
+        cases,
+        mode=args.mode,
+        concurrency=args.concurrency,
+        show_progress=(args.mode == "live"),
+    )
     md = format_markdown_report(report)
     print(md)
 

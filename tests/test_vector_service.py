@@ -144,6 +144,36 @@ class TestVectorService(unittest.IsolatedAsyncioTestCase):
         await init_cb(mock_conn)
         mock_register_vector.assert_awaited_once_with(mock_conn)
 
+    async def test_get_embedding_lru_cache_hits_and_skips_none(self):
+        """Repeated normalized queries reuse cached embeddings without redundant API calls; errors are never cached."""
+        fake_resp = MagicMock()
+        fake_emb = MagicMock()
+        fake_emb.values = [0.25] * 768
+        fake_resp.embeddings = [fake_emb]
+
+        fake_client = MagicMock()
+        fake_client.models.embed_content = MagicMock(return_value=fake_resp)
+        self.service._genai_client = fake_client
+
+        v1 = await self.service.get_embedding("Cek   Laba Rugi")
+        v2 = await self.service.get_embedding("cek laba rugi")
+        self.assertEqual(v1, [0.25] * 768)
+        self.assertEqual(v2, [0.25] * 768)
+        self.assertEqual(fake_client.models.embed_content.call_count, 1)
+
+        # Mutating returned copy must not corrupt cache
+        v1[0] = 9.9
+        v3 = await self.service.get_embedding("cek laba rugi")
+        self.assertAlmostEqual(v3[0], 0.25)
+
+        # Errors returning None must not be cached
+        fake_client.models.embed_content.side_effect = RuntimeError("429")
+        err_vec = await self.service.get_embedding("query gagal")
+        self.assertIsNone(err_vec)
+        fake_client.models.embed_content.side_effect = None
+        ok_vec = await self.service.get_embedding("query gagal")
+        self.assertEqual(ok_vec, [0.25] * 768)
+
 
 if __name__ == "__main__":
     unittest.main()

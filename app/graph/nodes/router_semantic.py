@@ -12,10 +12,11 @@ Implements the target NLU pipeline defined in nlu_architecture_blueprint.md:
 import asyncio
 import logging
 import re
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from pydantic import BaseModel, Field
 
 from app.core.branches import resolve_all_branch_company_ids, resolve_branch_company_id
 from app.core.config import settings
@@ -93,6 +94,45 @@ _STRICT_PURCHASE_VOUCHER_DOC_RE = re.compile(
 )
 
 _MAX_SEMANTIC_CANDIDATES = 12
+
+_EMOJI_STRIP_RE = re.compile(
+    "["
+    "\U0001F300-\U0001F9FF"
+    "\U0001FA00-\U0001FAFF"
+    "\u2600-\u27BF"
+    "\uFE0F"
+    "]+",
+    flags=re.UNICODE,
+)
+
+
+class _LeanPlannedTool(BaseModel):
+    tool: str
+    domain: Literal["accounting", "inventory", "sales", "marketplace"]
+    sub_query: Optional[str] = None
+
+
+class _LeanClarificationOption(BaseModel):
+    label: str
+    query: str
+    icon: str = "fa-arrow-right"
+
+
+class SemanticRouterOutput(BaseModel):
+    """Compact structured output schema minimizing input schema and output generation tokens."""
+    domain: Literal[
+        "accounting", "inventory", "sales", "marketplace",
+        "knowledge", "general", "out_of_scope", "clarification"
+    ]
+    query_mode: Literal[
+        "live_erp", "vector_rag", "hybrid", "general",
+        "out_of_scope", "contextual_analysis", "clarification"
+    ] = "live_erp"
+    planned_tools: List[_LeanPlannedTool] = Field(default_factory=list)
+    rag_query: Optional[str] = None
+    needs_clarification: bool = False
+    clarification_question: Optional[str] = None
+    clarification_options: List[_LeanClarificationOption] = Field(default_factory=list)
 
 
 def is_explicit_customer_billing_query(text: str) -> bool:
@@ -529,15 +569,28 @@ def _build_state_from_semantic_decision(
             question = "Mohon perjelas permintaan Anda dengan memilih salah satu opsi di bawah ini."
         raw_opts = getattr(decision, "clarification_options", None) or []
         serialized_opts: List[Dict[str, str]] = []
-        for opt in raw_opts[:4]:
-            if hasattr(opt, "model_dump"):
-                serialized_opts.append(opt.model_dump())
-            elif isinstance(opt, dict):
-                serialized_opts.append({
-                    "label": str(opt.get("label") or "").strip(),
-                    "query": str(opt.get("query") or "").strip(),
-                    "icon": str(opt.get("icon") or "fa-arrow-right").strip(),
-                })
+        seen_opt_q: set[str] = set()
+        for opt in raw_opts:
+            raw_lbl = opt.label if hasattr(opt, "label") else (opt.get("label") if isinstance(opt, dict) else "")
+            raw_q = opt.query if hasattr(opt, "query") else (opt.get("query") if isinstance(opt, dict) else "")
+            raw_ico = opt.icon if hasattr(opt, "icon") else (opt.get("icon") if isinstance(opt, dict) else "fa-arrow-right")
+            clean_lbl = re.sub(r"\s+", " ", _EMOJI_STRIP_RE.sub("", str(raw_lbl or ""))).strip()
+            clean_q = str(raw_q or "").strip()
+            if not clean_lbl or not clean_q:
+                continue
+            norm_q = re.sub(r"\s+", " ", clean_q.rstrip("?!.,;:'\"> ")).lower()
+            if norm_q in seen_opt_q:
+                continue
+            seen_opt_q.add(norm_q)
+            icon_str = str(raw_ico or "fa-arrow-right").strip()
+            clean_icon = icon_str if re.fullmatch(r"[A-Za-z0-9_\- ]+", icon_str) else "fa-arrow-right"
+            serialized_opts.append({
+                "label": clean_lbl,
+                "query": clean_q,
+                "icon": clean_icon or "fa-arrow-right",
+            })
+            if len(serialized_opts) >= 4:
+                break
         return {
             "detected_domain": "clarification",
             "detected_tool": None,
@@ -682,7 +735,7 @@ async def aroute_semantic_nlu(
       Hard Guardrails -> Per-Clause Hybrid Retrieval -> Dynamic Scoped LLM Router.
     Returns None if LLM is unavailable or fails so caller can fall back cleanly to legacy_regex.
     """
-    from app.graph.nodes.router import MultiRouterDecision, _enforce_general_vs_out_of_scope
+    from app.graph.nodes.router import _enforce_general_vs_out_of_scope
 
     clauses = decompose_user_query(user_query) or [user_query]
     guardrail_res = check_hard_guardrails(
@@ -719,7 +772,7 @@ async def aroute_semantic_nlu(
     ]
 
     try:
-        structured_model = model.with_structured_output(MultiRouterDecision)
+        structured_model = model.with_structured_output(SemanticRouterOutput)
         decision = await structured_model.ainvoke(
             messages,
             config={"tags": ["internal_no_stream"]},
@@ -753,7 +806,7 @@ def route_semantic_nlu_sync(
     Synchronous counterpart of aroute_semantic_nlu for sync router_node execution.
     Returns None if LLM is unavailable or fails so caller can fall back cleanly to legacy_regex.
     """
-    from app.graph.nodes.router import MultiRouterDecision, _enforce_general_vs_out_of_scope
+    from app.graph.nodes.router import _enforce_general_vs_out_of_scope
 
     clauses = decompose_user_query(user_query) or [user_query]
     guardrail_res = check_hard_guardrails(
@@ -790,7 +843,7 @@ def route_semantic_nlu_sync(
     ]
 
     try:
-        structured_model = model.with_structured_output(MultiRouterDecision)
+        structured_model = model.with_structured_output(SemanticRouterOutput)
         decision = structured_model.invoke(messages)
     except Exception as exc:
         logger.warning("Sync Scoped LLM Router failed for '%s': %s", user_query, exc)

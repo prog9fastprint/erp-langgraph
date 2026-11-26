@@ -160,6 +160,31 @@ class TestLLMClientFactory(unittest.TestCase):
         self.assertIn("Unsupported MODEL_PROVIDER", str(ctx.exception))
         self.assertIn("gemini", str(ctx.exception))
 
+    def test_get_chat_model_reuses_warm_cache_and_invalidates_on_health_change(self):
+        """Warm chat model cache reuses client for identical config and invalidates on circuit-breaker trip."""
+        from app.services.llm import clear_chat_model_cache, mark_provider_unhealthy, reset_provider_health
+
+        clear_chat_model_cache()
+        reset_provider_health()
+        try:
+            with patch.object(settings, "OPENAI_API_KEY", "warm-cache-key-1"):
+                m1 = get_chat_model(provider="openai", model_name="gpt-4o-mini", enable_fallback=False)
+                m2 = get_chat_model(provider="openai", model_name="gpt-4o-mini", enable_fallback=False)
+                self.assertIs(m1, m2)
+
+            with patch.object(settings, "OPENAI_API_KEY", "warm-cache-key-2"):
+                m3 = get_chat_model(provider="openai", model_name="gpt-4o-mini", enable_fallback=False)
+                self.assertIsNot(m1, m3)
+
+            with patch.object(settings, "OPENAI_API_KEY", "warm-cache-key-1"):
+                mark_provider_unhealthy("openai")
+                reset_provider_health()
+                m4 = get_chat_model(provider="openai", model_name="gpt-4o-mini", enable_fallback=False)
+                self.assertIsNot(m1, m4)
+        finally:
+            reset_provider_health()
+            clear_chat_model_cache()
+
 
 if __name__ == "__main__":
     unittest.main()

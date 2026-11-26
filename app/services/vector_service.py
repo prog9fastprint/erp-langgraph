@@ -4,10 +4,11 @@ Provides semantic embedding generation via Google GenAI SDK (gemini-embedding-00
 and vector similarity retrieval using asyncpg and pgvector on a dedicated PostgreSQL instance.
 """
 import asyncio
+from collections import OrderedDict
 import json
 import logging
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 import weakref
 
 from app.core.config import settings
@@ -42,6 +43,8 @@ class VectorService:
             weakref.WeakKeyDictionary()
         )
         self._fallback_lock: Optional[asyncio.Lock] = None
+        self._embedding_cache: "OrderedDict[Tuple[str, str], List[float]]" = OrderedDict()
+        self._embedding_cache_max_size: int = 512
 
     @property
     def _pool(self) -> Optional[Any]:
@@ -212,6 +215,13 @@ class VectorService:
         if not text or not text.strip():
             return None
 
+        normalized_text = " ".join(text.strip().lower().split())
+        cache_key = (self.embedding_model, normalized_text)
+        cached_vec = self._embedding_cache.get(cache_key)
+        if cached_vec is not None:
+            self._embedding_cache.move_to_end(cache_key)
+            return list(cached_vec)
+
         client = self._get_genai_client()
         if client is None:
             return None
@@ -226,7 +236,12 @@ class VectorService:
                 config=config,
             )
             if response and hasattr(response, "embeddings") and response.embeddings:
-                return response.embeddings[0].values
+                vec = list(response.embeddings[0].values)
+                self._embedding_cache[cache_key] = vec
+                self._embedding_cache.move_to_end(cache_key)
+                while len(self._embedding_cache) > self._embedding_cache_max_size:
+                    self._embedding_cache.popitem(last=False)
+                return list(vec)
         except Exception as exc:
             logger.error(f"Error calling Gemini embed_content API: {exc}")
             return None
