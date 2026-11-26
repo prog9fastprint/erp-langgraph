@@ -10,8 +10,16 @@ from app.core.config import settings
 from app.services.llm import get_default_model_name
 
 # Structured verification status literal
-VerificationStatus = Literal["VALID", "EMPTY", "RETRY", "ERROR"]
-QueryMode = Literal["live_erp", "vector_rag", "hybrid", "general", "out_of_scope", "contextual_analysis"]
+VerificationStatus = Literal["VALID", "EMPTY", "RETRY", "ERROR", "CLARIFICATION"]
+QueryMode = Literal[
+    "live_erp",
+    "vector_rag",
+    "hybrid",
+    "general",
+    "out_of_scope",
+    "contextual_analysis",
+    "clarification",
+]
 
 
 class ToolCallPlan(TypedDict, total=False):
@@ -121,6 +129,11 @@ class AgentState(TypedDict, total=False):
     sub_questions: Optional[List[str]]
     non_tool_questions: Optional[List[Dict[str, Any]]]
 
+    # 10. Conservative Disambiguation / Clarification
+    needs_clarification: Optional[bool]
+    clarification_question: Optional[str]
+    clarification_options: Optional[List[Dict[str, str]]]
+
 
 def create_initial_state(
     user_query: str,
@@ -196,6 +209,9 @@ def create_initial_state(
         "rag_results_by_query": {},
         "sub_questions": [],
         "non_tool_questions": [],
+        "needs_clarification": False,
+        "clarification_question": None,
+        "clarification_options": [],
         # Multi-tool orchestration state extensions
         "is_multi_tool": is_multi_tool if is_multi_tool is not None else False,
         "active_model": active_model or get_default_model_name(),

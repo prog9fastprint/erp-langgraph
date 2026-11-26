@@ -70,6 +70,10 @@ def decide_after_router(state: AgentState) -> str:
     sub_questions = state.get("sub_questions") or []
     non_tool_questions = state.get("non_tool_questions") or []
 
+    # 0. Conservative Disambiguation / Clarification: bypass extractor/tools straight to synthesizer
+    if query_mode == "clarification" or state.get("needs_clarification"):
+        return "synthesizer"
+
     # 1. Pure single-question guardrail & contextual analysis: skip tool extraction
     if query_mode == "contextual_analysis" and not non_tool_questions and len(sub_questions) <= 1:
         return "synthesizer"
@@ -519,7 +523,7 @@ async def _prepare_workflow_execution(
             initial_state["prior_detected_tool"] = checkpoint_values.get("prior_detected_tool")
             initial_state["prior_detected_domain"] = checkpoint_values.get("prior_detected_domain")
             initial_state["prior_extracted_params"] = checkpoint_values.get("prior_extracted_params")
-        elif checkpoint_values.get("detected_domain"):
+        elif checkpoint_values.get("detected_domain") and checkpoint_values.get("detected_domain") != "clarification":
             initial_state["prior_detected_domain"] = checkpoint_values.get("detected_domain")
             initial_state["prior_detected_tool"] = checkpoint_values.get("detected_tool")
             initial_state["prior_extracted_params"] = checkpoint_values.get("extracted_params")

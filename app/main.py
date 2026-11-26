@@ -270,6 +270,10 @@ def _build_chat_response(final_state: Dict[str, Any], started_at: float) -> Chat
     resolved_company_ids = [int(c) for c in raw_company_ids] if raw_company_ids else None
     execution_time_ms = round((time.perf_counter() - started_at) * 1000.0, 2)
     model_used = final_state.get("active_model") or get_default_model_name()
+    query_mode = final_state.get("query_mode")
+    needs_clarification = bool(
+        final_state.get("needs_clarification") or query_mode == "clarification"
+    )
 
     return ChatResponse(
         final_answer=final_state.get("final_answer"),
@@ -282,6 +286,8 @@ def _build_chat_response(final_state: Dict[str, Any], started_at: float) -> Chat
         execution_time_ms=execution_time_ms,
         model_used=model_used,
         table_query_meta=final_state.get("table_query_meta"),
+        needs_clarification=needs_clarification,
+        query_mode=query_mode,
     )
 
 

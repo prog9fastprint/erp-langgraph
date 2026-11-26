@@ -75,12 +75,14 @@ class TestChatSchemas(unittest.TestCase):
         self.assertIsNone(data["error_message"])
 
     def test_chat_response_defaults(self):
-        """ChatResponse fields default to None."""
+        """ChatResponse fields default to None / False cleanly for backward compatibility."""
         resp = ChatResponse()
         self.assertIsNone(resp.final_answer)
         self.assertIsNone(resp.detected_domain)
         self.assertIsNone(resp.verification_status)
         self.assertIsNone(resp.error_message)
+        self.assertFalse(resp.needs_clarification)
+        self.assertIsNone(resp.query_mode)
 
 
 class TestChatEndpoint(unittest.TestCase):
@@ -326,6 +328,35 @@ class TestChatEndpoint(unittest.TestCase):
             thread_id=thread_id,
             company_id_explicit=False,
         )
+
+    @patch("app.main.arun_workflow", new_callable=AsyncMock)
+    def test_chat_returns_clarification_contract_with_chips(self, mock_workflow):
+        """POST /api/v1/chat emits needs_clarification=True, query_mode='clarification', and clickable chips."""
+        mock_workflow.return_value = {
+            "final_answer": "Apakah Anda ingin mengecek pesanan penjualan ERP atau order marketplace?",
+            "detected_domain": "clarification",
+            "query_mode": "clarification",
+            "verification_status": "CLARIFICATION",
+            "needs_clarification": True,
+            "error_message": None,
+            "suggested_followups": [
+                {"label": "Sales Order ERP", "query": "Cek daftar sales order minggu ini", "icon": "fa-file-invoice"},
+                {"label": "Order Marketplace", "query": "Cek daftar order marketplace minggu ini", "icon": "fa-store"},
+            ],
+        }
+
+        response = self.client.post(
+            "/api/v1/chat",
+            json={"query": "cek order minggu ini"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertTrue(data["needs_clarification"])
+        self.assertEqual(data["query_mode"], "clarification")
+        self.assertEqual(data["verification_status"], "CLARIFICATION")
+        self.assertEqual(len(data["suggested_followups"]), 2)
+        self.assertEqual(data["suggested_followups"][0]["label"], "Sales Order ERP")
 
 
 if __name__ == "__main__":

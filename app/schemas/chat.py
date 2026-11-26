@@ -68,7 +68,7 @@ class ChatResponse(BaseModel):
 
     final_answer: Optional[str] = Field(default=None, description="Synthesized Markdown answer")
     detected_domain: Optional[str] = Field(default=None, description="Classified intent domain")
-    verification_status: Optional[str] = Field(default=None, description="Verification status (VALID, EMPTY, RETRY, ERROR)")
+    verification_status: Optional[str] = Field(default=None, description="Verification status (VALID, EMPTY, RETRY, ERROR, CLARIFICATION)")
     error_message: Optional[str] = Field(default=None, description="Error message if execution encountered failures")
     suggested_followups: Optional[List[FollowupSuggestion]] = Field(
         default_factory=list,
@@ -93,4 +93,12 @@ class ChatResponse(BaseModel):
     table_query_meta: Optional[Dict[str, Any]] = Field(
         default=None,
         description="Optional paginated tool query metadata for remote full-table inspection and export"
+    )
+    needs_clarification: bool = Field(
+        default=False,
+        description="True when the orchestrator asks a conservative disambiguation question with clickable chips"
+    )
+    query_mode: Optional[str] = Field(
+        default=None,
+        description="Execution mode chosen by router (live_erp, vector_rag, hybrid, general, out_of_scope, contextual_analysis, clarification)"
     )

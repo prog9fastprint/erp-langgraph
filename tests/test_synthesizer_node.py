@@ -660,5 +660,91 @@ class TestSynthesizerAntiAiSlop(unittest.TestCase):
         self.assertIn("Terekonsiliasi Sempurna (Fully Reconciled)", output)
 
 
+class TestClarificationSynthesizerAndRouting(unittest.IsolatedAsyncioTestCase):
+    """Test suite for Task 2.1 clarification state, routing short-circuit, and synthesizer fast-path."""
+
+    def test_initial_state_and_decide_after_router_clarification_short_circuit(self):
+        """create_initial_state resets clarification flags; decide_after_router routes clarification straight to synthesizer."""
+        from app.graph.workflow import decide_after_router
+
+        state = create_initial_state(user_query="cek mutasi bulan ini")
+        self.assertFalse(state["needs_clarification"])
+        self.assertIsNone(state["clarification_question"])
+        self.assertEqual(state["clarification_options"], [])
+
+        # Even if active_tools/rag_queries were populated, clarification must short-circuit to synthesizer
+        state["query_mode"] = "clarification"
+        state["needs_clarification"] = True
+        state["active_tools"] = [{"tool": "get_stock_history", "domain": "inventory"}]
+        state["rag_queries"] = ["mutasi"]
+        self.assertEqual(decide_after_router(state), "synthesizer")
+
+    def test_sync_synthesizer_clarification_fastpath_sanitizes_chips_without_llm(self):
+        """synthesizer_node renders clarification_question directly, strips emojis, caps at 4, and skips LLM."""
+        from unittest.mock import MagicMock, patch
+
+        mock_llm = MagicMock()
+        state = create_initial_state(user_query="cek mutasi bulan ini")
+        state["query_mode"] = "clarification"
+        state["needs_clarification"] = True
+        state["detected_domain"] = "clarification"
+        state["clarification_question"] = "Mutasi mana yang ingin Anda periksa?"
+        state["clarification_options"] = [
+            {"label": "📦 Mutasi Stok", "query": "Cek kartu stok bulan ini", "icon": "fa-boxes"},
+            {"label": "💰 Buku Besar Akun", "query": "Cek mutasi buku besar bulan ini", "icon": "fa-book"},
+            {"label": "Duplikat", "query": "cek kartu stok bulan ini!", "icon": "fa-boxes"},
+            {"label": "Transfer Gudang", "query": "Cek surat jalan transfer bulan ini", "icon": "bad<script>"},
+            {"label": "Mutasi Dompet MP", "query": "Cek cashflow dompet marketplace bulan ini", "icon": "fa-wallet"},
+            {"label": "Opsi Kelima", "query": "Cek jurnal umum bulan ini", "icon": "fa-list"},
+        ]
+
+        with patch("app.graph.nodes.synthesizer.get_chat_model") as mock_factory:
+            result = synthesizer_node(state, llm=mock_llm)
+
+        mock_factory.assert_not_called()
+        mock_llm.invoke.assert_not_called()
+        self.assertEqual(result["final_answer"], "Mutasi mana yang ingin Anda periksa?")
+        self.assertEqual(result["verification_status"], "CLARIFICATION")
+        self.assertTrue(result["needs_clarification"])
+        self.assertEqual(result["query_mode"], "clarification")
+        self.assertEqual(len(result["messages"]), 1)
+        self.assertEqual(result["messages"][0].content, "Mutasi mana yang ingin Anda periksa?")
+
+        chips = result["suggested_followups"]
+        self.assertEqual(len(chips), 4)
+        self.assertEqual(chips[0]["label"], "Mutasi Stok")
+        self.assertNotIn("📦", chips[0]["label"])
+        self.assertEqual(chips[1]["label"], "Buku Besar Akun")
+        self.assertEqual(chips[2]["icon"], "fa-arrow-right")
+
+    async def test_async_synthesizer_clarification_dispatches_token_without_llm(self):
+        """asynthesizer_node dispatches SSE token directly for clarification without calling LLM."""
+        from unittest.mock import AsyncMock, MagicMock, patch
+        from app.graph.nodes.synthesizer import asynthesizer_node
+
+        mock_llm = MagicMock()
+        mock_llm.ainvoke = AsyncMock()
+        state = create_initial_state(user_query="cek order minggu ini")
+        state["query_mode"] = "clarification"
+        state["needs_clarification"] = True
+        state["clarification_question"] = "Apakah yang dimaksud Sales Order ERP atau Order Marketplace?"
+        state["clarification_options"] = [
+            {"label": "Sales Order ERP", "query": "Cek daftar sales order minggu ini"},
+            {"label": "Order Marketplace", "query": "Cek daftar order marketplace minggu ini"},
+        ]
+
+        with patch("app.graph.nodes.synthesizer.adispatch_custom_event", new_callable=AsyncMock) as mock_dispatch:
+            result = await asynthesizer_node(state, llm=mock_llm)
+
+        mock_llm.ainvoke.assert_not_awaited()
+        mock_dispatch.assert_awaited_once_with(
+            "token",
+            {"content": "Apakah yang dimaksud Sales Order ERP atau Order Marketplace?"},
+        )
+        self.assertEqual(result["verification_status"], "CLARIFICATION")
+        self.assertTrue(result["needs_clarification"])
+        self.assertEqual(len(result["suggested_followups"]), 2)
+
+
 if __name__ == "__main__":
     unittest.main()
