@@ -17,7 +17,6 @@ from langchain_core.messages import AIMessage, HumanMessage
 from app.core.context import clean_product_identifier
 from app.graph.nodes.extractor import (
     _fallback_extract_contacts,
-    _fallback_extract_sales_orders,
     _fallback_extract_stock_level,
     _fallback_extract_top_selling_products,
     extractor_node,

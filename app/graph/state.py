@@ -111,7 +111,7 @@ class AgentState(TypedDict, total=False):
     rag_queries: Optional[List[str]]
     rag_context: Optional[List[Dict[str, Any]]]
     rag_sources: Optional[List[str]]
-    rag_results_by_query: Optional[List[Dict[str, Any]]]
+    rag_results_by_query: Optional[Dict[str, Dict[str, Any]]]
 
     # 9. Multi-Question Decomposition & Non-Tool Responses
     sub_questions: Optional[List[str]]
@@ -185,7 +185,7 @@ def create_initial_state(
         "rag_queries": [],
         "rag_context": None,
         "rag_sources": None,
-        "rag_results_by_query": [],
+        "rag_results_by_query": {},
         "sub_questions": [],
         "non_tool_questions": [],
         # Multi-tool orchestration state extensions

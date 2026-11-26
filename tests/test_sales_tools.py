@@ -9,7 +9,6 @@ Covers:
 - Single and multi-company synthesizer presentation
 """
 import unittest
-from datetime import date
 from unittest.mock import AsyncMock, patch
 
 from app.graph.state import create_initial_state

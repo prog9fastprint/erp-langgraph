@@ -9,7 +9,6 @@ Unit test suite validating fixes for stock distribution query optimization:
 - Verifies LLM circuit breaker and fail-fast cache
 """
 import unittest
-from unittest.mock import MagicMock, patch
 
 from app.graph.nodes.router import router_node
 from app.graph.nodes.extractor import (

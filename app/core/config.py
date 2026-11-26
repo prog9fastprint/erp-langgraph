@@ -1,6 +1,8 @@
 """
 Application Configuration settings loaded from environment variables and .env file.
 """
+import os
+import sys
 from typing import Optional, List
 from pydantic import Field, AliasChoices
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -38,6 +40,7 @@ class Settings(BaseSettings):
     )
     ERP_USERNAME: Optional[str] = None
     ERP_PASSWORD: Optional[str] = None
+    ERP_LOGIN_SECRET: Optional[str] = Field(default=None, validation_alias="ERP_LOGIN_SECRET")
     REQUEST_TIMEOUT_SEC: int = Field(
         default=15,
         validation_alias=AliasChoices("REQUEST_TIMEOUT_SEC", "REQUEST_TIMEOUT"),
@@ -64,7 +67,6 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("GOOGLE_AI_API_KEY_3", "GEMINI_API_KEY_3"),
     )
     GEMINI_MODEL: str = Field(default="gemini-2.5-flash", validation_alias="GEMINI_MODEL")
-    GEMINI_MODEL_OCR_AIR: str = Field(default="gemini-2.5-flash", validation_alias="GEMINI_MODEL_OCR_AIR")
 
     # OpenRouter Configuration (Priority 3)
     OPENROUTER_API_KEY: Optional[str] = None
@@ -79,10 +81,8 @@ class Settings(BaseSettings):
         return keys
 
     # 3. LangGraph & Tools Settings
-    USE_DYNAMIC_TOOLS: bool = False
     ENABLE_HITL_INTERRUPT: bool = False
     ERP_MULTI_COMPANY_CONCURRENCY: int = 16
-    ERP_MULTI_COMPANY_MAX_BRANCHES: int = 20
 
     # 4. Context Window & Memory Management
     MAX_WINDOW_MESSAGES: int = Field(default=10, validation_alias="MAX_WINDOW_MESSAGES")
@@ -100,7 +100,7 @@ class Settings(BaseSettings):
     )
     GEMINI_API_KEY: Optional[str] = Field(
         default=None,
-        validation_alias=AliasChoices("GEMINI_API_KEY", "GOOGLE_AI_API_KEY", "GOOGLE_API_KEY"),
+        validation_alias=AliasChoices("GOOGLE_AI_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY"),
     )
     GEMINI_EMBEDDING_MODEL: str = Field(default="gemini-embedding-001", validation_alias="GEMINI_EMBEDDING_MODEL")
 
@@ -111,4 +111,13 @@ class Settings(BaseSettings):
     TOOL_RETRIEVAL_DISTANCE_THRESHOLD: float = Field(default=0.65, validation_alias="TOOL_RETRIEVAL_DISTANCE_THRESHOLD")
 
 
-settings = Settings()
+def _is_test_runtime() -> bool:
+    """Return True when running inside unit tests so local .env secrets never leak."""
+    return (
+        "unittest" in sys.modules
+        or os.environ.get("FASTPRINT_TEST_ENV") == "true"
+        or os.environ.get("APP_ENV", "").strip().lower() == "test"
+    )
+
+
+settings = Settings(_env_file=None if _is_test_runtime() else ".env")

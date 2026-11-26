@@ -7,7 +7,7 @@ from datetime import date, datetime, timedelta, timezone, tzinfo
 import re
 from typing import Any, Dict, List, Optional, Set
 from zoneinfo import ZoneInfo
-from langchain_core.messages import BaseMessage, SystemMessage, HumanMessage, AIMessage
+from langchain_core.messages import BaseMessage
 
 from app.core.config import settings
 
@@ -408,88 +408,245 @@ def sanitize_tool_params(params: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     return sanitized
 
 
+_RECORD_COUNT_KEYS = (
+    "total_count",
+    "total_found",
+    "count",
+    "records_count",
+    "total_products",
+)
+
+_CLEAN_AUDIT_SCANNED_KEYS = (
+    "total_accounts",
+    "total_evaluated",
+    "total_kilat_scanned",
+    "total_lines",
+    "total_orders",
+    "active_competitors",
+)
+
+_LOG_TOTAL_KEYS = (
+    "stock_logs_total",
+    "price_logs_total",
+    "pcls_logs_total",
+    "cashflow_logs_total",
+)
+
+_COLLECTION_LIST_KEYS = (
+    "entries",
+    "items",
+    "accounts",
+    "products",
+    "stocks",
+    "bills",
+    "records",
+    "lines",
+    "locations",
+    "transfers",
+    "history",
+    "adjustments",
+    "scraps",
+    "warehouses",
+    "categories",
+    "alerts",
+    "orders",
+    "contacts",
+    "mappings",
+    "exceptions",
+    "simulations",
+    "stock_logs",
+    "price_logs",
+    "pcls_logs",
+    "anomalies",
+    "by_store",
+    "by_deduction_category",
+    "cashflow_logs",
+    "competitors",
+    "fast_moving",
+    "slow_moving",
+    "restock_recommendations",
+)
+
+_BALANCE_METRIC_KEYS = {
+    "net_balance",
+    "total_debit",
+    "total_credit",
+    "grand_net_balance",
+    "grand_total_debit",
+    "grand_total_credit",
+    "total_revenue",
+    "total_assets",
+    "bank_statement_balance",
+}
+
+_KNOWN_RECORD_ATTRS = {
+    "id",
+    "product_id",
+    "product_name",
+    "sku",
+    "code",
+    "default_code",
+    "barcode",
+    "account_id",
+    "account_code",
+    "account_name",
+    "location_id",
+    "location_name",
+    "partner_id",
+    "partner_name",
+    "vendor_id",
+    "vendor_name",
+    "invoice_id",
+    "journal_id",
+    "move_id",
+    "reference",
+    "name",
+    "uom",
+    "qty_on_hand",
+    "quantity",
+    "available_quantity",
+    "virtual_available",
+    "incoming_qty",
+    "outgoing_qty",
+    "net_balance",
+    "total_debit",
+    "total_credit",
+    "grand_net_balance",
+    "amount_total",
+    "price_unit",
+    "list_price",
+    "standard_price",
+    "debit",
+    "credit",
+    "balance",
+    "total_revenue",
+    "gross_profit",
+    "net_profit",
+    "cogs",
+    "operating_profit",
+    "gross_margin_percent",
+    "total_assets",
+    "total_liabilities",
+    "total_equity",
+    "total_liabilities_and_equity",
+    "bank_statement_balance",
+    "erp_book_balance",
+    "residual_balance",
+    "bill_date",
+    "due_date",
+    "due_status",
+    "closing_balance",
+    "running_balance",
+}
+
+
 def resolve_tool_record_count(tool_result: Any) -> int:
     """
     Compute total record count found in ERP tool response envelope.
-    Handles paginated responses, raw record lists, and aggregate calculations.
+    Handles error payloads, paginated counts, collections, nested data, and aggregate summaries.
     """
     if tool_result is None:
         return 0
     if isinstance(tool_result, list):
         return len(tool_result)
-    if isinstance(tool_result, dict):
-        for count_key in ("total_count", "total_found", "count", "records_count"):
-            val = tool_result.get(count_key)
-            if val is not None:
-                try:
-                    c_int = int(val)
-                    if c_int > 0:
-                        return c_int
-                    summary_blk = tool_result.get("summary")
-                    if isinstance(summary_blk, dict) and summary_blk:
-                        if any(
-                            int(summary_blk.get(sk) or 0) > 0
-                            for sk in (
-                                "total_accounts",
-                                "total_evaluated",
-                                "total_kilat_scanned",
-                                "total_lines",
-                                "total_orders",
-                                "active_competitors",
-                            )
-                        ) or ("total_anomalies" in summary_blk and ("date_window" in tool_result or "filters" in tool_result)):
-                            return 1
-                    return 0
-                except (ValueError, TypeError):
-                    pass
-        log_totals = [
-            tool_result.get(k)
-            for k in ("stock_logs_total", "price_logs_total", "pcls_logs_total", "cashflow_logs_total")
-            if tool_result.get(k) is not None
-        ]
-        if log_totals:
+    if not isinstance(tool_result, dict) or not tool_result:
+        return 0
+
+    if (
+        tool_result.get("error") is not None
+        or tool_result.get("detail") is not None
+        or tool_result.get("errors") is not None
+        or tool_result.get("success") is False
+    ):
+        return 0
+
+    if (
+        tool_result.get("exclude_zero") is True
+        and isinstance(tool_result.get("out_of_stock_count"), (int, float))
+        and not isinstance(tool_result.get("out_of_stock_count"), bool)
+        and int(tool_result["out_of_stock_count"]) > 0
+    ):
+        alerts_list = tool_result.get("alerts")
+        if isinstance(alerts_list, list) and len(alerts_list) > 0:
+            return len(alerts_list)
+        return 1
+
+    for count_key in _RECORD_COUNT_KEYS:
+        val = tool_result.get(count_key)
+        if val is not None and not isinstance(val, bool):
             try:
-                log_sum = sum(int(v) for v in log_totals)
-                if log_sum > 0:
-                    return log_sum
-                if any(
-                    isinstance(tool_result.get(sk), dict) and int(tool_result[sk].get("total") or 0) > 0
-                    for sk in ("stock_summary", "price_summary")
-                ):
-                    return 1
+                c_int = int(val)
+                if c_int > 0:
+                    return c_int
+                summary_blk = tool_result.get("summary")
+                if isinstance(summary_blk, dict) and summary_blk:
+                    if any(
+                        int(summary_blk.get(sk) or 0) > 0
+                        for sk in _CLEAN_AUDIT_SCANNED_KEYS
+                    ) or ("total_anomalies" in summary_blk and ("date_window" in tool_result or "filters" in tool_result)):
+                        return 1
                 return 0
             except (ValueError, TypeError):
                 pass
-        for list_key in (
-            "entries",
-            "items",
-            "accounts",
-            "products",
-            "bills",
-            "records",
-            "lines",
-            "warehouses",
-            "categories",
-            "orders",
-            "contacts",
-            "mappings",
-            "exceptions",
-            "simulations",
-            "stock_logs",
-            "price_logs",
-            "pcls_logs",
-            "anomalies",
-            "by_store",
-            "cashflow_logs",
-            "competitors",
-        ):
-            collection = tool_result.get(list_key)
-            if isinstance(collection, list):
+
+    log_totals = [
+        tool_result.get(k)
+        for k in _LOG_TOTAL_KEYS
+        if tool_result.get(k) is not None and not isinstance(tool_result.get(k), bool)
+    ]
+    has_log_summary = any(
+        isinstance(tool_result.get(sk), dict) and tool_result[sk]
+        for sk in ("stock_summary", "price_summary")
+    )
+    if log_totals or has_log_summary:
+        try:
+            log_sum = sum(int(v) for v in log_totals)
+            if log_sum > 0:
+                return log_sum
+            if any(
+                isinstance(tool_result.get(sk), dict) and int(tool_result[sk].get("total") or 0) > 0
+                for sk in ("stock_summary", "price_summary")
+            ):
+                return 1
+            return 0
+        except (ValueError, TypeError):
+            pass
+
+    for list_key in _COLLECTION_LIST_KEYS:
+        collection = tool_result.get(list_key)
+        if isinstance(collection, list):
+            if len(collection) > 0:
                 return len(collection)
-        if any(isinstance(tool_result.get(k), dict) and tool_result[k] for k in ("summary", "stock_summary", "price_summary")):
-            return 1
-        return 1 if tool_result else 0
-    return 1
+            summary_blk = tool_result.get("summary")
+            if isinstance(summary_blk, dict) and any(
+                int(summary_blk.get(sk) or 0) > 0 for sk in _CLEAN_AUDIT_SCANNED_KEYS
+            ):
+                return 1
+            return 0
+
+    if any(
+        isinstance(tool_result.get(k), dict) and tool_result[k]
+        for k in ("summary", "totals", "confirmed_metrics", "stock_summary", "price_summary")
+    ):
+        return 1
+
+    if "data" in tool_result and isinstance(tool_result["data"], (dict, list)):
+        return resolve_tool_record_count(tool_result["data"])
+
+    if any(k in _BALANCE_METRIC_KEYS for k in tool_result.keys()):
+        has_value = any(
+            float(v or 0) != 0.0
+            for v in tool_result.values()
+            if isinstance(v, (int, float)) and not isinstance(v, bool)
+        )
+        return 1 if has_value else 0
+
+    has_business_attr = any(k in _KNOWN_RECORD_ATTRS for k in tool_result.keys())
+    has_non_none_value = any(v is not None for v in tool_result.values())
+    if has_business_attr and has_non_none_value:
+        return 1
+
+    return 0
 
 
 def chunk_text_for_streaming(text: str, max_chunk_len: int = 35) -> List[str]:
@@ -512,4 +669,25 @@ def chunk_text_for_streaming(text: str, max_chunk_len: int = 35) -> List[str]:
     if curr:
         chunks.append(curr)
     return chunks
+
+
+ANAPHORA_TOKENS = {"itu", "tersebut", "tadi", "ini", "terkait", "dia", "nya", "sana", "situ"}
+ANAPHORIC_CLITICS = (
+    "stoknya", "harganya", "barangnya", "produknya", "saldonya",
+    "tagihannya", "fakturnya", "invoicenya", "lokasinya", "detailnya",
+    "transaksinya", "jurnalnya", "omzetnya", "omsetnya", "ruginya",
+    "labanya", "neracanya", "kasnya", "sisanya",
+)
+
+
+def has_anaphoric_reference(text: str) -> bool:
+    """Check if text contains Indonesian anaphoric clitics, pronouns, or elliptical clauses."""
+    cleaned = (text or "").lower()
+    if any(clitic in cleaned for clitic in ANAPHORIC_CLITICS):
+        return True
+    if any(re.search(rf"\b{re.escape(token)}\b", cleaned) for token in ANAPHORA_TOKENS):
+        return True
+    if re.search(r"\b(?:berapa|gimana|bagaimana|mana|ada berapa)\s+(?:stok|harga|saldo|tagihan|faktur|detail)\b", cleaned):
+        return True
+    return False
 

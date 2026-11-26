@@ -5,25 +5,17 @@ verifier record counting, and markdown synthesizer formatting.
 """
 import unittest
 from datetime import date
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock
 from pydantic import ValidationError
 
 from app.schemas.tools import (
-    AccountBalanceFilterSchema,
-    JournalEntriesFilterSchema,
     GeneralLedgerFilterSchema,
     ProfitAndLossFilterSchema,
     BalanceSheetFilterSchema,
     VendorBillsFilterSchema,
     BankReconciliationFilterSchema,
     # Response envelopes & data schemas
-    AccountBalanceResponseSchema,
-    JournalEntriesResponseSchema,
-    GeneralLedgerResponseSchema,
     ProfitAndLossResponseSchema,
-    BalanceSheetResponseSchema,
-    VendorBillsResponseSchema,
-    BankReconciliationResponseSchema,
     TOOL_DOMAIN_MAP,
 )
 from app.graph.nodes.router import classify_query_rule_based
@@ -32,12 +24,9 @@ from app.graph.nodes.extractor import (
     _fallback_extract_profit_and_loss,
     _fallback_extract_balance_sheet,
     _fallback_extract_vendor_bills,
-    _fallback_extract_bank_reconciliation,
-    _fallback_extract_account_balance,
 )
-from app.graph.nodes.verifier import _calculate_records_count, verifier_node
-from app.graph.nodes.synthesizer import _format_single_tool_presentation, synthesizer_node
-from app.graph.nodes.tool_node import tool_node
+from app.graph.nodes.verifier import _calculate_records_count
+from app.graph.nodes.synthesizer import _format_single_tool_presentation
 from app.services.django_client import DjangoCoreClient
 
 

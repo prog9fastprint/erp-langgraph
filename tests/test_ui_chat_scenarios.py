@@ -6,7 +6,6 @@ Unit and integration tests for UI Chat test cases:
 - Guardrails & non-ERP queries
 """
 import unittest
-from unittest.mock import AsyncMock, patch
 from fastapi.testclient import TestClient
 
 from app.main import app
@@ -19,7 +18,7 @@ from app.graph.nodes.synthesizer import (
     _format_multi_company_presentation,
     _format_rupiah,
 )
-from app.graph.state import AgentState, create_initial_state
+from app.graph.state import AgentState
 from app.schemas.chat import ChatRequest
 
 

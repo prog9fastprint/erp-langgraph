@@ -928,31 +928,33 @@ class TestLifespanCleanupAndSharedHttpPool(unittest.IsolatedAsyncioTestCase):
         shared_http._transport = httpx.MockTransport(_handler)
 
         # Concurrent login() calls coalesce into a single HTTP login request
-        t1, t2 = await asyncio.gather(c1.login(), c2.login())
-        self.assertEqual(t1, "sys-jwt-1")
-        self.assertEqual(t2, "sys-jwt-1")
-        self.assertEqual(login_calls, 1)
-        self.assertEqual(django_client_module._CACHED_SYSTEM_TOKEN, "sys-jwt-1")
+        cache_key = ("http://test-erp:8000", "admin")
+        with patch.object(settings, "ERP_LOGIN_SECRET", "test-login-secret"):
+            t1, t2 = await asyncio.gather(c1.login(), c2.login())
+            self.assertEqual(t1, "sys-jwt-1")
+            self.assertEqual(t2, "sys-jwt-1")
+            self.assertEqual(login_calls, 1)
+            self.assertEqual(django_client_module._CACHED_SYSTEM_TOKENS.get(cache_key), "sys-jwt-1")
 
-        # Per-instance aclose() does not kill the shared pooled httpx client
-        await c1.aclose()
-        await c2.aclose()
-        self.assertFalse(shared_http.is_closed)
+            # Per-instance aclose() does not kill the shared pooled httpx client
+            await c1.aclose()
+            await c2.aclose()
+            self.assertFalse(shared_http.is_closed)
 
-        # New DjangoCoreClient picks up _CACHED_SYSTEM_TOKEN immediately; 401 triggers refresh -> sys-jwt-2
-        with patch.object(settings, "ERP_API_TOKEN", ""):
-            c3 = DjangoCoreClient(base_url="http://test-erp:8000", username="admin", password="secret")
-            self.assertEqual(c3.token, "sys-jwt-1")
-            res = await c3.execute_tool(domain="accounting", tool_name="get_account_balance", params={})
-            self.assertEqual(res["ok"], True)
-            self.assertEqual(res["token"], "Bearer sys-jwt-2")
-            self.assertEqual(login_calls, 2)
-            self.assertEqual(django_client_module._CACHED_SYSTEM_TOKEN, "sys-jwt-2")
+            # New DjangoCoreClient picks up _CACHED_SYSTEM_TOKENS immediately; 401 triggers refresh -> sys-jwt-2
+            with patch.object(settings, "ERP_API_TOKEN", ""):
+                c3 = DjangoCoreClient(base_url="http://test-erp:8000", username="admin", password="secret")
+                self.assertEqual(c3.token, "sys-jwt-1")
+                res = await c3.execute_tool(domain="accounting", tool_name="get_account_balance", params={})
+                self.assertEqual(res["ok"], True)
+                self.assertEqual(res["token"], "Bearer sys-jwt-2")
+                self.assertEqual(login_calls, 2)
+                self.assertEqual(django_client_module._CACHED_SYSTEM_TOKENS.get(cache_key), "sys-jwt-2")
 
-        # Shared pool shutdown closes httpx client and wipes cached system token
+        # Shared pool shutdown closes httpx client and wipes cached system tokens
         await aclose_shared_django_client()
         self.assertTrue(shared_http.is_closed)
-        self.assertIsNone(django_client_module._CACHED_SYSTEM_TOKEN)
+        self.assertEqual(django_client_module._CACHED_SYSTEM_TOKENS, {})
 
     def test_fastapi_lifespan_tracks_background_tasks_and_closes_all_resources(self):
         """
@@ -974,7 +976,8 @@ class TestLifespanCleanupAndSharedHttpPool(unittest.IsolatedAsyncioTestCase):
             except asyncio.CancelledError:
                 raise
 
-        with patch("app.main.afetch_free_models_catalog", side_effect=_slow_prewarm), \
+        with patch.object(settings, "OPENROUTER_API_KEY", "test-openrouter-key"), \
+             patch("app.main.afetch_free_models_catalog", side_effect=_slow_prewarm), \
              patch("app.main.vector_service.close_pool", new_callable=AsyncMock) as mock_close_pool, \
              patch("app.main.shutdown_workflow_executor") as mock_shutdown_exec:
             with TestClient(app) as test_client:
@@ -991,7 +994,8 @@ class TestLifespanCleanupAndSharedHttpPool(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(created_shared_clients[0].is_closed)
 
         # Shutdown resilience: failure in close_pool still closes django client & workflow executor
-        with patch("app.main.afetch_free_models_catalog", new_callable=AsyncMock, return_value=["openrouter/free"]), \
+        with patch.object(settings, "OPENROUTER_API_KEY", "test-openrouter-key"), \
+             patch("app.main.afetch_free_models_catalog", new_callable=AsyncMock, return_value=["openrouter/free"]), \
              patch("app.main.vector_service.close_pool", new_callable=AsyncMock, side_effect=RuntimeError("pg shutdown boom")), \
              patch("app.main.aclose_shared_django_client", new_callable=AsyncMock) as mock_aclose_http, \
              patch("app.main.shutdown_workflow_executor") as mock_shutdown_exec:
@@ -1020,7 +1024,8 @@ class TestLifespanCleanupAndSharedHttpPool(unittest.IsolatedAsyncioTestCase):
             initialized.set()
             return ["openrouter/free"]
 
-        with patch("app.main.afetch_free_models_catalog", side_effect=_prewarm_with_resources), \
+        with patch.object(settings, "OPENROUTER_API_KEY", "test-openrouter-key"), \
+             patch("app.main.afetch_free_models_catalog", side_effect=_prewarm_with_resources), \
              patch.object(main_module.vector_service, "db_url", "postgresql://user:pass@localhost:5432/vec"), \
              patch("asyncpg.create_pool", new_callable=AsyncMock, return_value=mock_pg_pool):
             with TestClient(app) as test_client:
@@ -1085,8 +1090,7 @@ class TestTimezoneWibConsistency(unittest.TestCase):
         import hashlib
         from datetime import datetime, timezone
         import app.core.context as context_module
-        from app.services.django_client import DjangoCoreClient
-        from app.services.erp_client import ERPClient
+        from app.services.django_client import DjangoAuthError, DjangoCoreClient
 
         utc_instant = datetime(2026, 11, 13, 17, 30, 0, tzinfo=timezone.utc)
 
@@ -1095,14 +1099,17 @@ class TestTimezoneWibConsistency(unittest.TestCase):
             def now(cls, tz=None):
                 return utc_instant.astimezone(tz) if tz is not None else utc_instant.replace(tzinfo=None)
 
-        expected_hash = hashlib.md5(b"erp_master_nexus-2026-11-14-00:30").hexdigest()
+        expected_hash = hashlib.md5(b"test_erp_secret-2026-11-14-00:30").hexdigest()
 
-        with patch.object(context_module, "datetime", _FrozenDatetime):
+        with patch.object(context_module, "datetime", _FrozenDatetime), \
+             patch.object(settings, "ERP_LOGIN_SECRET", "test_erp_secret"):
             django_secret = DjangoCoreClient()._generate_secret_key()
-            erp_secret = ERPClient()._generate_secret_key()
 
         self.assertEqual(django_secret, expected_hash)
-        self.assertEqual(erp_secret, expected_hash)
+
+        with patch.object(settings, "ERP_LOGIN_SECRET", None), \
+             self.assertRaises(DjangoAuthError):
+            DjangoCoreClient()._generate_secret_key()
 
 
 class TestNonBlockingVectorEmbedding(unittest.TestCase):
@@ -1291,7 +1298,8 @@ class TestPending4MultiToolSelectiveRetryAndBranchScoping(unittest.IsolatedAsync
 
         self.assertEqual(mock_client.fetch_stock_level.await_count, 1)
         self.assertEqual(mock_client.fetch_vendor_bills.await_count, 2)
-        self.assertEqual(t2["multi_tool_results"]["get_stock_level"], valid_stock_payload)
+        self.assertEqual(t2["multi_tool_results"]["get_stock_level"]["products"], valid_stock_payload["products"])
+        self.assertEqual(t2["multi_tool_results"]["get_stock_level"]["total_count"], 1)
         self.assertEqual(t2["multi_tool_results"]["get_vendor_bills"]["bills"], found_bills_payload["bills"])
         self.assertEqual(t2["multi_tool_results"]["get_vendor_bills"]["total_count"], 1)
 

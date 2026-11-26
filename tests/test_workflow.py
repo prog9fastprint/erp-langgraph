@@ -5,13 +5,12 @@ router -> extractor -> tool_node -> verifier -> synthesizer -> END,
 conditional edge branching, retry loop recovery and termination (max 2x),
 error handling propagation, multi-turn memory checkpointer, and synchronous runner helper.
 """
-from datetime import date
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.checkpoint.memory import MemorySaver
 
-from app.graph.state import create_initial_state, AgentState
+from app.graph.state import create_initial_state
 from app.graph.workflow import (
     create_workflow_graph,
     decide_after_router,

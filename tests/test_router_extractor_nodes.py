@@ -1362,7 +1362,6 @@ class TestMultiToolExtractorNode(unittest.TestCase):
     def test_multi_segment_document_number_extraction(self):
         """Verify branch-prefixed journal entries and multi-segment documents are captured in full."""
         from app.graph.nodes.extractor import _fallback_extract_journal_entries, _fallback_extract_vendor_invoice
-        from app.graph.nodes.router import classify_query_rule_based
 
         res1 = _fallback_extract_journal_entries("cek entri jurnal BDG/JE/2026/00009")
         self.assertEqual(res1.get("entry_number"), "BDG/JE/2026/00009")

@@ -8,6 +8,7 @@ import json
 import logging
 import os
 from typing import Any, Dict, List, Optional
+import weakref
 
 from app.core.config import settings
 
@@ -33,23 +34,57 @@ class VectorService:
         self.gemini_api_key = gemini_api_key or settings.GEMINI_API_KEY or os.environ.get("GEMINI_API_KEY")
         self.embedding_model = embedding_model or settings.GEMINI_EMBEDDING_MODEL
         self._genai_client = None
-        self._pool: Optional[Any] = None
-        self._pool_lock: Optional[asyncio.Lock] = None
-        self._pool_lock_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._pools_by_loop: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, Any]" = (
+            weakref.WeakKeyDictionary()
+        )
+        self._fallback_pool: Optional[Any] = None
+        self._pool_locks_by_loop: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock]" = (
+            weakref.WeakKeyDictionary()
+        )
+        self._fallback_lock: Optional[asyncio.Lock] = None
+
+    @property
+    def _pool(self) -> Optional[Any]:
+        try:
+            running_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            if self._fallback_pool is not None:
+                return self._fallback_pool
+            for candidate in reversed(list(self._pools_by_loop.values())):
+                if candidate is not None and not getattr(candidate, "_closed", False):
+                    return candidate
+            return None
+        return self._pools_by_loop.get(running_loop, self._fallback_pool)
+
+    @_pool.setter
+    def _pool(self, value: Optional[Any]) -> None:
+        try:
+            running_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._fallback_pool = value
+            if value is None:
+                self._pools_by_loop.clear()
+            return
+        if value is None:
+            self._pools_by_loop.pop(running_loop, None)
+            self._fallback_pool = None
+        else:
+            self._pools_by_loop[running_loop] = value
 
     def _get_pool_lock(self) -> asyncio.Lock:
         """Lazily initialize pool lock bound to the currently running event loop."""
         try:
             running_loop = asyncio.get_running_loop()
         except RuntimeError:
-            running_loop = None
+            if self._fallback_lock is None:
+                self._fallback_lock = asyncio.Lock()
+            return self._fallback_lock
 
-        if self._pool_lock is None or (
-            running_loop is not None and self._pool_lock_loop is not running_loop
-        ):
-            self._pool_lock = asyncio.Lock()
-            self._pool_lock_loop = running_loop
-        return self._pool_lock
+        lock = self._pool_locks_by_loop.get(running_loop)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._pool_locks_by_loop[running_loop] = lock
+        return lock
 
     async def get_pool(self) -> Optional[Any]:
         """
@@ -59,12 +94,14 @@ class VectorService:
         if not self.db_url:
             return None
 
-        if self._pool is not None and not getattr(self._pool, "_closed", False):
-            return self._pool
+        existing_pool = self._pool
+        if existing_pool is not None and not getattr(existing_pool, "_closed", False):
+            return existing_pool
 
         async with self._get_pool_lock():
-            if self._pool is not None and not getattr(self._pool, "_closed", False):
-                return self._pool
+            existing_pool = self._pool
+            if existing_pool is not None and not getattr(existing_pool, "_closed", False):
+                return existing_pool
 
             try:
                 import asyncpg
@@ -75,28 +112,30 @@ class VectorService:
                 async def _init_connection(conn):
                     await register_vector(conn)
 
-                self._pool = await asyncpg.create_pool(
+                created_pool = await asyncpg.create_pool(
                     clean_url,
                     min_size=1,
                     max_size=10,
                     command_timeout=settings.REQUEST_TIMEOUT_SEC,
                     init=_init_connection,
                 )
+                self._pool = created_pool
                 logger.info("Dedicated PGVector asyncpg connection pool initialized successfully.")
-                return self._pool
+                return created_pool
             except Exception as exc:
                 logger.error(f"Failed to create asyncpg connection pool: {exc}")
                 return None
 
     async def close_pool(self) -> None:
         """
-        Gracefully close all connections in the asyncpg pool.
+        Gracefully close all connections in the active asyncpg pool.
         """
         async with self._get_pool_lock():
-            if self._pool is not None:
+            active_pool = self._pool
+            if active_pool is not None:
                 try:
-                    if not getattr(self._pool, "_closed", False):
-                        await self._pool.close()
+                    if not getattr(active_pool, "_closed", False):
+                        await active_pool.close()
                 except Exception as exc:
                     logger.warning(f"Error while closing asyncpg connection pool: {exc}")
                 finally:
@@ -113,6 +152,8 @@ class VectorService:
             return False
 
         ddl = f"""
+            CREATE EXTENSION IF NOT EXISTS vector;
+
             CREATE TABLE IF NOT EXISTS {KNOWLEDGE_TABLE_NAME} (
                 id SERIAL PRIMARY KEY,
                 company_id INT NOT NULL DEFAULT 1,
@@ -121,8 +162,9 @@ class VectorService:
                 content TEXT NOT NULL,
                 metadata JSONB DEFAULT '{{}}'::jsonb,
                 is_active BOOLEAN DEFAULT TRUE,
-                embedding vector(768),
-                created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+                embedding vector(768) NOT NULL,
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+                updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
             );
 
             CREATE INDEX IF NOT EXISTS idx_{KNOWLEDGE_TABLE_NAME}_embedding 
@@ -130,6 +172,9 @@ class VectorService:
 
             CREATE INDEX IF NOT EXISTS idx_{KNOWLEDGE_TABLE_NAME}_company_active 
             ON {KNOWLEDGE_TABLE_NAME} (company_id, is_active);
+
+            CREATE INDEX IF NOT EXISTS idx_{KNOWLEDGE_TABLE_NAME}_company_cat 
+            ON {KNOWLEDGE_TABLE_NAME} (company_id, category);
         """
         try:
             async with pool.acquire() as conn:

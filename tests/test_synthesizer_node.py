@@ -6,7 +6,7 @@ negative guardrails, AIMessage message history appending, and LLM fallback.
 """
 import unittest
 from unittest.mock import MagicMock
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage
 
 from app.graph.state import create_initial_state
 from app.graph.nodes.synthesizer import (
@@ -510,7 +510,7 @@ class TestSynthesizerNodeExecution(unittest.TestCase):
         update = synthesizer_node(state)
         self.assertIn("suggested_followups", update)
         labels = [f["label"] for f in update["suggested_followups"]]
-        self.assertTrue(any("PRN-L3110" in l for l in labels))
+        self.assertTrue(any("PRN-L3110" in lbl for lbl in labels))
         queries = [f["query"] for f in update["suggested_followups"]]
         self.assertTrue(any("PRN-L3110" in q for q in queries))
 

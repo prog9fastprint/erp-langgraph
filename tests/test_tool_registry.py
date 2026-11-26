@@ -3,19 +3,15 @@ Unit tests for Dynamic Semantic Tool Registry & RBAC Guardrail (TASK-5.1).
 Covers in-memory fallback, vector similarity retrieval with distance threshold,
 RBAC role/permission filtering, incremental seeding, and router integration.
 """
-import asyncio
-from datetime import date
 import json
 import unittest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
-from app.core.config import settings
 from app.graph.nodes.router import router_node, PlannedToolCall
-from app.graph.state import create_initial_state, AgentState
+from app.graph.state import create_initial_state
 from app.schemas.chat import ChatRequest
 from app.services.tool_registry_service import (
     ToolRegistryService,
-    get_tool_registry_service,
     CORE_TOOL_DEFINITIONS,
 )
 
@@ -212,9 +208,10 @@ class TestToolRegistryService(unittest.IsolatedAsyncioTestCase):
         mock_pool = MagicMock()
         mock_conn = MagicMock()
 
-        # Simulate that only 1 tool exists in the database
+        # Simulate that only 1 tool exists in the database with unchanged description
+        stock_desc = next(t["description"] for t in CORE_TOOL_DEFINITIONS if t["tool_name"] == "get_stock_level")
         existing_rows = [
-            {"tool_name": "get_stock_level", "description": "Existing stock tool"}
+            {"tool_name": "get_stock_level", "description": stock_desc}
         ]
         mock_conn.fetch = AsyncMock(return_value=existing_rows)
         mock_conn.execute = AsyncMock(return_value="INSERT 0 1")

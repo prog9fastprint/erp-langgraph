@@ -3,7 +3,6 @@ Unit tests for Branch Entity Resolution, Strict Date Handling, and Vendor Filter
 """
 import unittest
 from datetime import date
-from langchain_core.messages import HumanMessage
 
 from app.graph.state import create_initial_state
 from app.graph.nodes.extractor import (

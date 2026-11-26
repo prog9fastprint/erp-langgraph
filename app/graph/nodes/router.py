@@ -8,16 +8,84 @@ import logging
 import os
 import re
 import sys
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import BaseMessage, SystemMessage, HumanMessage
 from pydantic import BaseModel, Field, model_validator
 
 from app.core.config import settings
 from app.core.context import trim_conversation_messages
-from app.graph.state import AgentState, ToolCallPlan
+from app.graph.state import AgentState
 from app.schemas.tools import TOOL_DOMAIN_MAP
 from app.services.llm import get_chat_model
+
+from app.core.branches import (
+    COMPANY_NAME_MAP,
+    resolve_all_branch_company_ids,
+    resolve_branch_company_id,
+    resolve_prior_multi_company_scope,
+    strip_company_scope_keywords,
+)
+from app.core.context import has_anaphoric_reference
+from app.graph.nodes.extractors.accounting import resolve_pnl_drilldown_from_history
+from app.graph.nodes.router_decomposer import (
+    _extract_sub_queries,
+    _split_conjunction_clauses,
+    decompose_user_query,
+    find_previous_user_query,
+    is_retry_query,
+)
+from app.graph.nodes.router_patterns import (
+    CUSTOMER_TERMS,
+    VENDOR_TERMS,
+    PURCHASE_INVOICE_TERMS,
+    CUSTOMER_BILLING_TERMS,
+    ACCOUNTING_PROFIT_LOSS_PATTERNS,
+    ACCOUNTING_BALANCE_SHEET_PATTERNS,
+    ACCOUNTING_GENERAL_LEDGER_PATTERNS,
+    ACCOUNTING_BANK_RECON_PATTERNS,
+    ACCOUNTING_VENDOR_BILLS_PATTERNS,
+    ACCOUNTING_BALANCE_PATTERNS,
+    ACCOUNTING_JOURNAL_PATTERNS,
+    INVENTORY_STOCK_PATTERNS,
+    INVENTORY_STOCK_HISTORY_PATTERNS,
+    INVENTORY_TRANSFERS_PATTERNS,
+    INVENTORY_LOW_STOCK_PATTERNS,
+    INVENTORY_ADJUSTMENTS_PATTERNS,
+    INVENTORY_SCRAP_PATTERNS,
+    INVENTORY_WAREHOUSES_PATTERNS,
+    INVENTORY_CATEGORIES_PATTERNS,
+    INVENTORY_LOCATION_PATTERNS,
+    INVENTORY_VELOCITY_FORECAST_PATTERNS,
+    SALES_TOP_PRODUCTS_PATTERNS,
+    SALES_SUMMARY_PATTERNS,
+    SALES_ORDER_DETAIL_PATTERNS,
+    SALES_CONTACTS_PATTERNS,
+    SALES_ORDERS_PATTERNS,
+    MARKETPLACE_WRITE_PATTERNS,
+    MARKETPLACE_ACCOUNT_HEALTH_PATTERNS,
+    MARKETPLACE_KILAT_PATTERNS,
+    MARKETPLACE_ORDERS_PATTERNS,
+    MARKETPLACE_MAPPING_PATTERNS,
+    MARKETPLACE_STOCK_SYNC_SIM_PATTERNS,
+    MARKETPLACE_SYNC_LOGS_PATTERNS,
+    MARKETPLACE_PRICE_COMPARISON_PATTERNS,
+    MARKETPLACE_FEE_ANOMALIES_PATTERNS,
+    MARKETPLACE_DEDUCTION_SETTLEMENT_PATTERNS,
+    MARKETPLACE_CASHFLOW_BALANCE_PATTERNS,
+    MARKETPLACE_COMPETITOR_PATTERNS,
+    ALL_MARKETPLACE_PATTERN_GROUPS,
+    INVENTORY_PRODUCT_PATTERNS,
+    KNOWLEDGE_RAG_PATTERNS,
+    GREETING_PATTERNS,
+    GENERAL_INQUIRY_PATTERNS,
+    OUT_OF_SCOPE_PATTERNS,
+    RETRY_PATTERNS,
+    _CASUAL_NON_ERP_INTERROGATIVE_RE,
+    _match_any,
+    _find_first_match,
+    is_meta_question,
+)
 
 logger = logging.getLogger("router_node")
 
@@ -131,580 +199,6 @@ class MultiRouterDecision(BaseModel):
         return self
 
 
-class DecomposedSubQuestion(BaseModel):
-    """Single decomposed sub-question planned by LLM compound query decomposer."""
-    question_text: str = Field(..., description="Focused standalone question or command segment.")
-    intent_type: Literal["live_erp", "vector_rag", "general", "out_of_scope"] = Field(
-        "live_erp",
-        description="Execution intent: 'live_erp', 'vector_rag', 'general', or 'out_of_scope'."
-    )
-    planned_tools: List[PlannedToolCall] = Field(
-        default_factory=list,
-        description="ERP tool call(s) required for this sub-question when intent_type is 'live_erp'."
-    )
-    rag_query: Optional[str] = Field(
-        None,
-        description="Focused search query when intent_type is 'vector_rag'."
-    )
-
-
-class QueryDecompositionDecision(BaseModel):
-    """Structured output schema for decomposing compound multi-question prompts via LLM."""
-    sub_questions: List[DecomposedSubQuestion] = Field(
-        default_factory=list,
-        description="Ordered list of decomposed sub-questions present in the user prompt."
-    )
-
-
-# Disambiguation term sets
-CUSTOMER_TERMS = {"pelanggan", "customer", "piutang", "buyer", "klien"}
-VENDOR_TERMS = {"vendor", "supplier", "pemasok", "hutang"}
-PURCHASE_INVOICE_TERMS = ("faktur pembelian", "tagihan pembelian", "invoice pembelian")
-CUSTOMER_BILLING_TERMS = (
-    "tagihan",
-    "faktur",
-    "invoice",
-    "bill",
-    "piutang",
-    "hutang",
-    "pembayaran",
-    "bayar",
-)
-
-ACCOUNTING_PROFIT_LOSS_PATTERNS = [
-    r"\b(laba\s*(?:dan\s*)?rugi(?:nya)?|rugi\s*laba(?:nya)?|p&l|profit\s*(?:and|&)\s*loss|income\s*statement|omzet(?:nya)?|omset(?:nya)?|gross\s*margin|laba\s*kotor|laba\s*bersih)\b",
-]
-
-ACCOUNTING_BALANCE_SHEET_PATTERNS = [
-    r"\b(neraca(?:\s*keuangan)?|balance\s*sheet|posisi\s*keuangan|total\s*aset|aktiva\s*(?:dan\s*)?pasiva|keseimbangan\s*neraca)\b",
-]
-
-ACCOUNTING_GENERAL_LEDGER_PATTERNS = [
-    r"\b(buku\s*besar|general\s*ledger|ledger\s*akun|kartu\s*buku\s*besar|running\s*balance|mutasi\s*rekening)\b",
-]
-
-ACCOUNTING_BANK_RECON_PATTERNS = [
-    r"\b(rekonsiliasi\s*bank|bank\s*reconciliation|rekon\s*bank|selisih\s*(?:rekening\s*koran|bank)|statement\s*balance)\b",
-]
-
-ACCOUNTING_VENDOR_BILLS_PATTERNS = [
-    r"\b(vendor\s*bills?|ap\s*aging|umur\s*hutang|jatuh\s*tempo|overdue|due\s*soon)\b",
-]
-
-ACCOUNTING_BALANCE_PATTERNS = [
-    r"\bsaldo(nya)?\b",
-    r"\bbalance\b",
-    r"\bkas\b",
-    r"\bkas kecil\b",
-    r"\bbuku kas\b",
-    r"\bsaldo akun\b",
-]
-
-ACCOUNTING_JOURNAL_PATTERNS = [
-    r"\bjurnal(nya)?\b",
-    r"\bjournal\b",
-    r"\bentri jurnal\b",
-    r"\bdebit kredit\b",
-]
-
-INVENTORY_STOCK_PATTERNS = [
-    r"\bstok(nya)?\b",
-    r"\bstock(nya)?\b",
-    r"\bsisa barang(nya)?\b",
-    r"\bsisa stok(nya)?\b",
-    r"\bkuantitas(nya)?\b",
-    r"\bqty\b",
-    r"\bon hand\b",
-]
-
-INVENTORY_STOCK_HISTORY_PATTERNS = [
-    r"\bkartu\s+stok\b",
-    r"\briwayat\s+(mutasi|stok|pergerakan)\b",
-    r"\bmutasi\s+stok\b",
-    r"\bpergerakan\s+(stok|barang)\b",
-    r"\bbuku\s+besar\s+stok\b",
-    r"\bstock\s+history\b",
-    r"\bhistory\s+stok\b",
-    r"\bkartu\s+persediaan\b",
-]
-
-INVENTORY_TRANSFERS_PATTERNS = [
-    r"\bsurat\s+jalan\b",
-    r"\btransfer\s+(barang|gudang|stok|internal)\b",
-    r"\bmutasi\s+(antar\s+gudang|barang)\b",
-    r"\bpengiriman\s+barang\b",
-    r"\bpenerimaan\s+barang\b",
-    r"\bdelivery\s+order\b",
-    r"\bwh/(?:in|out)/\d+\b",
-    r"\bdokumen\s+transfer\b",
-]
-
-INVENTORY_LOW_STOCK_PATTERNS = [
-    r"\b(?:stok|stock)(?:nya)?\s+(?:paling\s+)?(?:menipis|habis|kritis|minimum|kurang|minus|sedikit|tersedikit|terkecil|terendah)\b",
-    r"\b(?:stok|stock)(?:nya)?\s+.*?(?:menipis|habis|kritis|minimum|tersedikit|terkecil|terendah|paling\s+sedikit)\b",
-    r"\b(?:produk|barang|item)\s+(?:yang\s+)?(?:stok|stock)(?:nya)?\s+(?:paling\s+)?(?:tersedikit|sedikit|terkecil|terendah|menipis|habis)\b",
-    r"\blow\s+stock\b",
-    r"\balert\s+stok\b",
-    r"\bstok\s+alert\b",
-    r"\bdi\s*bawah\s+minimum\b",
-    r"\bperingatan\s+stok\b",
-]
-
-INVENTORY_ADJUSTMENTS_PATTERNS = [
-    r"\bstock\s+opname\b",
-    r"\bstok\s+opname\b",
-    r"\bpenyesuaian\s+stok\b",
-    r"\badjustment\s+stok\b",
-    r"\bselisih\s+stok\b",
-    r"\bkoreksi\s+stok\b",
-    r"\bhasil\s+opname\b",
-]
-
-INVENTORY_SCRAP_PATTERNS = [
-    r"\bbarang\s+(rusak|cacat|scrap)\b",
-    r"\bscrap\s*(order|record)?\b",
-    r"\bpemusnahan\s+barang\b",
-    r"\bproduk\s+rusak\b",
-    r"\bcatatan\s+scrap\b",
-]
-
-INVENTORY_WAREHOUSES_PATTERNS = [
-    r"\bmaster\s+gudang\b",
-    r"\b(daftar|list)\s+master\s+gudang\b",
-    r"\bhierarki\s+gudang\b",
-    r"\bmaster\s+warehouses?\b",
-    r"\binfo\s+master\s+gudang\b",
-]
-
-INVENTORY_CATEGORIES_PATTERNS = [
-    r"\bkategori\s+(produk|barang)\b",
-    r"\bmaster\s+kategori\b",
-    r"\bdaftar\s+kategori\b",
-    r"\bproduct\s+categor(?:y|ies)\b",
-]
-
-INVENTORY_LOCATION_PATTERNS = [
-    r"\b(daftar|list|semua|info|data)\s+(lokasi|rak)\b",
-    r"\b(daftar|list)\s+(lokasi|rak)\b",
-    r"\bada\s+(lokasi|rak)\b",
-    r"\b(lokasi|rak)\s+(apa\s+saja|tersedia|aktif)\b",
-    r"^(lokasi|rak)\b",
-    r"\b(daftar|list|semua|info|data)\s+(gudang|lokasi|warehouse)\b",
-    r"\b(daftar|list)\s+(gudang|lokasi|warehouse)\b",
-    r"\bada\s+(gudang|lokasi|warehouse)\b",
-    r"\b(gudang|lokasi|warehouse)\s+(apa\s+saja|tersedia|aktif)\b",
-    r"^(gudang|lokasi|warehouse)\b",
-]
-
-SALES_TOP_PRODUCTS_PATTERNS = [
-    r"\b(?:produk|barang|item)\s+(?:dengan\s+)?(?:pendapatan|omset|omzet|penjualan|laba)\s+(?:tertinggi|terbanyak|terbesar|terlaris|teratas|top)\b",
-    r"\b(?:top|peringkat|daftar)\s+\d*\s*(?:produk|barang|item)\s+(?:terlaris|terbanyak|terbesar|omset|pendapatan)\b",
-    r"\b(?:pendapatan|omset|omzet|penjualan)\s+(?:tertinggi|terbesar)\s+(?:per\s+|tiap\s+)?(?:produk|barang|sku)\b",
-    r"\bproduk\s+terlaris\b",
-    r"\bproduk\s+paling\s+laku\b",
-    r"\bpenjualan\s+(?:terbanyak|tertinggi|terbesar)\s+(?:di\s*mana|cabang\s+mana|toko\s+mana|outlet\s+mana)\b",
-    r"\b(?:omzet|omset)\s+penjualan\s+sku\b",
-]
-
-SALES_SUMMARY_PATTERNS = [
-    r"\b(?:ringkasan|summary|performa|laporan)\s+(?:penjualan|sales|omzet|omset)\b",
-    r"\b(?:total|berapa)\s+(?:omzet|omset|penjualan)\b",
-    r"\b(?:omzet|omset)\s+(?:penjualan|bulan\s+ini|tahun\s+ini|hari\s+ini|kemarin|periode)\b",
-    r"\b(?:omzet|omset)\s+(?:cabang|perusahaan|toko)\b",
-    r"\b(?:omzet|omset|penjualan|sales)\s+(?:q[1-4]|kuartal\s*[1-4]|triwulan\s*[1-4]|semester\s*[12])\b",
-    r"\b(?:target|proyeksi|run[\s\-]?rate|pencapaian|tembus)\s+.*?(?:omzet|omset|penjualan|sales|target)\b",
-    r"\b(?:omzet|omset|penjualan|sales)\s+.*?(?:target|tembus|mencapai|proyeksi|run[\s\-]?rate|impact|dampak)\b",
-    r"\b(?:impact|dampak|pengaruh)(?:nya)?(?:\s+[a-z0-9\-]+){0,3}\s+(?:ke|terhadap)\s+(?:omzet|omset|penjualan)\b",
-    r"\b(?:rata-rata|aov)\s+(?:nilai\s+order|pesanan|penjualan)\b",
-]
-
-SALES_ORDER_DETAIL_PATTERNS = [
-    r"\b(?:detail|rincian|status|info|cek)\s+(?:so|sales\s*order|quotation|penawaran|pesanan|order)\s+(?:nomor\s+|no\s*)?([a-zA-Z0-9/\-_]+\d+[a-zA-Z0-9/\-_]*)\b",
-    r"\b(?:detail|rincian)\s+(?:so|sales\s*order|pesanan|order)\b",
-    r"\b(?:lacak|resi|awb)\s+(?:so|pesanan|order|pengiriman)\b",
-    r"\b(?:so|sales\s*order|quotation)\s*(?:nomor\s+|no\s*)?[a-zA-Z0-9/\-_]+\s+(?:status|detail|rincian)\b",
-    r"\bso/\d{4}/\d+\b",
-    r"\b[a-z]{2,5}/so/\d+\b",
-]
-
-SALES_CONTACTS_PATTERNS = [
-    r"\b(?:detail|info|data|cek|cari|lihat|daftar|list)\s+(?:contact|kontak)(?:nya)?\b",
-    r"\b(?:contact|kontak)(?:nya)?\s+(?:siapa(?:\s+saja)?|mana(?:\s+saja)?|apa(?:\s+saja)?)\b",
-    r"\bsiapa\s+(?:saja\s+)?(?:contact|kontak|pelanggan|customer|pembeli|buyer)(?:nya)?\b",
-    r"\b(?:daftar|list|top|peringkat(?:\s+teratas)?|rangking|ranking)\s+\d*\s*(?:contact|kontak|pelanggan|customer|pembeli|buyer)\b",
-    r"\b\d*\s*(?:pelanggan|customer|pembeli|buyer)\s+(?:dengan\s+)?(?:pembelian|belanja|order|transaksi|nilai)\s+(?:terbanyak|tertinggi|terbesar|teratas|paling\s+(?:banyak|besar|tinggi))\b",
-    r"\b(?:pelanggan|customer|pembeli|buyer)\s+.*?(?:paling\s+banyak\s+beli|paling\s+sering\s+beli|pembelian\s+terbanyak|belanja\s+terbesar|top\s+spender)\b",
-    r"\bsiapa\s+(?:saja\s+)?(?:(?:pelanggan|customer|pembeli|buyer)\s+)?(?:yang|yg)\s+paling\s+(?:banyak|sering)\s+(?:beli|belanja|order|transaksi)\b",
-    r"\b(?:nomor|no\.?)\s*(?:hp|wa|whatsapp|telp|telepon)\s+(?:contact|kontak|pelanggan|customer|pembeli)\b",
-    r"\b(?:contact|kontak)\s+(?:dari\s+|di\s+)?(?:wa|whatsapp|shopee|tiktok|tokopedia|lazada)\b",
-    r"\b(?:contact|kontak)\s+[a-zA-Z0-9]",
-]
-
-SALES_ORDERS_PATTERNS = [
-    r"\b(?:daftar|list|tampilkan|cari|cek|lihat|detail|rincian)\s+(?:so|sales\s*order|order\s+penjualan|pesanan\s+penjualan|quotation|penawaran)\b",
-    r"\b(?:so|sales\s*order|order\s+penjualan|pesanan|quotation|penawaran)\s+(?:terbaru|hari\s+ini|bulan\s+ini|kemarin|minggu\s+ini|pending|draft|cancel)\b",
-    r"\b(?:penjualan|omzet|omset|transaksi|nominal)\s+(?:ter\s*banyak|ter\s*besar|ter\s*tinggi|paling\s+(?:banyak|besar|tinggi))\s+(?:di\s+)?(?:quotation|penawaran|so|sales\s*order)\b",
-    r"\b(?:quotation|penawaran)\s+(?:mana|apa)\s+(?:yang\s+)?(?:penjualan(?:nya)?\s+|nominal(?:nya)?\s+|total(?:nya)?\s+)?(?:ter\s*banyak|ter\s*besar|ter\s*tinggi|paling\s+(?:banyak|besar|tinggi))\b",
-    r"\b(?:penjualan|order|pesanan|transaksi)\s+(?:di\s+|via\s+|lewat\s+|channel\s+)(?:wa|whatsapp|cust\s+datang|website\s+fp|goshop)\b",
-    r"\b(?:ada\s+berapa|daftar)\s+(?:pesanan|order)\s+(?:dari|customer|pelanggan)\b",
-    r"\bdaftar\s+pesanan\b",
-    r"\bpesanan\s+penjualan\b",
-]
-
-MARKETPLACE_WRITE_PATTERNS = [
-    r"\b(update|push|sinkron(?:kan)?|ubah|edit|naik(?:kan)?|turun(?:kan)?)\s+(?:data\s+)?(stok|stock|harga|price)\s+(?:ke\s+|di\s+)?(shopee|tiktok(?:\s*shop)?|tokopedia|lazada|marketplace)\b",
-    r"\b(proses|gabung|merge|perbaiki|fix|hapus)\s+(?:order\s*kilat|pesanan\s*kilat|reservasi\s*kilat|handling\s+kilat)\b",
-]
-
-MARKETPLACE_ACCOUNT_HEALTH_PATTERNS = [
-    r"\b(kesehatan\s+akun|account\s+health|cek\s+akun\s+marketplace|status\s+(?:akun|toko)\s+(?:marketplace|shopee|tiktok(?:\s*shop)?|tokopedia|lazada))\b",
-    r"\b(token\s+(?:oauth\s+)?(?:marketplace|shopee|tiktok(?:\s*shop)?|tokopedia|lazada)|token\s+(?:expired|kadaluarsa|habis|akan\s+habis|expiring))\b",
-    r"\b(gagal\s+fetch\s+order|fetch\s+order\s+error|moderasi\s+toko|accountorder|accountproperties)\b",
-    r"\b(akun\s+(?:marketplace|shopee|tiktok(?:\s*shop)?|tokopedia|lazada)\s+(?:mana\s+yang|yang\s+)?(?:bermasalah|error|expired|nonaktif|inactive|gagal))\b",
-    r"\b(penarikan\s+(?:data\s+|order\s+)?(?:marketplace|shopee|tiktok(?:\s*shop)?|tokopedia|lazada)|(?:nota|order|pesanan)\s+(?:marketplace|shopee|tiktok(?:\s*shop)?|tokopedia|lazada)\s+.*?(?:gagal|error|tertarik|di\s*tarik|di\s*proses))\b",
-    r"\b(?:gagal|error|bermasalah)\s+(?:di\s*)?(?:tarik|penarikan|proses|fetch|sync|sinkron)\s*.*?(?:marketplace|shopee|tiktok(?:\s*shop)?|tokopedia|lazada)\b",
-    r"\b(?:marketplace|shopee|tiktok(?:\s*shop)?|tokopedia|lazada)\s+.*?(?:gagal\s+(?:di\s*)?(?:tarik|proses|fetch)|penarikan\s+.*?gagal)\b",
-]
-
-MARKETPLACE_KILAT_PATTERNS = [
-    r"\b(pesanan\s+kilat|order\s+kilat|kilat\s+shopee|reservasi\s+kilat|no\.?\s*reservasi|no_reservasi|invoice_updated)\b",
-]
-
-MARKETPLACE_ORDERS_PATTERNS = [
-    r"\b(overdue\s+shipping|overdue\s+sla|lewat(?:i)?\s+batas\s+kirim|melewati\s+batas\s+kirim|batas\s+kirim|due\s+soon|missing\s+awb|belum\s+(?:punya|ada)\s+resi(?:\s+awb)?|tanpa\s+resi|status\s+mismatch|selisih\s+status\s+(?:erp|marketplace))\b",
-    r"\b(?:order|pesanan)\s+(?:marketplace|shopee|tiktok(?:\s*shop)?|tokopedia|lazada)\b",
-]
-
-MARKETPLACE_MAPPING_PATTERNS = [
-    r"\b(mapping\s+(?:produk|sku|marketplace)|product\s+mapping|produk\s+(?:marketplace\s+)?(?:yang\s+)?(?:belum|sudah)\s+ter-?mapping|unmapped(?:\s+sku)?|belum\s+(?:di|ter)-?mapping|qty_multiplier|duplikat\s+mapping|exception\s*product|masuk\s+exception)\b",
-]
-
-MARKETPLACE_STOCK_SYNC_SIM_PATTERNS = [
-    r"\b(simulasi\s+(?:update\s+|sinkronisasi\s+|push\s+)?stok|simulasi\s+stok\s+(?:marketplace|shopee|tiktok(?:\s*shop)?|tokopedia|lazada)|determine_stock|shared_stock|shared\s+stock|stok\s+(?:yang\s+)?(?:di-?push|dikirim)\s+ke\s+(?:marketplace|shopee|tiktok(?:\s*shop)?|tokopedia|lazada)|selisih\s+(?:kalkulasi\s+)?stok\s+(?:erp|gudang)\s+(?:vs|dan|dengan)\s+(?:marketplace|shopee|tiktok|log))\b",
-]
-
-MARKETPLACE_SYNC_LOGS_PATTERNS = [
-    r"\b(stockupdatelog|priceupdatelog|inventoryupdatepricelog|pcls\s+price)\b",
-    r"\b(log\s+(?:gagal|error|skip|sukses|eksekusi|update|sinkron(?:isasi)?)\s+(?:stok|stock|harga|price|marketplace|celery))\b",
-    r"\b(?:kenapa|mengapa|cek)\s+(?:update|sinkron(?:isasi)?)\s+(?:stok|stock|harga|price)\s+(?:atau\s+(?:harga|stok)\s+)?(?:marketplace|shopee|tiktok(?:\s*shop)?|tokopedia|lazada)?\s*(?:gagal|error|skip|tidak\s+update)\b",
-    r"\b(?:gagal|error)\s+(?:update|sinkron(?:isasi)?)\s+(?:stok|harga)\s+(?:marketplace|shopee|tiktok(?:\s*shop)?|tokopedia|lazada|celery)\b",
-]
-
-MARKETPLACE_PRICE_COMPARISON_PATTERNS = [
-    r"\b(?:bandingkan|perbandingan|selisih|compare)\s+harga\b.*?\b(?:marketplace|shopee|tiktok(?:\s*shop)?|tokopedia|lazada|pricelist|erp)\b",
-    r"\b(?:cek\s+|lihat\s+|berapa\s+)?harga\b.*?\bdi\s+(?:shopee|tiktok(?:\s*shop)?|tokopedia|lazada|marketplace)\b",
-    r"\b(?:harga\s+erp\s+vs\s+(?:harga\s+)?(?:shopee|tiktok(?:\s*shop)?|tokopedia|lazada|marketplace)|wholesalemp|harga\s+grosir\s+marketplace)\b",
-]
-
-MARKETPLACE_FEE_ANOMALIES_PATTERNS = [
-    r"\b(anomali\s+(?:potongan|fee|biaya|escrow)|high_fee|negative_fee|zero_income|erp_mp_mismatch|seller_expected_income|expected\s+income\s*(?:nol|0|minus|negatif))\b",
-    r"\b(potongan\s+(?:marketplace|shopee|tiktok(?:\s*shop)?|tokopedia|lazada)\s+(?:di\s*atas|lebih\s+dari|>=?|>)\s*\d+\s*%)\b",
-]
-
-MARKETPLACE_DEDUCTION_SETTLEMENT_PATTERNS = [
-    r"\b(?:rekap(?:itulasi)?|ringkasan|total|laporan|berapa|cek|lihat)\s+(?:potongan(?:\s+fee|\s+biaya)?|deduction|komisi|biaya\s+(?:layanan|admin|penanganan)|fee)\s+(?:marketplace|shopee|tiktok(?:\s*shop)?|tokopedia|lazada)\b",
-    r"\b(?:potongan(?:\s+fee|\s+biaya)?|deduction|biaya\s+(?:layanan|admin)|fee)\s+(?:dari\s+)?(?:marketplace|shopee|tiktok(?:\s*shop)?|tokopedia|lazada)\b",
-    r"\b(?:impact|dampak|pengaruh)(?:nya)?\s+.*?(?:potongan|deduction|fee|biaya\s+layanan|komisi|gagal\s+tarik|penarikan)\b",
-    r"\b(settlement\s+(?:marketplace\s+)?(?:mana\s+yang\s+)?belum\s+(?:ter-?)?posting|unposted\s+journal|revenue\s+history|gross\s+vs\s+nett)\b",
-]
-
-MARKETPLACE_CASHFLOW_BALANCE_PATTERNS = [
-    r"\b(saldo\s+(?:dompet|wallet|seller|escrow)|pending\s+escrow|pending\s+balance|available\s+balance|balance\s+snapshot|penarikan\s+dana|withdrawal\s+(?:marketplace|shopee|tiktok)|cashflow\s+(?:marketplace|shopee|tiktok))\b",
-    r"\b(?:saldo|dompet)\s+(?:toko\s+|akun\s+)?(?:shopee|tiktok(?:\s*shop)?|tokopedia|lazada)\b",
-]
-
-MARKETPLACE_COMPETITOR_PATTERNS = [
-    r"\b(kompetitor|competitor|pesaing|inspect\s+kompetitor|velocity\s+(?:penjualan\s+)?kompetitor|audit\s+kompetitor|belum\s+di-?audit|stale\s+audit|delta_sold_qty)\b",
-]
-
-ALL_MARKETPLACE_PATTERN_GROUPS = (
-    MARKETPLACE_ACCOUNT_HEALTH_PATTERNS
-    + MARKETPLACE_KILAT_PATTERNS
-    + MARKETPLACE_ORDERS_PATTERNS
-    + MARKETPLACE_MAPPING_PATTERNS
-    + MARKETPLACE_STOCK_SYNC_SIM_PATTERNS
-    + MARKETPLACE_SYNC_LOGS_PATTERNS
-    + MARKETPLACE_PRICE_COMPARISON_PATTERNS
-    + MARKETPLACE_FEE_ANOMALIES_PATTERNS
-    + MARKETPLACE_DEDUCTION_SETTLEMENT_PATTERNS
-    + MARKETPLACE_CASHFLOW_BALANCE_PATTERNS
-    + MARKETPLACE_COMPETITOR_PATTERNS
-)
-
-INVENTORY_VELOCITY_FORECAST_PATTERNS = [
-    r"\b(fast\s*[-]?\s*moving|slow\s*[-]?\s*moving|low\s*[-]?\s*moving|dead\s+stock)\b",
-    r"\b(forecast(?:ing)?)\s+.*?(?:stok|stock|order|produk|barang|restock|penjualan|permintaan)\b",
-    r"\b(?:stok|stock|produk|barang)\s+.*?(?:fast\s*[-]?\s*moving|slow\s*[-]?\s*moving|low\s*[-]?\s*moving|forecast(?:ing)?|perputaran|turnover)\b",
-    r"\b(?:mana\s+yang\s+|produk\s+(?:mana\s+)?(?:yang\s+)?)?(?:harus\s+(?:segera\s+)?di\s*[-]?\s*order|segera\s+di\s*[-]?\s*restock|rekomendasi\s+(?:restock|order))\b",
-    r"\bperputaran\s+(?:stok|stock|barang|produk)\b",
-]
-
-INVENTORY_PRODUCT_PATTERNS = [
-    r"\bproduk(nya)?\b",
-    r"\bproduct\b",
-    r"\bharga(nya)?\b",
-    r"\bharga\s+(barang|jual|beli)?(nya)?\b",
-    r"\bharga barang\b",
-    r"\bharga jual\b",
-    r"\bharga beli\b",
-    r"\bdetail barang\b",
-    r"\bsku\b",
-    r"\bbarcode\b",
-    r"\bvarian\b",
-]
-
-KNOWLEDGE_RAG_PATTERNS = [
-    r"\bsop\b",
-    r"\bkebijakan\b",
-    r"\bprosedur\b",
-    r"\baturan\b",
-    r"\b(per)?syarat(an)?\b",
-    r"\b(ke)?tentuan\b",
-    r"\b(di|me)?retur(kan)?(nya)?\b",
-    r"\b(ber)?garansi\b",
-    r"\bspesifikasi\b",
-    r"\b(gsm|gramasi|ketebalan)\b",
-    r"\bprofil\s+(vendor|supplier|customer|pelanggan)\b",
-    r"\btermin\s+(pembayaran|kredit)\b",
-    r"\bcara\s+(klaim|retur|pengajuan)\b",
-    r"\b(di)?klaim\b",
-]
-
-GREETING_PATTERNS = [
-    r"^(halo|hai|hi|hey|hei|helo|hello)\b",
-    r"^(selamat\s+(pagi|siang|sore|malam|petang))\b",
-    r"^(assalamu\s*['’]?alaikum|sampurasun|kulonuwun)\b",
-    r"^(ping|p\b|tes|test|testing)\b",
-    r"^(terima\s*kasih|makasih|thanks|thank\s*you|matur\s*nuwun)\b",
-]
-
-GENERAL_INQUIRY_PATTERNS = [
-    r"^(bisa\s+(?:bantu\s+apa|apa\s+aja|melakukan\s+apa)|kamu\s+(?:siapa|bisa\s+apa(?:\s+aja)?)|anda\s+bisa\s+apa(?:\s+aja)?|fitur\s+apa(?:\s+aja)?|menu|help|bantuan|siapa\s+kamu|apa\s+yang\s+bisa\s+(?:kamu|anda)\s+(?:lakukan|bantu))\b",
-]
-
-_META_QUESTION_RE = re.compile(
-    r"^(?:(?:jadi|terus|lalu|nah|oh\s+ya)\s+)?(?:"
-    r"(?:periode|rentang\s+(?:waktu|tanggal)|tanggal)\s+(?:data\s+)?(?:yang|yg)\s+(?:kamu\s+|anda\s+)?(?:pakai|gunakan|dicek|cek|tampilkan|ditampilkan)\s+(?:kapan|berapa|mana)"
-    r"|kapan\s+periode\s+(?:data\s+)?(?:yang|yg)\s+(?:kamu\s+|anda\s+)?(?:pakai|gunakan)"
-    r"|(?:company|perusahaan|cabang)\s+(?:mana\s+(?:aja|saja)|apa\s+(?:aja|saja))(?:\s+(?:yang|yg)\s+(?:kamu\s+|anda\s+)?(?:pakai|gunakan|aktif|terdaftar|ada|tersedia|dicek))?"
-    r"|(?:yang|yg)\s+(?:kamu\s+|anda\s+)?pakai\s+(?:company|perusahaan|cabang)\s+(?:mana|apa)"
-    r"|(?:data|database|erp|sistem)\s+(?:terbaru|terakhir|paling\s+baru|cutoff|update)(?:\s+(?:tanggal|tgl|sampai|sejak|dari))?(?:\s+(?:kapan|berapa))?"
-    r"|(?:tanggal|tgl)\s+(?:data|update)\s+(?:terbaru|terakhir)(?:\s+(?:kapan|berapa))?"
-    r"|sampai\s+tanggal\s+berapa\s+data(?:\s+erp)?(?:\s+(?:tersedia|ada|terbaru))?"
-    r")$",
-    re.IGNORECASE,
-)
-
-_CASUAL_NON_ERP_INTERROGATIVE_RE = re.compile(
-    r"\b(?:(?:kamu|anda|lu|elo)\s+(?:tau|tahu|kenal|suka|pernah|bisa\s+masak|nonton)|(?:tau|tahu)\s+(?:enggak|nggak|gak|ga)\s+(?:tentang|soal)?)\b",
-    re.IGNORECASE,
-)
-
-def is_meta_question(text: str) -> bool:
-    """Return True if user asks about active session period, company scope, or latest ERP date."""
-    cleaned = re.sub(r"[?!.,;:'\"]+$", "", (text or "").strip())
-    return bool(_META_QUESTION_RE.match(cleaned))
-
-OUT_OF_SCOPE_PATTERNS = [
-    r"\b(system\s*design|arsitektur\s*(sistem)?|source\s*code|prompt\s*(kamu|anda)|system\s*prompt)\b",
-    r"\b(buatkan\s+(puisi|cerita|kode|script)|ceritakan\s+(lelucon|dongeng)|siapa\s+presiden|ramalan\s+cuaca)\b",
-]
-
-RETRY_PATTERNS = [
-    r"^(?:(?:bisa\s+)?tolong\s+|mohon\s+|silakan\s+|bisa\s+)?(?:coba\s+(?:(?:di)?cek\s+|(?:di)?periksa\s+|(?:di)?cari\s+|(?:di)?lihat\s+)?(?:lagi|ulang)|(?:coba\s+)?(?:di)?cek\s+(?:sekali\s+)?(?:lagi|ulang)|(?:coba\s+)?(?:di)?periksa\s+(?:sekali\s+)?(?:lagi|ulang)|(?:coba\s+)?(?:di)?cari\s+(?:sekali\s+)?(?:lagi|ulang)|ulang(i)?|coba\s+ulang|ulangi\s+lagi|sekali\s+lagi|coba\s+sekali\s+lagi|retry|tes\s+lagi)(?:\s+dong|\s+ya|\s+deh|\s+bro|\s+kak|\s+mas|\s+mbak|\s+min|\s+gan|\s+pak|\s+bu)?$",
-]
-
-
-def _match_any(patterns: list, text: str) -> bool:
-    """Check if any regex pattern matches the text."""
-    for pattern in patterns:
-        if re.search(pattern, text, re.IGNORECASE):
-            return True
-    return False
-
-
-def _find_first_match(patterns: list, text: str) -> Optional[re.Match]:
-    """Find the earliest regex pattern match in text."""
-    best: Optional[re.Match] = None
-    for pattern in patterns:
-        m = re.search(pattern, text, re.IGNORECASE)
-        if m:
-            if best is None or m.start() < best.start():
-                best = m
-    return best
-
-
-_ABBREV_DOT_RE = re.compile(
-    r"\b(PT|CV|UD|PD|TB|FA|No|Rp|Jl|Dr|Mr|Mrs|Ms|St|a\.n|s\.d|e\.g|i\.e)\.",
-    re.IGNORECASE,
-)
-_CLAUSE_INTERROGATIVE_OR_VERB_RE = re.compile(
-    r"^(?:(?:tolong|coba|mohon|silakan|boleh)\s+)*"
-    r"(?:berapa(?:kah)?|apa(?:kah)?|siapa(?:kah)?|kenapa|mengapa|bagaimana|gimana|"
-    r"dimana|di\s+mana|kapan|mana(?:kah)?|"
-    r"cek|dicek|cari|dicari|tampilkan|lihat|lihatin|bandingkan|periksa|diperiksa|"
-    r"hitung|rekap|jelaskan|sebutkan|kasih\s+tau)\b",
-    re.IGNORECASE,
-)
-_PURE_GREETING_ONLY_RE = re.compile(
-    r"^(?:halo|hai|hi|hey|hei|helo|hello|selamat\s+(?:pagi|siang|sore|malam|petang)|"
-    r"assalamu\s*['’]?alaikum|permisi|pagi|siang|sore|malam)(?:\s+(?:min|kak|mas|mbak|gan|bro|pak|bu))?$",
-    re.IGNORECASE,
-)
-_PROTECTED_CONJUNCTION_PAIR_RE = re.compile(
-    r"(?:\b(?:laba|rugi)\s+(?:dan|&)\s+(?:rugi|laba)|"
-    r"\bprofit\s+(?:and|&)\s+loss|"
-    r"\baktiva\s+dan\s+pasiva|"
-    r"\bsemua\s+cabang\s+dan\s+(?:ho|headoffice|head\s*office)|"
-    r"\bharga\s+(?:jual|beli)\s+dan\s+(?:barcode|estimasi\s+hpp|hpp|beli|jual)|"
-    r"\b(?:stok|stock)\s+(?:atau|dan)\s+(?:harga|price))\b",
-    re.IGNORECASE,
-)
-
-
-def _split_conjunction_clauses(segment: str) -> List[str]:
-    """
-    Split a single sentence on coordinating conjunctions/commas only when the right side
-    begins an independent question or imperative command.
-    """
-    if not segment or len(segment) < 6:
-        return [segment] if segment else []
-
-    splitter_re = re.compile(
-        r"\s*(?:,\s*(?:dan|lalu|kemudian|serta|sekaligus|juga)\s+|"
-        r"\b(?:dan|serta|sekaligus|lalu|kemudian)\b|"
-        r"(?<!\d),(?!\d))\s*",
-        re.IGNORECASE,
-    )
-    matches = list(splitter_re.finditer(segment))
-    if not matches:
-        return [segment]
-
-    clauses: List[str] = []
-    start_idx = 0
-    for m in matches:
-        left_part = segment[start_idx:m.start()].strip(" ,.;:-\t")
-        right_part = segment[m.end():].strip(" ,.;:-\t")
-        if not left_part or not right_part:
-            continue
-        # Never split inside protected domain phrases (e.g. 'laba dan rugi', 'semua cabang dan HO')
-        window = segment[max(0, m.start() - 25):min(len(segment), m.end() + 25)]
-        if _PROTECTED_CONJUNCTION_PAIR_RE.search(window):
-            continue
-        # Keep evaluative/velocity clauses cohesive (e.g. 'forecasting ... fastmoving ... dan berikan kenapa alasannya')
-        if re.search(r"\b(?:fast\s*[-]?\s*moving|slow\s*[-]?\s*moving|low\s*[-]?\s*moving|dead\s+stock|forecast(?:ing)?|segera\s+di\s*[-]?\s*order|rekomendasi\s+(?:restock|order))\b", left_part, re.IGNORECASE):
-            if re.match(r"^(?:mana\s+produk\b|(?:berikan|jelaskan|sebutkan|tolong|kasih\s+tau)?\s*(?:kenapa|mengapa)?\s*alasannya\b)", right_part, re.IGNORECASE):
-                continue
-        if re.match(r"^(?:(?:berikan|jelaskan|sebutkan|tolong|kasih\s+tau)\s+)?(?:kenapa|mengapa)?\s*alasannya\b", right_part, re.IGNORECASE):
-            continue
-        # Do not split off pure greetings ('Halo, cek stok...')
-        if _PURE_GREETING_ONLY_RE.match(left_part):
-            continue
-        if len(left_part.split()) >= 2 and _CLAUSE_INTERROGATIVE_OR_VERB_RE.match(right_part):
-            clauses.append(left_part)
-            start_idx = m.end()
-
-    tail = segment[start_idx:].strip()
-    if tail:
-        clauses.append(tail)
-    return clauses or [segment]
-
-
-def decompose_user_query(query: str) -> List[str]:
-    """
-    Deterministically decompose a multi-question prompt into ordered sub-questions.
-    Splits on newlines, numbered/bulleted lines, sentence terminators (?, !, ;, non-abbrev .),
-    and coordinating conjunctions introducing a new question or imperative verb.
-    """
-    raw = (query or "").strip()
-    if not raw:
-        return []
-
-    # Protect abbreviations, decimals, and slash document numbers from period splitting
-    placeholder = "\u0000"
-    protected = _ABBREV_DOT_RE.sub(lambda m: f"{m.group(1)}{placeholder}", raw)
-    protected = re.sub(r"(\d)\.(\d)", rf"\1{placeholder}\2", protected)
-
-    # 1. Split on newlines and sentence terminators (? ! ; or non-numeric .)
-    primary_segments: List[str] = []
-    for line in re.split(r"[\r\n]+", protected):
-        line_clean = line.strip()
-        if not line_clean:
-            continue
-        # Strip leading list marker only when multiline or numbered list
-        if "\n" in raw or re.match(r"^\d+[.)]\s+", line_clean):
-            line_clean = re.sub(r"^(?:\d+[.)]\s+|[-*•]\s+)", "", line_clean).strip()
-        # Split sentences inside the line
-        sent_parts = re.split(r"(?<=[?!;])\s+|(?<!\d)\.(?!\d)(?=\s+[^\s])", line_clean)
-        for sp in sent_parts:
-            sp_restored = sp.replace(placeholder, ".").strip()
-            # Strip dangling coordinating conjunction after '?' (e.g., "Apa SOP retur? dan berapa...")
-            sp_restored = re.sub(
-                r"^(?:dan|lalu|kemudian|serta|juga|terus)\s+(?=(?:berapa|apa|siapa|kenapa|mengapa|bagaimana|gimana|dimana|di\s+mana|kapan|mana|cek|cari|tampilkan|lihat|tolong|coba)\b)",
-                "",
-                sp_restored,
-                flags=re.IGNORECASE,
-            ).strip()
-            if sp_restored:
-                primary_segments.append(sp_restored)
-
-    if not primary_segments:
-        return [raw]
-
-    # 2. Split coordinating clauses inside each sentence when right side is an independent question/command
-    final_clauses: List[str] = []
-    for seg in primary_segments:
-        final_clauses.extend(_split_conjunction_clauses(seg))
-
-    # Merge leading pure greeting into the first substantive clause if present
-    if len(final_clauses) > 1 and _PURE_GREETING_ONLY_RE.match(final_clauses[0].rstrip("?!., ")):
-        final_clauses[1] = f"{final_clauses[0]} {final_clauses[1]}".strip()
-        final_clauses.pop(0)
-
-    return final_clauses or [raw]
-
-
-def _extract_sub_queries(query: str, candidates: List[Tuple[str, str, int]]) -> List[str]:
-    """
-    Split multi-intent query into focused sub-queries along sentence boundaries and Indonesian conjunctions.
-    Falls back to the full query if clause count does not align with candidates count.
-    """
-    if len(candidates) <= 1:
-        return [query] * len(candidates)
-
-    decomposed = decompose_user_query(query)
-    if len(decomposed) == len(candidates):
-        return decomposed
-
-    parts = re.split(r"\b(?:dan|serta|sekaligus|juga|lalu)\b|;|(?<!\d),(?!\d)|(?<=[?!])\s+", query, flags=re.IGNORECASE)
-    cleaned_parts = [p.strip() for p in parts if p.strip()]
-
-    if len(cleaned_parts) == len(candidates):
-        return cleaned_parts
-
-    return [query] * len(candidates)
-
-
-def is_retry_query(text: str) -> bool:
-    """Check if the text represents a conversational retry command."""
-    cleaned = (text or "").strip().rstrip("?!.,;: '\"").lower()
-    return _match_any(RETRY_PATTERNS, cleaned)
-
-
-def find_previous_user_query(messages: Optional[List[BaseMessage]]) -> Optional[str]:
-    """
-    Find the most recent HumanMessage content prior to the current turn that is not a retry command.
-    """
-    if not messages:
-        return None
-    for msg in reversed(messages[:-1]):
-        if isinstance(msg, HumanMessage):
-            content = getattr(msg, "content", "") or ""
-            content_str = str(content).strip()
-            if content_str and not is_retry_query(content_str):
-                return content_str
-    return None
-
 
 def _find_previous_erp_query(messages: Optional[List[BaseMessage]]) -> Optional[str]:
     """
@@ -724,8 +218,8 @@ def _find_previous_erp_query(messages: Optional[List[BaseMessage]]) -> Optional[
                     "accounting", "inventory", "sales", "marketplace"
                 ):
                     return content_str
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("Prior ERP query probe failed: %s", exc)
     return find_previous_user_query(messages)
 
 
@@ -792,8 +286,9 @@ def classify_query_rule_based(query: str) -> Optional[Dict[str, Any]]:
     has_vendor = any(re.search(rf"\b{re.escape(term)}(nya)?\b", cleaned) for term in VENDOR_TERMS)
     has_purchase_invoice = any(kw in cleaned for kw in PURCHASE_INVOICE_TERMS)
     is_rag = _match_any(KNOWLEDGE_RAG_PATTERNS, cleaned)
+    is_greeting_or_general = _match_any(GREETING_PATTERNS, cleaned) or _match_any(GENERAL_INQUIRY_PATTERNS, cleaned)
 
-    # 0. Sapaan / Percakapan Kasual / Bantuan Cepat / Meta-Questions
+    # 0. Session Meta-Questions (period / company scope / latest ERP date)
     if is_meta_question(cleaned):
         return {
             "detected_domain": "general",
@@ -805,34 +300,6 @@ def classify_query_rule_based(query: str) -> Optional[Dict[str, Any]]:
             "detected_tools": [],
             "active_tools": [],
         }
-    if _match_any(GREETING_PATTERNS, cleaned) or _match_any(GENERAL_INQUIRY_PATTERNS, cleaned):
-        has_erp_intent = (
-            _match_any(ACCOUNTING_BALANCE_PATTERNS, cleaned)
-            or _match_any(ACCOUNTING_JOURNAL_PATTERNS, cleaned)
-            or _match_any(ACCOUNTING_PROFIT_LOSS_PATTERNS, cleaned)
-            or _match_any(ACCOUNTING_BALANCE_SHEET_PATTERNS, cleaned)
-            or _match_any(ACCOUNTING_GENERAL_LEDGER_PATTERNS, cleaned)
-            or _match_any(ACCOUNTING_BANK_RECON_PATTERNS, cleaned)
-            or _match_any(ACCOUNTING_VENDOR_BILLS_PATTERNS, cleaned)
-            or _match_any(INVENTORY_STOCK_PATTERNS, cleaned)
-            or _match_any(INVENTORY_LOCATION_PATTERNS, cleaned)
-            or _match_any(INVENTORY_PRODUCT_PATTERNS, cleaned)
-            or _match_any(ALL_MARKETPLACE_PATTERN_GROUPS, cleaned)
-            or has_vendor
-            or has_purchase_invoice
-            or is_rag
-        )
-        if not has_erp_intent:
-            return {
-                "detected_domain": "general",
-                "detected_tool": None,
-                "query_mode": "general",
-                "rag_query": None,
-                "is_multi_tool": False,
-                "detected_domains": ["general"],
-                "detected_tools": [],
-                "active_tools": [],
-            }
 
     # 0.1 Fast-Path Out-of-Scope Guardrail (including direct marketplace write attempts)
     is_mp_diagnostic_q = bool(
@@ -1088,10 +555,6 @@ def classify_query_rule_based(query: str) -> Optional[Dict[str, Any]]:
         if m_stock:
             explicit_catalog_patterns = [
                 r"\bharga(nya)?\b",
-                r"\bharga\s+(barang|jual|beli)?(nya)?\b",
-                r"\bharga barang\b",
-                r"\bharga jual\b",
-                r"\bharga beli\b",
                 r"\bdetail barang\b",
                 r"\bvarian\b",
                 r"\bkategori\b",
@@ -1222,6 +685,19 @@ def classify_query_rule_based(query: str) -> Optional[Dict[str, Any]]:
             "active_tools": active_tools,
         }
 
+    # 5. Greeting / General Conversational Inquiry (only when no ERP/RAG intent matched)
+    if is_greeting_or_general:
+        return {
+            "detected_domain": "general",
+            "detected_tool": None,
+            "query_mode": "general",
+            "rag_query": None,
+            "is_multi_tool": False,
+            "detected_domains": ["general"],
+            "detected_tools": [],
+            "active_tools": [],
+        }
+
     return None
 
 
@@ -1253,7 +729,6 @@ def _should_hq_auto_expand(
     multi_cids: List[int],
     detected_tool: Optional[str],
     query_low: str,
-    has_anaphoric_reference_fn: Any,
 ) -> bool:
     """
     Determine whether an active HQ/Pusat session should automatically expand across branches:
@@ -1275,9 +750,55 @@ def _should_hq_auto_expand(
                 r"\b(?:quotation\s+mana|penjualan\s+.*?\s+mana|apakah\s+ada\s+penjualan|ter\s*banyak\s+di\s+quotation)\b",
                 query_low,
             )
-            or has_anaphoric_reference_fn(query_low)
+            or has_anaphoric_reference(query_low)
         )
     return False
+
+
+def _compute_company_scope(
+    text: str,
+    state: AgentState,
+    detected_tool: Optional[str],
+    fallback_to_active: bool = False,
+) -> Optional[Tuple[int, List[int], bool]]:
+    """Resolve (company_id, company_ids, is_multi_company) from text and prior state."""
+
+    multi_cids, is_all = resolve_all_branch_company_ids(text)
+    explicit_single = resolve_branch_company_id(text)
+    text_low = (text or "").lower()
+    active_cid = int(state.get("company_id") or settings.DEFAULT_COMPANY_ID)
+
+    is_branch_ranking = bool(
+        detected_tool in ("get_top_selling_products", "get_stock_level")
+        and re.search(r"\b(?:di\s*mana|cabang\s+mana|toko\s+mana|outlet\s+mana|gudang\s+mana)\b", text_low)
+    )
+    is_hq_expand = _should_hq_auto_expand(
+        active_cid=active_cid,
+        explicit_single=explicit_single,
+        multi_cids=multi_cids,
+        detected_tool=detected_tool,
+        query_low=text_low,
+    )
+
+    if is_all or (is_branch_ranking and explicit_single is None and not multi_cids) or is_hq_expand:
+        auth_cids = [int(c) for c in (state.get("authorized_company_ids") or []) if c]
+        eff_cids = auth_cids if (is_hq_expand and len(auth_cids) > 1) else list(COMPANY_NAME_MAP.keys())
+        return eff_cids[0], eff_cids, True
+    if len(multi_cids) > 1:
+        return multi_cids[0], multi_cids, True
+    if explicit_single is not None or len(multi_cids) == 1:
+        cid = explicit_single if explicit_single is not None else multi_cids[0]
+        return cid, [cid], False
+    if state.get("is_multi_company") and state.get("company_ids"):
+        eff_cids = [int(c) for c in state["company_ids"] if c]
+        if len(eff_cids) > 1 or not fallback_to_active:
+            return (eff_cids or [active_cid])[0], eff_cids, True
+    recovered_mc = resolve_prior_multi_company_scope(state.get("messages"), text)
+    if recovered_mc and (len(recovered_mc) > 1 or not fallback_to_active):
+        return recovered_mc[0], recovered_mc, True
+    if fallback_to_active:
+        return active_cid, [active_cid], False
+    return None
 
 
 def _annotate_multi_company(res: Dict[str, Any], state: AgentState, user_query: str) -> Dict[str, Any]:
@@ -1285,63 +806,17 @@ def _annotate_multi_company(res: Dict[str, Any], state: AgentState, user_query: 
         return res
     if res.pop("_per_clause_company_scoped", False):
         return res
-    from app.graph.nodes.extractor import (
-        resolve_all_branch_company_ids,
-        resolve_branch_company_id,
-        resolve_prior_multi_company_scope,
-        COMPANY_NAME_MAP,
-        has_anaphoric_reference,
-    )
-    multi_cids, is_all = resolve_all_branch_company_ids(user_query)
-    explicit_single = resolve_branch_company_id(user_query)
-
-    q_low = (user_query or "").lower()
-    active_cid = state.get("company_id")
-
-    is_branch_ranking_query = bool(
-        res.get("detected_tool") in ("get_top_selling_products", "get_stock_level")
-        and re.search(r"\b(?:di\s*mana|cabang\s+mana|toko\s+mana|outlet\s+mana|gudang\s+mana)\b", q_low)
-    )
-    is_hq_cross_branch_q = _should_hq_auto_expand(
-        active_cid=active_cid,
-        explicit_single=explicit_single,
-        multi_cids=multi_cids,
+    scope = _compute_company_scope(
+        user_query,
+        state=state,
         detected_tool=res.get("detected_tool"),
-        query_low=q_low,
-        has_anaphoric_reference_fn=has_anaphoric_reference,
+        fallback_to_active=False,
     )
-
-    if is_all or (is_branch_ranking_query and explicit_single is None and not multi_cids) or is_hq_cross_branch_q:
-        auth_cids = [int(c) for c in (state.get("authorized_company_ids") or []) if c]
-        if is_hq_cross_branch_q and len(auth_cids) > 1:
-            effective_cids = auth_cids
-        else:
-            effective_cids = list(COMPANY_NAME_MAP.keys())
-        res["is_multi_company"] = True
-        res["company_ids"] = effective_cids
-        res["company_id"] = effective_cids[0]
-    elif len(multi_cids) > 1:
-        res["is_multi_company"] = True
-        res["company_ids"] = multi_cids
-        res["company_id"] = multi_cids[0]
-    elif explicit_single is not None or len(multi_cids) == 1:
-        # Explicit single company overrides prior multi-company state
-        target_cid = explicit_single if explicit_single is not None else multi_cids[0]
-        res["is_multi_company"] = False
-        res["company_id"] = target_cid
-        res["company_ids"] = [target_cid]
-    elif state.get("is_multi_company") and state.get("company_ids"):
-        # Follow-up without branch mention inherits prior multi-company scope
-        effective_cids = [int(c) for c in state.get("company_ids") if c]
-        res["is_multi_company"] = True
-        res["company_ids"] = effective_cids
-        res["company_id"] = (effective_cids or [1])[0]
-    else:
-        recovered_mc = resolve_prior_multi_company_scope(state.get("messages"), user_query)
-        if recovered_mc:
-            res["is_multi_company"] = True
-            res["company_ids"] = recovered_mc
-            res["company_id"] = recovered_mc[0]
+    if scope is not None:
+        cid, cids, is_mc = scope
+        res["is_multi_company"] = is_mc
+        res["company_id"] = cid
+        res["company_ids"] = cids
     return res
 
 
@@ -1361,48 +836,15 @@ def _resolve_clause_company_scope(
     detected_tool: Optional[str],
 ) -> Tuple[int, List[int], bool]:
     """Resolve company_id, company_ids, and is_multi_company strictly for one sub-question clause."""
-    from app.graph.nodes.extractor import (
-        resolve_all_branch_company_ids,
-        resolve_branch_company_id,
-        resolve_prior_multi_company_scope,
-        COMPANY_NAME_MAP,
-        has_anaphoric_reference,
-    )
-
-    multi_cids, is_all = resolve_all_branch_company_ids(clause)
-    explicit_single = resolve_branch_company_id(clause)
-    c_low = (clause or "").lower()
-    active_cid = int(state.get("company_id") or settings.DEFAULT_COMPANY_ID)
-
-    is_branch_ranking = bool(
-        detected_tool in ("get_top_selling_products", "get_stock_level")
-        and re.search(r"\b(?:di\s*mana|cabang\s+mana|toko\s+mana|outlet\s+mana|gudang\s+mana)\b", c_low)
-    )
-    is_hq_expand = _should_hq_auto_expand(
-        active_cid=active_cid,
-        explicit_single=explicit_single,
-        multi_cids=multi_cids,
+    scope = _compute_company_scope(
+        clause,
+        state=state,
         detected_tool=detected_tool,
-        query_low=c_low,
-        has_anaphoric_reference_fn=has_anaphoric_reference,
+        fallback_to_active=True,
     )
-
-    if is_all or (is_branch_ranking and explicit_single is None and not multi_cids) or is_hq_expand:
-        auth_cids = [int(c) for c in (state.get("authorized_company_ids") or []) if c]
-        eff_cids = auth_cids if (is_hq_expand and len(auth_cids) > 1) else list(COMPANY_NAME_MAP.keys())
-        return eff_cids[0], eff_cids, True
-    if len(multi_cids) > 1:
-        return multi_cids[0], multi_cids, True
-    if explicit_single is not None or len(multi_cids) == 1:
-        cid = explicit_single if explicit_single is not None else multi_cids[0]
-        return cid, [cid], False
-    if state.get("is_multi_company") and state.get("company_ids"):
-        eff_cids = [int(c) for c in state["company_ids"] if c]
-        if len(eff_cids) > 1:
-            return eff_cids[0], eff_cids, True
-    recovered_mc = resolve_prior_multi_company_scope(state.get("messages"), clause)
-    if recovered_mc and len(recovered_mc) > 1:
-        return recovered_mc[0], recovered_mc, True
+    if scope is not None:
+        return scope
+    active_cid = int(state.get("company_id") or settings.DEFAULT_COMPANY_ID)
     return active_cid, [active_cid], False
 
 
@@ -1488,75 +930,80 @@ def _invoke_llm_clause_router(
         return None
 
 
-def _route_decomposed_clauses(
+def _build_dynamic_clause_result(dyn_cands: List[Dict[str, Any]], clause: str) -> Optional[Dict[str, Any]]:
+    """Build normalized single-clause route result from semantic tool retrieval candidates."""
+    if not dyn_cands:
+        return None
+    best = dyn_cands[0]
+    return {
+        "detected_domain": best["domain"],
+        "detected_tool": best["tool_name"],
+        "query_mode": "live_erp",
+        "rag_query": None,
+        "is_multi_tool": False,
+        "detected_domains": [best["domain"]],
+        "detected_tools": [best["tool_name"]],
+        "active_tools": [{
+            "tool": best["tool_name"],
+            "domain": best["domain"],
+            "sub_query": clause,
+            "params": {},
+            "status": "pending",
+        }],
+    }
+
+
+def _classify_decomposed_clauses_core(
     clauses: List[str],
-    user_query: str,
     state: AgentState,
     model: Optional[BaseChatModel],
-) -> Dict[str, Any]:
-    """
-    Route multiple decomposed sub-questions independently, applying smart merge
-    for identical same-branch/location stock queries and isolating per-clause company scopes.
-    """
-    from app.graph.nodes.extractor import has_anaphoric_reference
-    from app.services.tool_registry_service import get_tool_registry_service
-
-    # Optional explicit shared leading branch scope prefix (e.g., "Untuk cabang Surabaya: ...")
+    model_factory: Optional[Callable[[], Optional[BaseChatModel]]] = None,
+) -> Tuple[List[str], str, List[Tuple[int, str, Optional[Dict[str, Any]]]]]:
+    """Run rule and lazy LLM classification on each decomposed clause before dynamic fallback."""
     shared_prefix_clause = ""
-    if clauses:
+    working_clauses = list(clauses)
+    if working_clauses:
         m_prefix = re.match(
             r"^\s*((?:untuk|di)\s+(?:cabang\s+|toko\s+|kantor\s+)?[A-Za-z0-9\s]+?)\s*:\s*(.+)$",
-            clauses[0],
+            working_clauses[0],
             re.IGNORECASE,
         )
         if m_prefix:
-            from app.graph.nodes.extractor import resolve_branch_company_id
             if resolve_branch_company_id(m_prefix.group(1)) is not None:
                 shared_prefix_clause = m_prefix.group(1).strip()
-                clauses = [m_prefix.group(2).strip()] + list(clauses[1:])
+                working_clauses = [m_prefix.group(2).strip()] + list(working_clauses[1:])
+
+    classified_items: List[Tuple[int, str, Optional[Dict[str, Any]]]] = []
+    for q_idx, raw_clause in enumerate(working_clauses):
+        clause = raw_clause.strip()
+        if not clause:
+            continue
+        c_res = classify_query_rule_based(clause)
+        if c_res is None:
+            active_model = model if model is not None else (model_factory() if model_factory else None)
+            if active_model is not None:
+                c_res = _invoke_llm_clause_router(clause, state, active_model)
+        classified_items.append((q_idx, clause, c_res))
+
+    return working_clauses, shared_prefix_clause, classified_items
+
+
+def _assemble_decomposed_route(
+    clauses: List[str],
+    shared_prefix_clause: str,
+    classified_items: List[Tuple[int, str, Optional[Dict[str, Any]]]],
+    user_query: str,
+    state: AgentState,
+) -> Dict[str, Any]:
+    """Assemble final multi-question state delta from classified clauses."""
+    from app.services.tool_registry_service import get_tool_registry_service
 
     collected_plans: List[Dict[str, Any]] = []
     rag_queries: List[str] = []
     non_tool_questions: List[Dict[str, Any]] = []
     first_explicit_scope: Optional[Tuple[int, List[int], bool]] = None
 
-    for q_idx, raw_clause in enumerate(clauses):
-        clause = raw_clause.strip()
-        if not clause:
-            continue
-
-        c_res = classify_query_rule_based(clause)
-        if c_res is None and model is not None:
-            c_res = _invoke_llm_clause_router(clause, state, model)
-        if c_res is None and settings.DYNAMIC_TOOL_RETRIEVAL_ENABLED:
-            try:
-                registry = get_tool_registry_service()
-                dyn_cands = registry.search_tools_sync(
-                    query=clause,
-                    user_roles=state.get("user_roles"),
-                    top_k=settings.TOOL_RETRIEVAL_TOP_K,
-                    distance_threshold=settings.TOOL_RETRIEVAL_DISTANCE_THRESHOLD,
-                )
-                if dyn_cands:
-                    best = dyn_cands[0]
-                    c_res = {
-                        "detected_domain": best["domain"],
-                        "detected_tool": best["tool_name"],
-                        "query_mode": "live_erp",
-                        "rag_query": None,
-                        "is_multi_tool": False,
-                        "detected_domains": [best["domain"]],
-                        "detected_tools": [best["tool_name"]],
-                        "active_tools": [{
-                            "tool": best["tool_name"],
-                            "domain": best["domain"],
-                            "sub_query": clause,
-                            "params": {},
-                            "status": "pending",
-                        }],
-                    }
-            except Exception as exc:
-                logger.warning("Dynamic retrieval error for clause '%s': %s", clause, exc)
+    for q_idx, clause, c_res in classified_items:
 
         if c_res is None:
             c_low = clause.lower().strip()
@@ -1611,12 +1058,10 @@ def _route_decomposed_clauses(
                     re.IGNORECASE,
                 )
             ):
-                from app.graph.nodes.extractor import resolve_all_branch_company_ids
                 prior_stock_plan["sub_query"] = f"{prior_stock_plan.get('sub_query') or ''} {clause}".strip()
                 prior_stock_plan["question_text"] = f"{prior_stock_plan.get('question_text') or ''} {clause}".strip()
                 elab_cids, elab_is_all = resolve_all_branch_company_ids(clause)
                 if elab_is_all:
-                    from app.graph.nodes.extractor import COMPANY_NAME_MAP
                     all_cids = list(COMPANY_NAME_MAP.keys())
                     prior_stock_plan["is_multi_company"] = True
                     prior_stock_plan["company_ids"] = all_cids
@@ -1626,7 +1071,6 @@ def _route_decomposed_clauses(
                     prior_stock_plan["company_ids"] = merged_cids
                 continue
 
-            from app.graph.nodes.extractor import resolve_branch_company_id, resolve_all_branch_company_ids
             scope_text = f"{shared_prefix_clause} {clause}".strip() if shared_prefix_clause else clause
             clause_has_explicit_branch = bool(
                 resolve_branch_company_id(scope_text) is not None
@@ -1742,6 +1186,91 @@ def _route_decomposed_clauses(
     }
 
 
+def _route_decomposed_clauses(
+    clauses: List[str],
+    user_query: str,
+    state: AgentState,
+    model: Optional[BaseChatModel],
+    model_factory: Optional[Callable[[], Optional[BaseChatModel]]] = None,
+) -> Dict[str, Any]:
+    """
+    Route multiple decomposed sub-questions independently (sync), applying smart merge
+    for identical same-branch/location stock queries and isolating per-clause company scopes.
+    """
+    from app.services.tool_registry_service import get_tool_registry_service
+
+    working_clauses, shared_prefix_clause, classified_items = _classify_decomposed_clauses_core(
+        clauses=clauses,
+        state=state,
+        model=model,
+        model_factory=model_factory,
+    )
+    resolved_items: List[Tuple[int, str, Optional[Dict[str, Any]]]] = []
+    for q_idx, clause, c_res in classified_items:
+        if c_res is None and settings.DYNAMIC_TOOL_RETRIEVAL_ENABLED:
+            try:
+                registry = get_tool_registry_service()
+                dyn_cands = registry.search_tools_sync(
+                    query=clause,
+                    user_roles=state.get("user_roles"),
+                    top_k=settings.TOOL_RETRIEVAL_TOP_K,
+                    distance_threshold=settings.TOOL_RETRIEVAL_DISTANCE_THRESHOLD,
+                )
+                c_res = _build_dynamic_clause_result(dyn_cands, clause)
+            except Exception as exc:
+                logger.warning("Dynamic retrieval error for clause '%s': %s", clause, exc)
+        resolved_items.append((q_idx, clause, c_res))
+
+    return _assemble_decomposed_route(
+        clauses=working_clauses,
+        shared_prefix_clause=shared_prefix_clause,
+        classified_items=resolved_items,
+        user_query=user_query,
+        state=state,
+    )
+
+
+async def _aroute_decomposed_clauses(
+    clauses: List[str],
+    user_query: str,
+    state: AgentState,
+    model: Optional[BaseChatModel],
+    model_factory: Optional[Callable[[], Optional[BaseChatModel]]] = None,
+) -> Dict[str, Any]:
+    """Async counterpart of _route_decomposed_clauses avoiding sync nested event loops."""
+    from app.services.tool_registry_service import get_tool_registry_service
+
+    working_clauses, shared_prefix_clause, classified_items = _classify_decomposed_clauses_core(
+        clauses=clauses,
+        state=state,
+        model=model,
+        model_factory=model_factory,
+    )
+    resolved_items: List[Tuple[int, str, Optional[Dict[str, Any]]]] = []
+    for q_idx, clause, c_res in classified_items:
+        if c_res is None and settings.DYNAMIC_TOOL_RETRIEVAL_ENABLED:
+            try:
+                registry = get_tool_registry_service()
+                dyn_cands = await registry.search_tools(
+                    query=clause,
+                    user_roles=state.get("user_roles"),
+                    top_k=settings.TOOL_RETRIEVAL_TOP_K,
+                    distance_threshold=settings.TOOL_RETRIEVAL_DISTANCE_THRESHOLD,
+                )
+                c_res = _build_dynamic_clause_result(dyn_cands, clause)
+            except Exception as exc:
+                logger.warning("Async dynamic retrieval error for clause '%s': %s", clause, exc)
+        resolved_items.append((q_idx, clause, c_res))
+
+    return _assemble_decomposed_route(
+        clauses=working_clauses,
+        shared_prefix_clause=shared_prefix_clause,
+        classified_items=resolved_items,
+        user_query=user_query,
+        state=state,
+    )
+
+
 def _collect_trailing_human_query(messages: Optional[List[BaseMessage]]) -> str:
     """Collect the trailing unanswered HumanMessage(s) when state['user_query'] is omitted."""
     if not messages:
@@ -1781,34 +1310,74 @@ def router_node(
     return _annotate_multi_company(raw_res, state=state, user_query=user_query)
 
 
-def _router_node_impl(
+async def arouter_node(
     state: AgentState,
     llm: Optional[BaseChatModel] = None,
-    user_query: str = "",
 ) -> Dict[str, Any]:
-    if not user_query:
-        return {
-            "detected_domain": "general",
-            "detected_tool": None,
-            "query_mode": "general",
-            "rag_query": None,
-            "rag_queries": [],
-            "sub_questions": [],
-            "non_tool_questions": [],
-            "is_multi_tool": False,
-            "detected_domains": ["general"],
-            "detected_tools": [],
-            "active_tools": [],
-        }
+    """
+    Asynchronous counterpart of router_node that awaits dynamic semantic tool retrieval
+    directly on the running event loop without spawning background threads.
+    """
+    user_query = state.get("user_query")
+    if not user_query and state.get("messages"):
+        user_query = _collect_trailing_human_query(state["messages"])
 
-    # Step 0: Fast Conversational Retry Check ('coba lagi', 'ulang', 'retry')
+    user_query = (user_query or "").strip()
+    raw_res = await _arouter_node_impl(state=state, llm=llm, user_query=user_query)
+    return _annotate_multi_company(raw_res, state=state, user_query=user_query)
+
+
+def _prepare_router_context(
+    state: AgentState,
+    llm: Optional[BaseChatModel],
+    user_query: str,
+) -> Tuple[Optional[Dict[str, Any]], bool, Optional[str], str, Callable[[], Optional[BaseChatModel]]]:
+    """Evaluate empty/retry early exits and construct lazy LLM getter."""
+    cached_model: Optional[BaseChatModel] = llm
+    model_resolved = llm is not None
+    is_test_env = "unittest" in sys.modules or os.environ.get("FASTPRINT_TEST_ENV") == "true"
+
+    def _get_model() -> Optional[BaseChatModel]:
+        nonlocal cached_model, model_resolved
+        if model_resolved:
+            return cached_model
+        model_resolved = True
+        if not is_test_env:
+            try:
+                cached_model = get_chat_model()
+            except Exception as exc:
+                logger.debug("Lazy router LLM initialization failed: %s", exc)
+                cached_model = None
+        return cached_model
+
+    if not user_query:
+        return (
+            {
+                "detected_domain": "general",
+                "detected_tool": None,
+                "query_mode": "general",
+                "rag_query": None,
+                "rag_queries": [],
+                "sub_questions": [],
+                "non_tool_questions": [],
+                "is_multi_tool": False,
+                "detected_domains": ["general"],
+                "detected_tools": [],
+                "active_tools": [],
+            },
+            False,
+            None,
+            user_query,
+            _get_model,
+        )
+
     is_retry = is_retry_query(user_query)
     prior_query = find_previous_user_query(state.get("messages")) if is_retry else None
     if is_retry:
         if prior_query:
-            user_query = prior_query
-        else:
-            return {
+            return None, True, prior_query, prior_query, _get_model
+        return (
+            {
                 "detected_domain": "general",
                 "detected_tool": None,
                 "query_mode": "general",
@@ -1821,28 +1390,24 @@ def _router_node_impl(
                 "detected_domains": ["general"],
                 "detected_tools": [],
                 "active_tools": [],
-            }
+            },
+            False,
+            None,
+            user_query,
+            _get_model,
+        )
 
-    # Resolve optional LLM model lazily for hybrid decomposition / fallback
-    model = llm
-    is_test_env = "unittest" in sys.modules or os.environ.get("FASTPRINT_TEST_ENV") == "true"
-    if model is None and not is_test_env:
-        try:
-            model = get_chat_model()
-        except Exception:
-            model = None
+    return None, False, None, user_query, _get_model
 
-    # Step 0.5: Hybrid Multi-Question Decomposition (clause-first routing)
-    clauses = decompose_user_query(user_query)
-    if len(clauses) > 1:
-        try:
-            decomposed_res = _route_decomposed_clauses(clauses, user_query=user_query, state=state, model=model)
-            if is_retry and prior_query:
-                decomposed_res["user_query"] = prior_query
-                decomposed_res["retry_instruction"] = f"Mengulang permintaan: {prior_query}"
-            return decomposed_res
-        except Exception as exc:
-            logger.warning("Multi-question decomposition failed for '%s': %s", user_query, exc)
+
+def _router_single_and_llm_steps(
+    state: AgentState,
+    user_query: str,
+    is_retry: bool,
+    prior_query: Optional[str],
+    get_model_fn: Callable[[], Optional[BaseChatModel]],
+) -> Optional[Dict[str, Any]]:
+    """Execute single-clause rules, conversational follow-up resolution, and LLM fallback."""
 
     # Step 1: Fast Rule / Regex Pattern Matching (Single-Clause)
     try:
@@ -1869,11 +1434,6 @@ def _router_node_impl(
     # Step 1.2: P&L / Balance Sheet Account Drill-Down Follow-up (e.g. 'coba berikan detail dari Penjualan Surabaya')
     history_messages = state.get("messages") or []
     if len(history_messages) > 1:
-        from app.graph.nodes.extractor import (
-            resolve_pnl_drilldown_from_history,
-            resolve_branch_company_id,
-            resolve_all_branch_company_ids,
-        )
         drill_match = resolve_pnl_drilldown_from_history(user_query, history_messages)
         if drill_match:
             from app.services.tool_registry_service import get_tool_registry_service
@@ -1899,7 +1459,6 @@ def _router_node_impl(
                 "sub_questions": [user_query],
                 "non_tool_questions": [],
             }
-            # Inherit branch scope from prior accounting turn if no explicit branch in current query
             if resolve_branch_company_id(user_query) is None and not resolve_all_branch_company_ids(user_query)[1]:
                 prior_q_acc = _find_previous_erp_query(history_messages)
                 if prior_q_acc:
@@ -1917,11 +1476,6 @@ def _router_node_impl(
     if len(history_messages) > 1:
         prior_q = _find_previous_erp_query(history_messages)
         if prior_q:
-            from app.graph.nodes.extractor import (
-                resolve_all_branch_company_ids,
-                resolve_branch_company_id,
-                strip_company_scope_keywords,
-            )
 
             clean_uq = user_query.strip().rstrip("?!.,;:'\"> ").lower()
             is_casual_oos = bool(_CASUAL_NON_ERP_INTERROGATIVE_RE.search(clean_uq))
@@ -2037,14 +1591,7 @@ def _router_node_impl(
                     logger.warning(f"Error in heuristic short follow-up routing: {exc}")
 
     # Step 2: Fallback to LLM Structured Output (Context-Aware)
-    model = llm
-    is_test_env = "unittest" in sys.modules or os.environ.get("FASTPRINT_TEST_ENV") == "true"
-    if model is None and not is_test_env:
-        try:
-            model = get_chat_model()
-        except Exception:
-            # If no API key configured in test/offline environment, safely fallback
-            model = None
+    model = get_model_fn()
 
     if model is not None:
         try:
@@ -2183,53 +1730,51 @@ def _router_node_impl(
                 result["user_query"] = prior_query
                 result["retry_instruction"] = f"Mengulang permintaan: {prior_query}"
             return result
-        except Exception:
-            pass
-
-    # Step 2.5: Dynamic Semantic Tool Retrieval via PGVector / In-Memory Catalog
-    if settings.DYNAMIC_TOOL_RETRIEVAL_ENABLED:
-        try:
-            from app.services.tool_registry_service import get_tool_registry_service
-            registry = get_tool_registry_service()
-            user_roles = state.get("user_roles")
-            candidates = registry.search_tools_sync(
-                query=user_query,
-                user_roles=user_roles,
-                top_k=settings.TOOL_RETRIEVAL_TOP_K,
-                distance_threshold=settings.TOOL_RETRIEVAL_DISTANCE_THRESHOLD,
-            )
-            if candidates:
-                best_match = candidates[0]
-                best_tool = best_match["tool_name"]
-                best_domain = best_match["domain"]
-                active_tools = [
-                    {
-                        "tool": best_tool,
-                        "domain": best_domain,
-                        "sub_query": user_query,
-                        "params": {},
-                        "status": "pending",
-                    }
-                ]
-                result_dynamic: Dict[str, Any] = {
-                    "detected_domain": best_domain,
-                    "detected_tool": best_tool,
-                    "query_mode": "live_erp",
-                    "rag_query": None,
-                    "is_multi_tool": False,
-                    "detected_domains": [best_domain],
-                    "detected_tools": [best_tool],
-                    "active_tools": active_tools,
-                    "available_tools": candidates,
-                }
-                if is_retry and prior_query:
-                    result_dynamic["user_query"] = prior_query
-                    result_dynamic["retry_instruction"] = f"Mengulang permintaan: {prior_query}"
-                return result_dynamic
         except Exception as exc:
-            logger.warning(f"Error in dynamic semantic tool retrieval during router execution: {exc}")
+            logger.debug("LLM router fallback failed for '%s': %s", user_query, exc)
 
-    # Default fallback when unclassified (non-greeting, non-meta, non-billing, non-ERP -> out_of_scope)
+    return None
+
+
+def _build_dynamic_single_result(
+    candidates: List[Dict[str, Any]],
+    user_query: str,
+    is_retry: bool,
+    prior_query: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    """Build single-tool dynamic retrieval route dictionary when candidates are present."""
+    if not candidates:
+        return None
+    best_match = candidates[0]
+    best_tool = best_match["tool_name"]
+    best_domain = best_match["domain"]
+    active_tools = [
+        {
+            "tool": best_tool,
+            "domain": best_domain,
+            "sub_query": user_query,
+            "params": {},
+            "status": "pending",
+        }
+    ]
+    result_dynamic: Dict[str, Any] = {
+        "detected_domain": best_domain,
+        "detected_tool": best_tool,
+        "query_mode": "live_erp",
+        "rag_query": None,
+        "is_multi_tool": False,
+        "detected_domains": [best_domain],
+        "detected_tools": [best_tool],
+        "active_tools": active_tools,
+        "available_tools": candidates,
+    }
+    if is_retry and prior_query:
+        result_dynamic["user_query"] = prior_query
+        result_dynamic["retry_instruction"] = f"Mengulang permintaan: {prior_query}"
+    return result_dynamic
+
+
+def _general_fallback_result() -> Dict[str, Any]:
     return {
         "detected_domain": "out_of_scope",
         "detected_tool": None,
@@ -2241,3 +1786,185 @@ def _router_node_impl(
         "active_tools": [],
         "available_tools": [],
     }
+
+
+def _router_node_impl(
+    state: AgentState,
+    llm: Optional[BaseChatModel] = None,
+    user_query: str = "",
+) -> Dict[str, Any]:
+    early_res, is_retry, prior_query, eff_query, get_model_fn = _prepare_router_context(
+        state=state,
+        llm=llm,
+        user_query=user_query,
+    )
+    if early_res is not None:
+        return early_res
+
+    clauses = decompose_user_query(eff_query)
+    if len(clauses) > 1:
+        try:
+            decomposed_res = _route_decomposed_clauses(
+                clauses,
+                user_query=eff_query,
+                state=state,
+                model=None,
+                model_factory=get_model_fn,
+            )
+            if is_retry and prior_query:
+                decomposed_res["user_query"] = prior_query
+                decomposed_res["retry_instruction"] = f"Mengulang permintaan: {prior_query}"
+            return decomposed_res
+        except Exception as exc:
+            logger.warning("Multi-question decomposition failed for '%s': %s", eff_query, exc)
+
+    step_res = _router_single_and_llm_steps(
+        state=state,
+        user_query=eff_query,
+        is_retry=is_retry,
+        prior_query=prior_query,
+        get_model_fn=get_model_fn,
+    )
+    if step_res is not None:
+        return step_res
+
+    # Step 2.5: Dynamic Semantic Tool Retrieval via PGVector / In-Memory Catalog
+    if settings.DYNAMIC_TOOL_RETRIEVAL_ENABLED:
+        try:
+            from app.services.tool_registry_service import get_tool_registry_service
+            registry = get_tool_registry_service()
+            candidates = registry.search_tools_sync(
+                query=eff_query,
+                user_roles=state.get("user_roles"),
+                top_k=settings.TOOL_RETRIEVAL_TOP_K,
+                distance_threshold=settings.TOOL_RETRIEVAL_DISTANCE_THRESHOLD,
+            )
+            dyn_res = _build_dynamic_single_result(candidates, eff_query, is_retry, prior_query)
+            if dyn_res is not None:
+                return dyn_res
+        except Exception as exc:
+            logger.warning(f"Error in dynamic semantic tool retrieval during router execution: {exc}")
+
+    return _general_fallback_result()
+
+
+async def _arouter_node_impl(
+    state: AgentState,
+    llm: Optional[BaseChatModel] = None,
+    user_query: str = "",
+) -> Dict[str, Any]:
+    early_res, is_retry, prior_query, eff_query, get_model_fn = _prepare_router_context(
+        state=state,
+        llm=llm,
+        user_query=user_query,
+    )
+    if early_res is not None:
+        return early_res
+
+    clauses = decompose_user_query(eff_query)
+    if len(clauses) > 1:
+        try:
+            decomposed_res = await _aroute_decomposed_clauses(
+                clauses,
+                user_query=eff_query,
+                state=state,
+                model=None,
+                model_factory=get_model_fn,
+            )
+            if is_retry and prior_query:
+                decomposed_res["user_query"] = prior_query
+                decomposed_res["retry_instruction"] = f"Mengulang permintaan: {prior_query}"
+            return decomposed_res
+        except Exception as exc:
+            logger.warning("Async multi-question decomposition failed for '%s': %s", eff_query, exc)
+
+    step_res = _router_single_and_llm_steps(
+        state=state,
+        user_query=eff_query,
+        is_retry=is_retry,
+        prior_query=prior_query,
+        get_model_fn=get_model_fn,
+    )
+    if step_res is not None:
+        return step_res
+
+    if settings.DYNAMIC_TOOL_RETRIEVAL_ENABLED:
+        try:
+            from app.services.tool_registry_service import get_tool_registry_service
+            registry = get_tool_registry_service()
+            candidates = await registry.search_tools(
+                query=eff_query,
+                user_roles=state.get("user_roles"),
+                top_k=settings.TOOL_RETRIEVAL_TOP_K,
+                distance_threshold=settings.TOOL_RETRIEVAL_DISTANCE_THRESHOLD,
+            )
+            dyn_res = _build_dynamic_single_result(candidates, eff_query, is_retry, prior_query)
+            if dyn_res is not None:
+                return dyn_res
+        except Exception as exc:
+            logger.warning(f"Error in async dynamic semantic tool retrieval during router execution: {exc}")
+
+    return _general_fallback_result()
+
+__all__ = [
+    "PlannedToolCall",
+    "RouterDecision",
+    "MultiRouterDecision",
+    "TOOL_DOMAIN_MAP",
+    "decompose_user_query",
+    "is_retry_query",
+    "find_previous_user_query",
+    "_extract_sub_queries",
+    "_split_conjunction_clauses",
+    "classify_query_rule_based",
+    "router_node",
+    "arouter_node",
+    "CUSTOMER_TERMS",
+    "VENDOR_TERMS",
+    "PURCHASE_INVOICE_TERMS",
+    "CUSTOMER_BILLING_TERMS",
+    "ACCOUNTING_PROFIT_LOSS_PATTERNS",
+    "ACCOUNTING_BALANCE_SHEET_PATTERNS",
+    "ACCOUNTING_GENERAL_LEDGER_PATTERNS",
+    "ACCOUNTING_BANK_RECON_PATTERNS",
+    "ACCOUNTING_VENDOR_BILLS_PATTERNS",
+    "ACCOUNTING_BALANCE_PATTERNS",
+    "ACCOUNTING_JOURNAL_PATTERNS",
+    "INVENTORY_STOCK_PATTERNS",
+    "INVENTORY_STOCK_HISTORY_PATTERNS",
+    "INVENTORY_TRANSFERS_PATTERNS",
+    "INVENTORY_LOW_STOCK_PATTERNS",
+    "INVENTORY_ADJUSTMENTS_PATTERNS",
+    "INVENTORY_SCRAP_PATTERNS",
+    "INVENTORY_WAREHOUSES_PATTERNS",
+    "INVENTORY_CATEGORIES_PATTERNS",
+    "INVENTORY_LOCATION_PATTERNS",
+    "INVENTORY_VELOCITY_FORECAST_PATTERNS",
+    "SALES_TOP_PRODUCTS_PATTERNS",
+    "SALES_SUMMARY_PATTERNS",
+    "SALES_ORDER_DETAIL_PATTERNS",
+    "SALES_CONTACTS_PATTERNS",
+    "SALES_ORDERS_PATTERNS",
+    "MARKETPLACE_WRITE_PATTERNS",
+    "MARKETPLACE_ACCOUNT_HEALTH_PATTERNS",
+    "MARKETPLACE_KILAT_PATTERNS",
+    "MARKETPLACE_ORDERS_PATTERNS",
+    "MARKETPLACE_MAPPING_PATTERNS",
+    "MARKETPLACE_STOCK_SYNC_SIM_PATTERNS",
+    "MARKETPLACE_SYNC_LOGS_PATTERNS",
+    "MARKETPLACE_PRICE_COMPARISON_PATTERNS",
+    "MARKETPLACE_FEE_ANOMALIES_PATTERNS",
+    "MARKETPLACE_DEDUCTION_SETTLEMENT_PATTERNS",
+    "MARKETPLACE_CASHFLOW_BALANCE_PATTERNS",
+    "MARKETPLACE_COMPETITOR_PATTERNS",
+    "ALL_MARKETPLACE_PATTERN_GROUPS",
+    "INVENTORY_PRODUCT_PATTERNS",
+    "KNOWLEDGE_RAG_PATTERNS",
+    "GREETING_PATTERNS",
+    "GENERAL_INQUIRY_PATTERNS",
+    "OUT_OF_SCOPE_PATTERNS",
+    "RETRY_PATTERNS",
+    "_match_any",
+    "_find_first_match",
+    "is_meta_question",
+]

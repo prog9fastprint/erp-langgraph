@@ -20,6 +20,7 @@ _CACHED_FREE_MODELS: List[str] = []
 _LAST_CACHE_TIME: float = 0.0
 _CACHE_TTL_SECONDS: float = 900.0  # 15 minutes
 _CACHE_LOCK = threading.Lock()
+_REFRESH_TASK: Optional[asyncio.Task] = None
 
 # Curated fallback list when offline or when dynamic lookup is unavailable
 DEFAULT_CURATED_FREE_MODELS = [
@@ -94,6 +95,21 @@ class CircuitBreakerChatOpenAI(ChatOpenAI):
             self._handle_failure(exc)
             raise
 
+    def stream(self, *args, **kwargs):
+        try:
+            yield from super().stream(*args, **kwargs)
+        except Exception as exc:
+            self._handle_failure(exc)
+            raise
+
+    async def astream(self, *args, **kwargs):
+        try:
+            async for chunk in super().astream(*args, **kwargs):
+                yield chunk
+        except Exception as exc:
+            self._handle_failure(exc)
+            raise
+
 
 def _sync_fetch_free_models_catalog(
     api_key: Optional[str] = None,
@@ -112,7 +128,7 @@ def _sync_fetch_free_models_catalog(
             return list(_CACHED_FREE_MODELS)
 
     discovered_models: List[str] = []
-    key = api_key or settings.OPENROUTER_API_KEY or settings.OPENAI_API_KEY
+    key = api_key or settings.OPENROUTER_API_KEY
 
     # 1. Live query to OpenRouter API /v1/models if key is available and not a test mock
     if key and not key.startswith("mock"):
@@ -229,17 +245,31 @@ def fetch_free_models_catalog(
 
     if loop and loop.is_running():
         # Do not block the running event loop with synchronous network I/O.
-        # Schedule background non-blocking refresh via afetch_free_models_catalog
-        try:
-            asyncio.create_task(
-                afetch_free_models_catalog(
-                    api_key=api_key,
-                    force_refresh=True,
-                    prioritize_tools=prioritize_tools,
+        # Schedule one deduplicated background refresh via afetch_free_models_catalog.
+        global _REFRESH_TASK
+        if _REFRESH_TASK is None or _REFRESH_TASK.done():
+            try:
+                task = asyncio.create_task(
+                    afetch_free_models_catalog(
+                        api_key=api_key,
+                        force_refresh=True,
+                        prioritize_tools=prioritize_tools,
+                    )
                 )
-            )
-        except Exception as exc:
-            logger.debug(f"Could not schedule background catalog refresh: {exc}")
+                _REFRESH_TASK = task
+
+                def _clear_refresh_task(done_task: asyncio.Task) -> None:
+                    global _REFRESH_TASK
+                    if _REFRESH_TASK is done_task:
+                        _REFRESH_TASK = None
+                    try:
+                        done_task.exception()
+                    except (asyncio.CancelledError, Exception):
+                        pass
+
+                task.add_done_callback(_clear_refresh_task)
+            except Exception as exc:
+                logger.debug(f"Could not schedule background catalog refresh: {exc}")
 
         with _CACHE_LOCK:
             if _CACHED_FREE_MODELS:
@@ -337,7 +367,7 @@ def get_chat_model(
     selected_provider = (provider or settings.MODEL_PROVIDER).lower().strip()
 
     if selected_provider == "openrouter":
-        api_key = settings.OPENROUTER_API_KEY or settings.OPENAI_API_KEY
+        api_key = settings.OPENROUTER_API_KEY
         if not api_key:
             raise ValueError("OPENROUTER_API_KEY environment variable is required when MODEL_PROVIDER=openrouter")
 
@@ -357,7 +387,7 @@ def get_chat_model(
             model_chain = [target_model] + [m for m in fallbacks if m != target_model]
             extra_body["models"] = model_chain[:3]  # Max 3 models allowed by OpenRouter API
 
-        return ChatOpenAI(
+        return CircuitBreakerChatOpenAI(
             model=target_model,
             api_key=api_key,
             base_url="https://openrouter.ai/api/v1",
@@ -368,6 +398,7 @@ def get_chat_model(
                 "X-Title": "FastPrint ERP LangGraph",
             },
             extra_body=extra_body if extra_body else None,
+            provider_name="openrouter",
         )
 
     elif selected_provider == "gemini":
@@ -435,15 +466,18 @@ def get_chat_model(
 
         if enable_fallback:
             tier_fallbacks: List[BaseChatModel] = []
-            # Priority 2: Gemini
-            if settings.get_gemini_api_keys():
+            # Priority 2: Gemini (multi-key failover, skipped if all Gemini keys are unhealthy)
+            if settings.get_gemini_api_keys() and not is_gemini_unhealthy():
                 try:
-                    gemini_model = get_chat_model(
-                        provider="gemini",
-                        enable_fallback=False,
+                    gemini_model = _build_gemini_model(
                         temperature=temperature,
+                        enable_key_fallback=True,
                     )
-                    tier_fallbacks.append(gemini_model)
+                    if hasattr(gemini_model, "runnable") and hasattr(gemini_model, "fallbacks"):
+                        tier_fallbacks.append(gemini_model.runnable)
+                        tier_fallbacks.extend(gemini_model.fallbacks)
+                    else:
+                        tier_fallbacks.append(gemini_model)
                 except Exception as exc:
                     logger.warning(f"Could not configure Gemini fallback for OpenAI model: {exc}")
 

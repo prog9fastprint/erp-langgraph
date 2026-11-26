@@ -6,12 +6,10 @@ conditional edge routing (decide_after_verification), and end-to-end StateGraph 
 """
 from datetime import date
 import unittest
-from unittest.mock import AsyncMock, MagicMock
 from langgraph.graph import StateGraph, START, END
 
 from app.graph.state import create_initial_state, AgentState
 from app.graph.nodes.extractor import extractor_node
-from app.graph.nodes.tool_node import tool_node, tool_node_sync
 from app.graph.nodes.verifier import (
     verifier_node,
     decide_after_verification,

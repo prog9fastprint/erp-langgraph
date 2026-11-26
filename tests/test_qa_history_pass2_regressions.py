@@ -10,18 +10,15 @@ from langchain_core.messages import AIMessage, HumanMessage
 
 from app.graph.nodes.extractor import (
     _fallback_extract_account_balance,
-    _fallback_extract_account_health,
     _fallback_extract_bank_reconciliation,
     _fallback_extract_contacts,
     _fallback_extract_general_ledger,
-    _fallback_extract_inventory_velocity_forecast,
     _fallback_extract_stock_level,
     extractor_node,
 )
 from app.graph.nodes.router import router_node
 from app.graph.nodes.synthesizer import (
     _build_table_query_meta,
-    asynthesizer_node,
     format_deterministic_answer,
 )
 from app.graph.nodes.tool_node import _execute_single_tool

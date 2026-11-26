@@ -5,7 +5,7 @@ token setting, verbose toggle, session reset, and workflow invocation.
 """
 import io
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import cli
 

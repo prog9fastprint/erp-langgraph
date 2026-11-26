@@ -7,10 +7,9 @@ import asyncio
 import json
 import logging
 import os
+import re
 import sys
-from typing import Any, Dict, List, Optional, Set, Tuple, Type
-
-from pydantic import BaseModel
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from app.core.config import settings
 from app.schemas.tools import (
@@ -397,7 +396,10 @@ class ToolRegistryService:
         default_definitions: Optional[List[Dict[str, Any]]] = None,
     ):
         self.vector_service = vector_service or global_vector_service
-        self.table_name = table_name or settings.TOOL_CATALOG_TABLE_NAME
+        resolved_table = (table_name or settings.TOOL_CATALOG_TABLE_NAME or "").strip()
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", resolved_table):
+            raise ValueError(f"Invalid SQL identifier for table_name: {resolved_table!r}")
+        self.table_name = resolved_table
         self.definitions = default_definitions or CORE_TOOL_DEFINITIONS
         self._in_memory_catalog: Dict[str, Dict[str, Any]] = {}
         self._build_in_memory_catalog()
@@ -488,11 +490,11 @@ class ToolRegistryService:
             is_write = bool(tool.get("is_write", False))
 
             if t_name in existing_tools:
-                if not force_update:
+                if not force_update and existing_tools.get(t_name) == t_desc:
                     skipped += 1
                     continue
 
-                # Force update existing tool
+                # Update existing tool (forced or description changed)
                 embedding = await self.vector_service.get_embedding(t_desc)
                 emb_vec = [float(v) for v in embedding] if embedding else None
                 update_sql = f"""

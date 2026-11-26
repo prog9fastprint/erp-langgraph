@@ -6,14 +6,14 @@ Aggregate Verification, and Unified Markdown Synthesis.
 import asyncio
 from datetime import date
 import unittest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
-from app.graph.state import AgentState, ToolCallPlan, create_initial_state
-from app.graph.nodes.router import router_node, classify_query_rule_based
+from app.graph.state import AgentState, create_initial_state
+from app.graph.nodes.router import router_node
 from app.graph.nodes.extractor import extractor_node
-from app.graph.nodes.tool_node import tool_node, tool_node_sync
+from app.graph.nodes.tool_node import tool_node
 from app.graph.nodes.verifier import verifier_node
-from app.graph.nodes.synthesizer import synthesizer_node, format_deterministic_answer
+from app.graph.nodes.synthesizer import format_deterministic_answer
 from app.graph.workflow import create_workflow_graph
 from app.services.django_client import DjangoCoreClient
 

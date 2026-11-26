@@ -5,7 +5,6 @@ Tests embedding generation, query retrieval, text chunking, and fallback mechani
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from app.core.config import settings
 from app.services.vector_service import VectorService
 from scripts.ingest_knowledge import split_text_into_chunks
 

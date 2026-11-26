@@ -6,19 +6,22 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app
 
+COPY requirements.txt .
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     curl \
-    && rm -rf /var/lib/apt/lists/*
-
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+    && pip install --no-cache-dir -r requirements.txt \
+    && apt-get purge -y --auto-remove gcc \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --create-home --shell /bin/bash appuser
 
 COPY app ./app
 COPY data ./data
-COPY prompts ./prompts
 COPY scripts ./scripts
 COPY cli.py .
+
+RUN chown -R appuser:appuser /app
+USER appuser
 
 EXPOSE 8002
 
