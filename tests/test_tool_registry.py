@@ -15,6 +15,7 @@ from app.services.tool_registry_service import (
     ToolRegistryService,
     CORE_TOOL_DEFINITIONS,
     build_tool_search_text,
+    merge_rrf_candidates,
 )
 
 
@@ -382,6 +383,142 @@ class TestToolRegistryService(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result, {"created": 0, "updated": 1, "skipped": 0})
         mock_vec_service.get_embedding.assert_awaited_once_with(expected_search_text)
+
+    def test_conditional_rbac_empty_roles_allows_readonly_and_blocks_write(self):
+        """Conditional RBAC: empty/None user_roles returns read-only permissioned tools and hides write tools."""
+        write_tool = {
+            "tool_name": "create_manual_journal",
+            "domain": "accounting",
+            "description": "Membuat jurnal manual baru untuk transaksi akuntansi",
+            "params_schema": {},
+            "keywords": ["buat jurnal manual", "jurnal manual"],
+            "sample_queries": ["buat jurnal manual baru", "tambah jurnal manual", "posting jurnal manual"],
+            "negative_hints": "Operasi tulis, butuh konfirmasi.",
+            "required_permission": "accounting.create_journal",
+            "is_write": True,
+        }
+        registry = ToolRegistryService(default_definitions=CORE_TOOL_DEFINITIONS + [write_tool])
+
+        # Empty/None user_roles -> shows read-only permissioned tools (e.g. get_profit_and_loss, get_vendor_bills)
+        pnl_none = registry.search_tools_fallback(query="cek laporan laba rugi bulan ini", user_roles=None)
+        self.assertIn("get_profit_and_loss", [t["tool_name"] for t in pnl_none])
+
+        bills_empty = registry.search_tools_fallback(query="daftar tagihan vendor jatuh tempo", user_roles=[])
+        self.assertIn("get_vendor_bills", [t["tool_name"] for t in bills_empty])
+
+        # Write tools are never exposed when user_roles is empty/None
+        write_res = registry.search_tools_fallback(query="buat jurnal manual", user_roles=[])
+        self.assertNotIn("create_manual_journal", [t["tool_name"] for t in write_res])
+
+        # Non-empty verified user_roles enforces required_permission strictly
+        pnl_restricted = registry.search_tools_fallback(
+            query="cek laporan laba rugi bulan ini",
+            user_roles=["inventory.viewer"],
+        )
+        self.assertNotIn("get_profit_and_loss", [t["tool_name"] for t in pnl_restricted])
+
+        pnl_allowed = registry.search_tools_fallback(
+            query="cek laporan laba rugi bulan ini",
+            user_roles=["accounting.view_financial_reports"],
+        )
+        self.assertIn("get_profit_and_loss", [t["tool_name"] for t in pnl_allowed])
+
+    def test_fallback_scores_sample_queries_and_short_acronyms(self):
+        """Upgraded fallback recalls tools via natural sample_queries and 2-char ERP acronyms (gl, so, ap)."""
+        cases = [
+            ("pesanan kilat shopee nyangkut hari ini", "get_kilat_order_diagnostics"),
+            ("cek mutasi gl akun kas kecil", "get_general_ledger"),
+            ("daftar so hari ini di mainstore", "get_sales_orders"),
+            ("produk dead stock slow moving 90 hari", "get_inventory_velocity_forecast"),
+            ("sku shopee belum mapping ke erp", "get_product_mapping_status"),
+        ]
+        for query, expected_tool in cases:
+            with self.subTest(query=query):
+                res = self.registry.search_tools_fallback(query=query, user_roles=[], top_k=8)
+                names = [t["tool_name"] for t in res]
+                self.assertIn(expected_tool, names, f"Expected {expected_tool} in {names}")
+                top = res[0]
+                self.assertIn("negative_hints", top)
+                self.assertIn("rrf_score", top)
+                self.assertIsNone(top["distance"])
+
+    async def test_search_tools_hybrid_pgvector_fts_rrf_and_conditional_rbac(self):
+        """search_tools_hybrid executes PGVector + FTS RRF SQL with Conditional RBAC and enriches negative_hints."""
+        mock_vec_service = MagicMock()
+        mock_vec_service.get_embedding = AsyncMock(return_value=[0.1] * 768)
+
+        mock_pool = MagicMock()
+        mock_conn = MagicMock()
+        mock_conn.fetch = AsyncMock(
+            return_value=[
+                {
+                    "tool_name": "get_general_ledger",
+                    "domain": "accounting",
+                    "description": "Laporan buku besar (General Ledger) lengkap",
+                    "params_schema": json.dumps({"type": "object", "properties": {"account_code": {"type": "string"}}}),
+                    "required_permission": "accounting.view_ledger",
+                    "is_write": False,
+                    "distance": 0.21,
+                    "rrf_score": 0.032787,
+                }
+            ]
+        )
+
+        mock_acquire = MagicMock()
+        mock_acquire.__aenter__ = AsyncMock(return_value=mock_conn)
+        mock_acquire.__aexit__ = AsyncMock(return_value=None)
+        mock_pool.acquire.return_value = mock_acquire
+        mock_vec_service.get_pool = AsyncMock(return_value=mock_pool)
+
+        service = ToolRegistryService(vector_service=mock_vec_service)
+
+        # 1. Empty roles -> enforce_rbac=False
+        results = await service.search_tools_hybrid(query="cek gl akun kas", user_roles=[])
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["tool_name"], "get_general_ledger")
+        self.assertAlmostEqual(results[0]["rrf_score"], 0.032787)
+        self.assertAlmostEqual(results[0]["distance"], 0.21)
+        self.assertTrue(results[0]["negative_hints"])
+
+        sql_executed = mock_conn.fetch.call_args[0][0]
+        self.assertIn("vec_ranked", sql_executed)
+        self.assertIn("fts_ranked", sql_executed)
+        self.assertIn("FULL OUTER JOIN", sql_executed)
+        self.assertIn("60.0 +", sql_executed)
+        self.assertIn("search_tsv", sql_executed)
+        # args: (sql, vector_arr, domain, should_enforce, roles_param, max_dist, cleaned_query, or_tsquery, acronym_regex, limit)
+        self.assertFalse(mock_conn.fetch.call_args[0][3])
+        self.assertEqual(mock_conn.fetch.call_args[0][4], [])
+        self.assertIn("gl", mock_conn.fetch.call_args[0][8])
+
+        # 2. Non-empty verified roles -> enforce_rbac=True
+        await service.search_tools_hybrid(query="cek gl akun kas", user_roles=["accounting.view_ledger"])
+        self.assertTrue(mock_conn.fetch.call_args[0][3])
+        self.assertEqual(mock_conn.fetch.call_args[0][4], ["accounting.view_ledger"])
+
+    async def test_search_tools_hybrid_falls_back_gracefully_when_offline(self):
+        """search_tools_hybrid degrades cleanly to upgraded in-memory fallback when pool or embedding is unavailable."""
+        mock_vec_service = MagicMock()
+        mock_vec_service.get_pool = AsyncMock(return_value=None)
+
+        service = ToolRegistryService(vector_service=mock_vec_service)
+        res = await service.search_tools_hybrid(query="cek pesanan kilat shopee nyangkut", user_roles=None)
+        self.assertIn("get_kilat_order_diagnostics", [t["tool_name"] for t in res])
+
+    def test_merge_rrf_candidates_deduplicates_and_accumulates_scores(self):
+        """merge_rrf_candidates fuses multi-clause lists, boosts tools appearing in multiple clauses, and caps count."""
+        list_a = [
+            {"tool_name": "get_stock_level", "domain": "inventory", "rrf_score": 0.02, "distance": 0.30},
+            {"tool_name": "get_sales_summary", "domain": "sales", "rrf_score": 0.015, "distance": 0.40},
+        ]
+        list_b = [
+            {"tool_name": "get_sales_summary", "domain": "sales", "rrf_score": 0.02, "distance": 0.25},
+            {"tool_name": "get_profit_and_loss", "domain": "accounting", "rrf_score": 0.018, "distance": 0.28},
+        ]
+        merged = merge_rrf_candidates([list_a, list_b], max_results=3)
+        self.assertEqual([m["tool_name"] for m in merged], ["get_sales_summary", "get_stock_level", "get_profit_and_loss"])
+        self.assertAlmostEqual(merged[0]["rrf_score"], 0.035)
+        self.assertAlmostEqual(merged[0]["distance"], 0.25)
 
 
 class TestRouterDynamicToolRetrieval(unittest.TestCase):

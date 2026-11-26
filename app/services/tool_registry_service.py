@@ -661,7 +661,114 @@ FALLBACK_STOP_WORDS: Set[str] = {
     "informasi", "perusahaan", "kantor", "toko", "bisa", "tolong", "cek", "lihat",
     "saya", "kami", "kita", "kamu", "anda", "dia", "mereka", "dengan", "secara",
     "terkait", "tentang", "mengenai", "atas", "bawah", "dalam", "luar", "semua",
+    "tampilkan", "cari", "berapa", "mana", "saja", "dong", "ya", "mohon", "bantu",
 }
+
+SHORT_ERP_ACRONYMS: Set[str] = {
+    "so", "gl", "ap", "ar", "hp", "wa", "po", "do", "mp", "je", "pc", "pl",
+}
+
+RRF_K_CONSTANT: float = 60.0
+
+
+def _extract_query_tokens(query: str) -> List[str]:
+    """Extract normalized search tokens preserving short ERP acronyms (so, gl, ap, ar, etc.)."""
+    cleaned = (query or "").lower().strip()
+    if not cleaned:
+        return []
+    raw_tokens = re.findall(r"[a-z0-9]+", cleaned)
+    tokens: List[str] = []
+    seen: Set[str] = set()
+    for tok in raw_tokens:
+        if tok in FALLBACK_STOP_WORDS:
+            continue
+        if len(tok) <= 2 and tok not in SHORT_ERP_ACRONYMS:
+            continue
+        if tok not in seen:
+            seen.add(tok)
+            tokens.append(tok)
+    return tokens
+
+
+def _extract_short_acronyms(query: str) -> List[str]:
+    """Return distinct short ERP acronyms present in query for bounded FTS/regex matching."""
+    cleaned = (query or "").lower().strip()
+    if not cleaned:
+        return []
+    raw_tokens = re.findall(r"[a-z0-9]+", cleaned)
+    found: List[str] = []
+    for tok in raw_tokens:
+        if tok in SHORT_ERP_ACRONYMS and tok not in found:
+            found.append(tok)
+    if re.search(r"\bp\s*&\s*l\b", cleaned) and "pl" not in found:
+        found.append("pl")
+    return found
+
+
+def _resolve_rbac_roles(
+    user_roles: Optional[List[str]],
+    enforce_rbac: Optional[bool] = None,
+) -> Tuple[bool, List[str]]:
+    """
+    Resolve Conditional RBAC policy:
+    - Default (enforce_rbac=None): enforce required_permission only when verified user_roles is non-empty.
+      When user_roles is None or empty, return all read-only (is_write=False) tools and defer final
+      authorization to Django Core JWT (HTTP 403).
+    """
+    cleaned_roles = [str(r).strip() for r in (user_roles or []) if str(r).strip()]
+    should_enforce = bool(cleaned_roles) if enforce_rbac is None else bool(enforce_rbac)
+    return should_enforce, cleaned_roles
+
+
+def merge_rrf_candidates(
+    candidate_lists: List[List[Dict[str, Any]]],
+    k: float = RRF_K_CONSTANT,
+    max_results: int = 12,
+) -> List[Dict[str, Any]]:
+    """
+    Deduplicate and fuse multiple ranked tool candidate lists (e.g. per-clause retrieval)
+    using Reciprocal Rank Fusion (RRF), retaining highest-scoring metadata per tool_name.
+    """
+    merged: Dict[str, Dict[str, Any]] = {}
+    rrf_scores: Dict[str, float] = {}
+    best_distance: Dict[str, Optional[float]] = {}
+
+    for cand_list in candidate_lists:
+        for rank_idx, cand in enumerate(cand_list or [], start=1):
+            t_name = cand.get("tool_name")
+            if not t_name:
+                continue
+            base_rrf = cand.get("rrf_score")
+            contrib = float(base_rrf) if isinstance(base_rrf, (int, float)) and base_rrf > 0 else (1.0 / (k + rank_idx))
+            rrf_scores[t_name] = rrf_scores.get(t_name, 0.0) + contrib
+
+            dist = cand.get("distance")
+            prev_dist = best_distance.get(t_name)
+            if isinstance(dist, (int, float)):
+                if prev_dist is None or dist < prev_dist:
+                    best_distance[t_name] = float(dist)
+            elif t_name not in best_distance:
+                best_distance[t_name] = None
+
+            if t_name not in merged:
+                merged[t_name] = dict(cand)
+
+    ranked_names = sorted(
+        merged.keys(),
+        key=lambda name: (
+            -rrf_scores[name],
+            best_distance[name] if best_distance[name] is not None else 1.0,
+            name,
+        ),
+    )
+
+    results: List[Dict[str, Any]] = []
+    for name in ranked_names[:max_results]:
+        item = dict(merged[name])
+        item["rrf_score"] = round(rrf_scores[name], 6)
+        item["distance"] = best_distance[name]
+        results.append(item)
+    return results
 
 
 class ToolRegistryService:
@@ -864,6 +971,33 @@ class ToolRegistryService:
         )
         return {"created": created, "updated": updated, "skipped": skipped}
 
+    def _hydrate_db_record(self, r: Any) -> Dict[str, Any]:
+        """Convert a PGVector record into a normalized candidate tool dictionary enriched with local metadata."""
+        ps = r["params_schema"]
+        if isinstance(ps, str):
+            try:
+                ps = json.loads(ps)
+            except Exception:
+                pass
+        t_name = r["tool_name"]
+        cached = self._in_memory_catalog.get(t_name) or {}
+        raw_dist = r.get("distance") if hasattr(r, "get") else r["distance"]
+        raw_rrf = r.get("rrf_score") if hasattr(r, "get") else None
+        item: Dict[str, Any] = {
+            "tool_name": t_name,
+            "domain": r["domain"],
+            "description": r["description"],
+            "params_schema": ps,
+            "required_permission": r["required_permission"],
+            "is_write": bool(r["is_write"]),
+            "negative_hints": cached.get("negative_hints", ""),
+            "sample_queries": list(cached.get("sample_queries", [])),
+            "distance": float(raw_dist) if raw_dist is not None else None,
+        }
+        if raw_rrf is not None:
+            item["rrf_score"] = round(float(raw_rrf), 6)
+        return item
+
     async def search_tools(
         self,
         query: str,
@@ -871,19 +1005,21 @@ class ToolRegistryService:
         user_roles: Optional[List[str]] = None,
         top_k: Optional[int] = None,
         distance_threshold: Optional[float] = None,
+        enforce_rbac: Optional[bool] = None,
     ) -> List[Dict[str, Any]]:
         """
-        Dynamically retrieve top relevant tools matching user query and user authorization.
+        Dynamically retrieve top relevant tools using PGVector cosine similarity and Conditional RBAC.
 
         Args:
             query: User input query text.
             domain: Optional ERP domain filter ('accounting', 'inventory', 'sales', 'marketplace').
-            user_roles: Optional list of user roles/permissions.
+            user_roles: Optional list of verified user roles/permissions.
             top_k: Maximum candidate tools to return (defaults to settings.TOOL_RETRIEVAL_TOP_K).
             distance_threshold: Maximum cosine distance cutoff (defaults to settings.TOOL_RETRIEVAL_DISTANCE_THRESHOLD).
+            enforce_rbac: Optional override for Conditional RBAC (default: True iff user_roles is non-empty).
 
         Returns:
-            List of candidate tool dicts sorted by similarity.
+            List of candidate tool dicts sorted by cosine distance ascending.
         """
         limit = top_k if top_k is not None else settings.TOOL_RETRIEVAL_TOP_K
         max_dist = (
@@ -894,26 +1030,43 @@ class ToolRegistryService:
 
         # Check feature flag or fallback condition
         if not settings.DYNAMIC_TOOL_RETRIEVAL_ENABLED:
-            return self.search_tools_fallback(query=query, domain=domain, user_roles=user_roles, top_k=limit)
+            return self.search_tools_fallback(
+                query=query,
+                domain=domain,
+                user_roles=user_roles,
+                top_k=limit,
+                enforce_rbac=enforce_rbac,
+            )
 
         pool = await self.vector_service.get_pool()
         if pool is None:
             logger.info("Vector DB pool unavailable. Using in-memory tool retrieval fallback.")
-            return self.search_tools_fallback(query=query, domain=domain, user_roles=user_roles, top_k=limit)
+            return self.search_tools_fallback(
+                query=query,
+                domain=domain,
+                user_roles=user_roles,
+                top_k=limit,
+                enforce_rbac=enforce_rbac,
+            )
 
         # 1. Embed user query via Gemini
         query_vector = await self.vector_service.get_embedding(query)
         if query_vector is None:
             logger.info("Query embedding failed or unavailable. Using in-memory tool retrieval fallback.")
-            return self.search_tools_fallback(query=query, domain=domain, user_roles=user_roles, top_k=limit)
+            return self.search_tools_fallback(
+                query=query,
+                domain=domain,
+                user_roles=user_roles,
+                top_k=limit,
+                enforce_rbac=enforce_rbac,
+            )
 
         try:
             vector_arr = [float(v) for v in query_vector]
-            # Role checking: if user_roles is None or empty, only public tools (required_permission IS NULL) match
-            roles_param = list(user_roles) if user_roles else None
+            should_enforce, roles_param = _resolve_rbac_roles(user_roles, enforce_rbac=enforce_rbac)
 
             sql = f"""
-                SELECT 
+                SELECT
                     tool_name,
                     domain,
                     description,
@@ -923,37 +1076,276 @@ class ToolRegistryService:
                     (embedding <=> $1) AS distance
                 FROM {self.table_name}
                 WHERE ($2::text IS NULL OR domain = $2)
-                  AND ($3::text[] IS NULL AND required_permission IS NULL 
-                       OR $3::text[] IS NOT NULL AND (required_permission IS NULL OR required_permission = ANY($3) OR 'admin' = ANY($3)))
-                  AND (embedding <=> $1) <= $4
+                  AND (
+                      (NOT $3::boolean AND is_write = FALSE)
+                      OR (
+                          $3::boolean
+                          AND (
+                              required_permission IS NULL
+                              OR required_permission = ANY($4::text[])
+                              OR 'admin' = ANY($4::text[])
+                          )
+                      )
+                  )
+                  AND (embedding <=> $1) <= $5
                 ORDER BY distance ASC
-                LIMIT $5;
+                LIMIT $6;
             """
             async with pool.acquire() as conn:
-                records = await conn.fetch(sql, vector_arr, domain, roles_param, max_dist, limit)
+                records = await conn.fetch(sql, vector_arr, domain, should_enforce, roles_param, max_dist, limit)
 
-            results: List[Dict[str, Any]] = []
-            for r in records:
-                ps = r["params_schema"]
-                if isinstance(ps, str):
-                    try:
-                        ps = json.loads(ps)
-                    except Exception:
-                        pass
-                results.append({
-                    "tool_name": r["tool_name"],
-                    "domain": r["domain"],
-                    "description": r["description"],
-                    "params_schema": ps,
-                    "required_permission": r["required_permission"],
-                    "is_write": r["is_write"],
-                    "distance": float(r["distance"]),
-                })
-            return results
+            return [self._hydrate_db_record(r) for r in records]
 
         except Exception as exc:
             logger.warning(f"Error querying PGVector for tool catalog: {exc}. Falling back to in-memory catalog.")
-            return self.search_tools_fallback(query=query, domain=domain, user_roles=user_roles, top_k=limit)
+            return self.search_tools_fallback(
+                query=query,
+                domain=domain,
+                user_roles=user_roles,
+                top_k=limit,
+                enforce_rbac=enforce_rbac,
+            )
+
+    async def search_tools_hybrid(
+        self,
+        query: str,
+        domain: Optional[str] = None,
+        user_roles: Optional[List[str]] = None,
+        top_k: Optional[int] = None,
+        distance_threshold: Optional[float] = None,
+        enforce_rbac: Optional[bool] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Hybrid semantic + lexical tool retrieval combining PGVector cosine distance and
+        PostgreSQL FTS ('simple') + ERP acronym matching via Reciprocal Rank Fusion (k=60),
+        scoped by Conditional RBAC with automatic in-memory fallback when offline.
+        """
+        limit = top_k if top_k is not None else settings.TOOL_RETRIEVAL_TOP_K
+        max_dist = (
+            distance_threshold
+            if distance_threshold is not None
+            else settings.TOOL_RETRIEVAL_DISTANCE_THRESHOLD
+        )
+
+        if not settings.DYNAMIC_TOOL_RETRIEVAL_ENABLED:
+            return self.search_tools_fallback(
+                query=query,
+                domain=domain,
+                user_roles=user_roles,
+                top_k=limit,
+                enforce_rbac=enforce_rbac,
+            )
+
+        pool = await self.vector_service.get_pool()
+        if pool is None:
+            logger.info("Vector DB pool unavailable for hybrid search. Using in-memory fallback.")
+            return self.search_tools_fallback(
+                query=query,
+                domain=domain,
+                user_roles=user_roles,
+                top_k=limit,
+                enforce_rbac=enforce_rbac,
+            )
+
+        query_vector = await self.vector_service.get_embedding(query)
+        if query_vector is None:
+            logger.info("Query embedding unavailable for hybrid search. Using in-memory fallback.")
+            return self.search_tools_fallback(
+                query=query,
+                domain=domain,
+                user_roles=user_roles,
+                top_k=limit,
+                enforce_rbac=enforce_rbac,
+            )
+
+        try:
+            vector_arr = [float(v) for v in query_vector]
+            should_enforce, roles_param = _resolve_rbac_roles(user_roles, enforce_rbac=enforce_rbac)
+            cleaned_query = (query or "").strip()
+            tokens = _extract_query_tokens(cleaned_query)
+            or_tsquery = " | ".join(tokens[:16]) if tokens else ""
+            acronyms = _extract_short_acronyms(cleaned_query)
+            acronym_regex = rf"\m({'|'.join(re.escape(a) for a in acronyms)})\M" if acronyms else ""
+
+            sql = f"""
+                WITH base AS (
+                    SELECT
+                        tool_name,
+                        domain,
+                        description,
+                        params_schema,
+                        required_permission,
+                        is_write,
+                        search_text,
+                        search_tsv,
+                        embedding
+                    FROM {self.table_name}
+                    WHERE ($2::text IS NULL OR domain = $2)
+                      AND (
+                          (NOT $3::boolean AND is_write = FALSE)
+                          OR (
+                              $3::boolean
+                              AND (
+                                  required_permission IS NULL
+                                  OR required_permission = ANY($4::text[])
+                                  OR 'admin' = ANY($4::text[])
+                              )
+                          )
+                      )
+                ),
+                vec_ranked AS (
+                    SELECT
+                        tool_name,
+                        (embedding <=> $1) AS distance,
+                        ROW_NUMBER() OVER (ORDER BY (embedding <=> $1) ASC, tool_name ASC) AS vec_rank
+                    FROM base
+                    WHERE embedding IS NOT NULL
+                      AND (embedding <=> $1) <= $5
+                    ORDER BY distance ASC, tool_name ASC
+                    LIMIT 15
+                ),
+                fts_scored AS (
+                    SELECT
+                        tool_name,
+                        (
+                            CASE
+                                WHEN $6::text <> '' AND search_tsv IS NOT NULL
+                                     AND search_tsv @@ websearch_to_tsquery('simple', $6)
+                                THEN ts_rank_cd(search_tsv, websearch_to_tsquery('simple', $6)) * 2.0
+                                ELSE 0.0
+                            END
+                            + CASE
+                                WHEN $7::text <> '' AND search_tsv IS NOT NULL
+                                     AND search_tsv @@ to_tsquery('simple', $7)
+                                THEN ts_rank_cd(search_tsv, to_tsquery('simple', $7))
+                                ELSE 0.0
+                            END
+                            + CASE
+                                WHEN $8::text <> '' AND coalesce(search_text, description) ~* $8
+                                THEN 0.25
+                                ELSE 0.0
+                            END
+                        ) AS fts_score
+                    FROM base
+                    WHERE (
+                        ($6::text <> '' AND search_tsv IS NOT NULL AND search_tsv @@ websearch_to_tsquery('simple', $6))
+                        OR ($7::text <> '' AND search_tsv IS NOT NULL AND search_tsv @@ to_tsquery('simple', $7))
+                        OR ($8::text <> '' AND coalesce(search_text, description) ~* $8)
+                    )
+                ),
+                fts_ranked AS (
+                    SELECT
+                        tool_name,
+                        fts_score,
+                        ROW_NUMBER() OVER (ORDER BY fts_score DESC, tool_name ASC) AS fts_rank
+                    FROM fts_scored
+                    ORDER BY fts_score DESC, tool_name ASC
+                    LIMIT 15
+                ),
+                combined AS (
+                    SELECT
+                        COALESCE(v.tool_name, f.tool_name) AS tool_name,
+                        v.distance,
+                        (
+                            COALESCE(1.0 / (60.0 + v.vec_rank), 0.0)
+                            + COALESCE(1.0 / (60.0 + f.fts_rank), 0.0)
+                        ) AS rrf_score
+                    FROM vec_ranked v
+                    FULL OUTER JOIN fts_ranked f ON v.tool_name = f.tool_name
+                )
+                SELECT
+                    b.tool_name,
+                    b.domain,
+                    b.description,
+                    b.params_schema,
+                    b.required_permission,
+                    b.is_write,
+                    c.distance,
+                    c.rrf_score
+                FROM combined c
+                JOIN base b ON b.tool_name = c.tool_name
+                ORDER BY c.rrf_score DESC, COALESCE(c.distance, 1.0) ASC, b.tool_name ASC
+                LIMIT $9;
+            """
+            async with pool.acquire() as conn:
+                records = await conn.fetch(
+                    sql,
+                    vector_arr,
+                    domain,
+                    should_enforce,
+                    roles_param,
+                    max_dist,
+                    cleaned_query,
+                    or_tsquery,
+                    acronym_regex,
+                    limit,
+                )
+
+            return [self._hydrate_db_record(r) for r in records]
+
+        except Exception as exc:
+            logger.warning(f"Error executing hybrid PGVector/FTS tool search: {exc}. Falling back to in-memory catalog.")
+            return self.search_tools_fallback(
+                query=query,
+                domain=domain,
+                user_roles=user_roles,
+                top_k=limit,
+                enforce_rbac=enforce_rbac,
+            )
+
+    def _run_async_search_sync(
+        self,
+        coro_fn,
+        query: str,
+        domain: Optional[str],
+        user_roles: Optional[List[str]],
+        top_k: Optional[int],
+        distance_threshold: Optional[float],
+        enforce_rbac: Optional[bool],
+        label: str,
+    ) -> List[Dict[str, Any]]:
+        """Shared safe sync wrapper around async retrieval coroutines with offline fallback."""
+        limit = top_k if top_k is not None else settings.TOOL_RETRIEVAL_TOP_K
+        is_test = "unittest" in sys.modules or os.environ.get("FASTPRINT_TEST_ENV") == "true" or settings.APP_ENV == "test"
+        if is_test or not settings.DYNAMIC_TOOL_RETRIEVAL_ENABLED or not settings.VECTOR_DB_URL:
+            return self.search_tools_fallback(
+                query=query,
+                domain=domain,
+                user_roles=user_roles,
+                top_k=limit,
+                enforce_rbac=enforce_rbac,
+            )
+
+        try:
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
+
+            kwargs = {
+                "query": query,
+                "domain": domain,
+                "user_roles": user_roles,
+                "top_k": limit,
+                "distance_threshold": distance_threshold,
+                "enforce_rbac": enforce_rbac,
+            }
+            if loop is not None and loop.is_running():
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                    return executor.submit(asyncio.run, coro_fn(**kwargs)).result(
+                        timeout=settings.REQUEST_TIMEOUT_SEC
+                    )
+            return asyncio.run(coro_fn(**kwargs))
+        except Exception as exc:
+            logger.warning(f"{label} execution failed: {exc}. Using in-memory fallback.")
+            return self.search_tools_fallback(
+                query=query,
+                domain=domain,
+                user_roles=user_roles,
+                top_k=limit,
+                enforce_rbac=enforce_rbac,
+            )
 
     def search_tools_sync(
         self,
@@ -962,100 +1354,135 @@ class ToolRegistryService:
         user_roles: Optional[List[str]] = None,
         top_k: Optional[int] = None,
         distance_threshold: Optional[float] = None,
+        enforce_rbac: Optional[bool] = None,
     ) -> List[Dict[str, Any]]:
         """
         Synchronous wrapper around search_tools with automatic fallback to in-memory matching.
         Safe for use inside synchronous nodes or test suites.
         """
-        limit = top_k if top_k is not None else settings.TOOL_RETRIEVAL_TOP_K
-        is_test = "unittest" in sys.modules or os.environ.get("FASTPRINT_TEST_ENV") == "true" or settings.APP_ENV == "test"
-        if is_test or not settings.DYNAMIC_TOOL_RETRIEVAL_ENABLED or not settings.VECTOR_DB_URL:
-            return self.search_tools_fallback(query=query, domain=domain, user_roles=user_roles, top_k=limit)
+        return self._run_async_search_sync(
+            coro_fn=self.search_tools,
+            query=query,
+            domain=domain,
+            user_roles=user_roles,
+            top_k=top_k,
+            distance_threshold=distance_threshold,
+            enforce_rbac=enforce_rbac,
+            label="search_tools_sync",
+        )
 
-        try:
-            try:
-                loop = asyncio.get_running_loop()
-            except RuntimeError:
-                loop = None
-
-            if loop is not None and loop.is_running():
-                import concurrent.futures
-                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-                    return executor.submit(
-                        asyncio.run,
-                        self.search_tools(
-                            query=query,
-                            domain=domain,
-                            user_roles=user_roles,
-                            top_k=limit,
-                            distance_threshold=distance_threshold,
-                        ),
-                    ).result(timeout=settings.REQUEST_TIMEOUT_SEC)
-            else:
-                return asyncio.run(
-                    self.search_tools(
-                        query=query,
-                        domain=domain,
-                        user_roles=user_roles,
-                        top_k=limit,
-                        distance_threshold=distance_threshold,
-                    )
-                )
-        except Exception as exc:
-            logger.warning(f"search_tools_sync execution failed: {exc}. Using in-memory fallback.")
-            return self.search_tools_fallback(query=query, domain=domain, user_roles=user_roles, top_k=limit)
+    def search_tools_hybrid_sync(
+        self,
+        query: str,
+        domain: Optional[str] = None,
+        user_roles: Optional[List[str]] = None,
+        top_k: Optional[int] = None,
+        distance_threshold: Optional[float] = None,
+        enforce_rbac: Optional[bool] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Synchronous wrapper around search_tools_hybrid with automatic fallback to in-memory matching.
+        """
+        return self._run_async_search_sync(
+            coro_fn=self.search_tools_hybrid,
+            query=query,
+            domain=domain,
+            user_roles=user_roles,
+            top_k=top_k,
+            distance_threshold=distance_threshold,
+            enforce_rbac=enforce_rbac,
+            label="search_tools_hybrid_sync",
+        )
 
     def search_tools_fallback(
         self,
         query: str,
         domain: Optional[str] = None,
         user_roles: Optional[List[str]] = None,
-        top_k: int = 5,
+        top_k: int = 8,
+        enforce_rbac: Optional[bool] = None,
     ) -> List[Dict[str, Any]]:
         """
-        In-memory keyword and RBAC fallback matching when database or embeddings are offline.
+        In-memory hybrid keyword, sample-query, description, and Conditional RBAC fallback scorer
+        used when PostgreSQL/PGVector or embeddings are offline or inside unit tests.
         """
         cleaned_query = (query or "").lower().strip()
-        tokens = [t for t in cleaned_query.split() if t not in FALLBACK_STOP_WORDS and len(t) > 2]
+        if not cleaned_query:
+            return []
+
+        tokens = _extract_query_tokens(cleaned_query)
+        token_set = set(tokens)
+        should_enforce, cleaned_roles = _resolve_rbac_roles(user_roles, enforce_rbac=enforce_rbac)
+        is_admin = "admin" in cleaned_roles
+        roles_set = set(cleaned_roles)
 
         candidates: List[Tuple[float, Dict[str, Any]]] = []
-        is_admin = bool(user_roles and "admin" in user_roles)
-        roles_set = set(user_roles) if user_roles else set()
 
         for tool in self._in_memory_catalog.values():
             # Domain check
             if domain and tool["domain"] != domain:
                 continue
 
-            # RBAC check
-            req_perm = tool.get("required_permission")
-            if req_perm is not None and not is_admin and req_perm not in roles_set:
+            # Conditional RBAC check
+            if should_enforce:
+                req_perm = tool.get("required_permission")
+                if req_perm is not None and not is_admin and req_perm not in roles_set:
+                    continue
+            elif tool.get("is_write", False):
                 continue
 
-            # Keyword and token match scoring
             score = 0.0
             desc_lower = tool["description"].lower()
+            desc_tokens = set(re.findall(r"[a-z0-9]+", desc_lower))
             name_lower = tool["tool_name"].lower()
+            name_parts = set(name_lower.split("_"))
             keywords = tool.get("keywords", [])
+            sample_queries = tool.get("sample_queries", [])
 
+            # 1. Exact keyword phrase matches
             for kw in keywords:
-                if re.search(rf"(?<!\w){re.escape(kw)}(?!\w)", cleaned_query):
-                    score += 3.0
+                if kw and re.search(rf"(?<!\w){re.escape(kw)}(?!\w)", cleaned_query):
+                    score += 3.5
 
+            # 2. Sample query overlap scoring (captures natural phrasing & slang)
+            best_sample_overlap = 0.0
+            all_sample_tokens: Set[str] = set()
+            for sq in sample_queries:
+                sq_low = sq.lower()
+                sq_tokens = set(_extract_query_tokens(sq_low))
+                all_sample_tokens.update(sq_tokens)
+                if not token_set or not sq_tokens:
+                    continue
+                overlap = len(token_set & sq_tokens)
+                if overlap >= 2:
+                    sample_score = min(4.5, overlap * 1.5)
+                    if sample_score > best_sample_overlap:
+                        best_sample_overlap = sample_score
+                elif overlap == 1 and len(token_set) == 1:
+                    best_sample_overlap = max(best_sample_overlap, 1.5)
+            score += best_sample_overlap
+
+            # 3. Individual token scoring against tool_name, description, and sample vocabulary
             for token in tokens:
-                if token in name_lower:
+                if token in name_parts or (len(token) >= 4 and token in name_lower):
                     score += 3.0
-                elif token in desc_lower:
+                elif token in desc_tokens or (len(token) >= 4 and token in desc_lower):
                     score += 1.0
+                elif token in all_sample_tokens:
+                    score += 0.75
 
-            # Only candidates with significant relevance score qualify
             if score >= 3.0:
                 candidates.append((score, tool))
 
-        # Sort descending by score
-        candidates.sort(key=lambda x: x[0], reverse=True)
+        candidates.sort(key=lambda x: (-x[0], x[1]["tool_name"]))
 
-        selected = [c[1] for c in candidates[:top_k]]
+        selected: List[Dict[str, Any]] = []
+        for rank_idx, (score, tool) in enumerate(candidates[:top_k], start=1):
+            item = dict(tool)
+            item["fallback_score"] = round(score, 4)
+            item["rrf_score"] = round(1.0 / (RRF_K_CONSTANT + rank_idx), 6)
+            item["distance"] = None
+            selected.append(item)
         return selected
 
     def get_tool_by_name(self, tool_name: str) -> Optional[Dict[str, Any]]:
