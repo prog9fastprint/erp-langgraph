@@ -10,9 +10,11 @@ from unittest.mock import AsyncMock, MagicMock
 from app.graph.nodes.router import router_node, PlannedToolCall
 from app.graph.state import create_initial_state
 from app.schemas.chat import ChatRequest
+from app.schemas.tools import TOOL_DOMAIN_MAP
 from app.services.tool_registry_service import (
     ToolRegistryService,
     CORE_TOOL_DEFINITIONS,
+    build_tool_search_text,
 )
 
 
@@ -37,6 +39,43 @@ class TestToolRegistryService(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(invoice_meta)
         self.assertEqual(invoice_meta["domain"], "accounting")
         self.assertEqual(invoice_meta["required_permission"], "accounting.view_invoices")
+
+    def test_all_36_enriched_tool_cards_and_search_text(self):
+        """All 36 core ERP tools match TOOL_DOMAIN_MAP and include sample_queries, negative_hints, and search_text."""
+        self.assertEqual(len(CORE_TOOL_DEFINITIONS), 36)
+        catalog_names = {t["tool_name"] for t in CORE_TOOL_DEFINITIONS}
+        self.assertEqual(catalog_names, set(TOOL_DOMAIN_MAP.keys()))
+
+        for tool in CORE_TOOL_DEFINITIONS:
+            name = tool["tool_name"]
+            with self.subTest(tool=name):
+                self.assertEqual(tool["domain"], TOOL_DOMAIN_MAP[name])
+                samples = tool.get("sample_queries") or []
+                self.assertGreaterEqual(len(samples), 3, f"{name} needs at least 3 sample_queries")
+                self.assertLessEqual(len(samples), 5, f"{name} should have at most 5 sample_queries")
+                self.assertTrue(all(isinstance(q, str) and q.strip() for q in samples))
+
+                neg = (tool.get("negative_hints") or "").strip()
+                self.assertTrue(len(neg) >= 15, f"{name} needs substantive negative_hints")
+
+                search_text = build_tool_search_text(tool)
+                self.assertIn(f"Tool: {name} ({tool['domain']})", search_text)
+                self.assertIn("Deskripsi:", search_text)
+                self.assertIn("Kata Kunci:", search_text)
+                self.assertIn("Contoh Pertanyaan:", search_text)
+                self.assertIn("Bukan Untuk:", search_text)
+
+                cached = self.registry.get_tool_by_name(name)
+                self.assertIsNotNone(cached)
+                self.assertEqual(cached["sample_queries"], samples)
+                self.assertEqual(cached["negative_hints"], neg)
+                self.assertEqual(cached["search_text"], search_text)
+
+        # Verify vendor billing boundary separation between get_vendor_bills and fetch_vendor_invoices
+        vendor_bills_meta = self.registry.get_tool_by_name("get_vendor_bills")
+        vendor_inv_meta = self.registry.get_tool_by_name("fetch_vendor_invoices")
+        self.assertIn("customer", vendor_bills_meta["negative_hints"].lower())
+        self.assertIn("get_vendor_bills", vendor_inv_meta["negative_hints"])
 
     def test_fallback_domain_filtering(self):
         """Fallback tool retrieval respects domain filter strictly."""
@@ -174,9 +213,13 @@ class TestToolRegistryService(unittest.IsolatedAsyncioTestCase):
         mock_pool = MagicMock()
         mock_conn = MagicMock()
 
-        # Simulate that all tools already exist in the database
+        # Simulate that all tools already exist in the database with up-to-date search_text
         existing_rows = [
-            {"tool_name": t["tool_name"], "description": t["description"]}
+            {
+                "tool_name": t["tool_name"],
+                "description": t["description"],
+                "search_text": build_tool_search_text(t),
+            }
             for t in CORE_TOOL_DEFINITIONS
         ]
         mock_conn.fetch = AsyncMock(return_value=existing_rows)
@@ -208,10 +251,14 @@ class TestToolRegistryService(unittest.IsolatedAsyncioTestCase):
         mock_pool = MagicMock()
         mock_conn = MagicMock()
 
-        # Simulate that only 1 tool exists in the database with unchanged description
-        stock_desc = next(t["description"] for t in CORE_TOOL_DEFINITIONS if t["tool_name"] == "get_stock_level")
+        # Simulate that only 1 tool exists in the database with unchanged description and search_text
+        stock_tool = next(t for t in CORE_TOOL_DEFINITIONS if t["tool_name"] == "get_stock_level")
         existing_rows = [
-            {"tool_name": "get_stock_level", "description": stock_desc}
+            {
+                "tool_name": "get_stock_level",
+                "description": stock_tool["description"],
+                "search_text": build_tool_search_text(stock_tool),
+            }
         ]
         mock_conn.fetch = AsyncMock(return_value=existing_rows)
         mock_conn.execute = AsyncMock(return_value="INSERT 0 1")
@@ -230,6 +277,111 @@ class TestToolRegistryService(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["skipped"], 1)
         self.assertEqual(result["created"], len(CORE_TOOL_DEFINITIONS) - 1)
         self.assertEqual(result["updated"], 0)
+
+    async def test_initialize_catalog_ddl_and_search_text_change_detection(self):
+        """DDL migrates search_text/search_tsv + GIN index; NULL or changed search_text triggers re-embedding."""
+        mock_vec_service = MagicMock()
+        mock_vec_service.get_embedding = AsyncMock(return_value=[0.3] * 768)
+
+        mock_pool = MagicMock()
+        mock_conn = MagicMock()
+
+        tool_a = {
+            "tool_name": "tool_legacy_null",
+            "domain": "accounting",
+            "description": "Same description A",
+            "params_schema": {},
+            "keywords": ["kas"],
+            "sample_queries": ["cek kas A", "saldo kas A", "lihat kas A"],
+            "negative_hints": "Bukan untuk stok barang gudang.",
+        }
+        tool_b = {
+            "tool_name": "tool_changed_hints",
+            "domain": "inventory",
+            "description": "Same description B",
+            "params_schema": {},
+            "keywords": ["stok"],
+            "sample_queries": ["cek stok B", "qty stok B", "sisa stok B"],
+            "negative_hints": "Bukan untuk laporan akuntansi laba rugi.",
+        }
+        tool_c = {
+            "tool_name": "tool_unchanged",
+            "domain": "sales",
+            "description": "Same description C",
+            "params_schema": {},
+            "keywords": ["omzet"],
+            "sample_queries": ["cek omzet C", "total sales C", "ringkasan C"],
+            "negative_hints": "Bukan untuk laporan neraca.",
+        }
+
+        existing_rows = [
+            {"tool_name": "tool_legacy_null", "description": "Same description A", "search_text": None},
+            {"tool_name": "tool_changed_hints", "description": "Same description B", "search_text": "Old search text"},
+            {
+                "tool_name": "tool_unchanged",
+                "description": "Same description C",
+                "search_text": build_tool_search_text(tool_c),
+            },
+        ]
+        mock_conn.fetch = AsyncMock(return_value=existing_rows)
+        mock_conn.execute = AsyncMock(return_value="OK")
+
+        mock_acquire = MagicMock()
+        mock_acquire.__aenter__ = AsyncMock(return_value=mock_conn)
+        mock_acquire.__aexit__ = AsyncMock(return_value=None)
+        mock_pool.acquire.return_value = mock_acquire
+        mock_vec_service.get_pool = AsyncMock(return_value=mock_pool)
+
+        service = ToolRegistryService(
+            vector_service=mock_vec_service,
+            default_definitions=[tool_a, tool_b, tool_c],
+        )
+
+        result = await service.initialize_catalog(force_update=False)
+
+        self.assertEqual(result, {"created": 0, "updated": 2, "skipped": 1})
+        ddl_sql = mock_conn.execute.call_args_list[0][0][0]
+        self.assertIn("ADD COLUMN IF NOT EXISTS search_text TEXT", ddl_sql)
+        self.assertIn("ADD COLUMN IF NOT EXISTS search_tsv tsvector GENERATED ALWAYS AS", ddl_sql)
+        self.assertIn("to_tsvector('simple', coalesce(search_text, ''))", ddl_sql)
+        self.assertIn("USING gin (search_tsv)", ddl_sql)
+
+        embedded_texts = [call.args[0] for call in mock_vec_service.get_embedding.call_args_list]
+        self.assertEqual(embedded_texts, [build_tool_search_text(tool_a), build_tool_search_text(tool_b)])
+
+    async def test_initialize_catalog_force_update_reembeds_all_with_search_text(self):
+        """force_update=True updates existing rows even when search_text is already identical."""
+        mock_vec_service = MagicMock()
+        mock_vec_service.get_embedding = AsyncMock(return_value=[0.4] * 768)
+
+        mock_pool = MagicMock()
+        mock_conn = MagicMock()
+        tool = {
+            "tool_name": "tool_force",
+            "domain": "sales",
+            "description": "Desc",
+            "params_schema": {},
+            "keywords": ["so"],
+            "sample_queries": ["cek so", "daftar so", "order so"],
+            "negative_hints": "Bukan untuk jurnal akuntansi.",
+        }
+        expected_search_text = build_tool_search_text(tool)
+        mock_conn.fetch = AsyncMock(
+            return_value=[{"tool_name": "tool_force", "description": "Desc", "search_text": expected_search_text}]
+        )
+        mock_conn.execute = AsyncMock(return_value="UPDATE 1")
+
+        mock_acquire = MagicMock()
+        mock_acquire.__aenter__ = AsyncMock(return_value=mock_conn)
+        mock_acquire.__aexit__ = AsyncMock(return_value=None)
+        mock_pool.acquire.return_value = mock_acquire
+        mock_vec_service.get_pool = AsyncMock(return_value=mock_pool)
+
+        service = ToolRegistryService(vector_service=mock_vec_service, default_definitions=[tool])
+        result = await service.initialize_catalog(force_update=True)
+
+        self.assertEqual(result, {"created": 0, "updated": 1, "skipped": 0})
+        mock_vec_service.get_embedding.assert_awaited_once_with(expected_search_text)
 
 
 class TestRouterDynamicToolRetrieval(unittest.TestCase):

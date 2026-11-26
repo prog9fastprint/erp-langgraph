@@ -3,8 +3,8 @@ Application Configuration settings loaded from environment variables and .env fi
 """
 import os
 import sys
-from typing import Optional, List
-from pydantic import Field, AliasChoices
+from typing import Literal, Optional, List
+from pydantic import Field, AliasChoices, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -107,8 +107,25 @@ class Settings(BaseSettings):
     # 6. Dynamic Semantic Tool Retrieval & RBAC
     DYNAMIC_TOOL_RETRIEVAL_ENABLED: bool = Field(default=True, validation_alias="DYNAMIC_TOOL_RETRIEVAL_ENABLED")
     TOOL_CATALOG_TABLE_NAME: str = Field(default="ai_tool_catalog", validation_alias="TOOL_CATALOG_TABLE_NAME")
-    TOOL_RETRIEVAL_TOP_K: int = Field(default=5, validation_alias="TOOL_RETRIEVAL_TOP_K")
-    TOOL_RETRIEVAL_DISTANCE_THRESHOLD: float = Field(default=0.65, validation_alias="TOOL_RETRIEVAL_DISTANCE_THRESHOLD")
+    TOOL_RETRIEVAL_TOP_K: int = Field(default=8, validation_alias="TOOL_RETRIEVAL_TOP_K")
+    TOOL_RETRIEVAL_DISTANCE_THRESHOLD: float = Field(default=0.72, validation_alias="TOOL_RETRIEVAL_DISTANCE_THRESHOLD")
+
+    # 7. Hybrid Semantic NLU Router & Shadow Rollout
+    NLU_ROUTER_MODE: Literal["legacy_regex", "semantic_llm", "shadow"] = Field(
+        default="legacy_regex",
+        validation_alias="NLU_ROUTER_MODE",
+    )
+    NLU_SHADOW_LOG_MISMATCH_ONLY: bool = Field(
+        default=True,
+        validation_alias="NLU_SHADOW_LOG_MISMATCH_ONLY",
+    )
+
+    @field_validator("NLU_ROUTER_MODE", mode="before")
+    @classmethod
+    def _normalize_nlu_router_mode(cls, value):
+        if isinstance(value, str):
+            return value.strip().lower()
+        return value
 
 
 def _is_test_runtime() -> bool:

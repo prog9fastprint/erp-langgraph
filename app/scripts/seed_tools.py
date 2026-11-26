@@ -22,7 +22,7 @@ async def main() -> int:
     parser.add_argument(
         "--update-existing",
         action="store_true",
-        help="Update existing tools and recompute embeddings (default is incremental insert only).",
+        help="Force recomputing search_text and embeddings for all existing tools (incremental mode already auto-updates changed search_text).",
     )
     parser.add_argument(
         "--domain",
@@ -57,7 +57,12 @@ async def main() -> int:
     if args.dry_run:
         for t in filtered_defs:
             perm = t.get("required_permission") or "public"
-            print(f" - [{t['domain']}] {t['tool_name']} (Perm: {perm}) -> {t['description'][:60]}...")
+            sample_count = len(t.get("sample_queries") or [])
+            has_neg = "yes" if (t.get("negative_hints") or "").strip() else "no"
+            print(
+                f" - [{t['domain']}] {t['tool_name']} "
+                f"(Perm: {perm}, Samples: {sample_count}, NegHints: {has_neg}) -> {t['description'][:60]}..."
+            )
         logger.info("Dry run complete. No database changes were made.")
         return 0
 
@@ -70,6 +75,9 @@ async def main() -> int:
         force_update=args.update_existing,
         domain_filter=args.domain,
     )
+    if result.get("error"):
+        logger.error("Tool catalog seeding failed: database pool unavailable.")
+        return 1
 
     logger.info(
         f"Seeding finished successfully: {result.get('created', 0)} created, "

@@ -5,7 +5,7 @@ Validates TASK-2.2 requirements in the canonical architecture.
 import os
 import unittest
 from unittest.mock import patch
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from app.core.config import Settings, settings
 from app.services.llm import get_chat_model
@@ -53,6 +53,39 @@ class TestCentralizedConfig(unittest.TestCase):
         with patch.dict(os.environ, env_precedence, clear=False):
             precedence_settings = Settings(_env_file=None)
             self.assertEqual(precedence_settings.ERP_BASE_URL, "http://primary.erp:8000")
+
+    def test_nlu_router_and_retrieval_defaults_and_validation(self):
+        """Verify NLU_ROUTER_MODE defaults, normalization, strict Literal validation, and retrieval defaults."""
+        clean_env = {
+            k: v
+            for k, v in os.environ.items()
+            if k
+            not in (
+                "NLU_ROUTER_MODE",
+                "NLU_SHADOW_LOG_MISMATCH_ONLY",
+                "TOOL_RETRIEVAL_TOP_K",
+                "TOOL_RETRIEVAL_DISTANCE_THRESHOLD",
+            )
+        }
+        with patch.dict(os.environ, clean_env, clear=True):
+            cfg = Settings(_env_file=None)
+            self.assertEqual(cfg.NLU_ROUTER_MODE, "legacy_regex")
+            self.assertTrue(cfg.NLU_SHADOW_LOG_MISMATCH_ONLY)
+            self.assertEqual(cfg.TOOL_RETRIEVAL_TOP_K, 8)
+            self.assertAlmostEqual(cfg.TOOL_RETRIEVAL_DISTANCE_THRESHOLD, 0.72)
+
+        with patch.dict(os.environ, {"NLU_ROUTER_MODE": "  SEMANTIC_LLM "}, clear=False):
+            cfg_sem = Settings(_env_file=None)
+            self.assertEqual(cfg_sem.NLU_ROUTER_MODE, "semantic_llm")
+
+        with patch.dict(os.environ, {"NLU_ROUTER_MODE": "SHADOW", "NLU_SHADOW_LOG_MISMATCH_ONLY": "false"}, clear=False):
+            cfg_shadow = Settings(_env_file=None)
+            self.assertEqual(cfg_shadow.NLU_ROUTER_MODE, "shadow")
+            self.assertFalse(cfg_shadow.NLU_SHADOW_LOG_MISMATCH_ONLY)
+
+        with patch.dict(os.environ, {"NLU_ROUTER_MODE": "invalid_mode"}, clear=False):
+            with self.assertRaises(ValidationError):
+                Settings(_env_file=None)
 
 
 class TestLLMClientFactory(unittest.TestCase):
