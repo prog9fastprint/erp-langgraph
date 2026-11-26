@@ -58,13 +58,13 @@ DJANGO_TECHNICAL_FIELDS: Set[str] = {
 def clean_product_identifier(value: Optional[str]) -> Optional[str]:
     """
     Strip conversational noise or leading prefixes like 'product', 'produk', 'barang', 'item', 'sku', 'kode'.
-    Preserves exact SKU codes and clean product names.
+    Preserves hyphenated SKU codes (e.g. 'SKU-UNKNOWN-999') and clean product names.
     """
     if not value or not isinstance(value, str):
         return value
     cleaned = value.strip().strip("'\"").rstrip("?!.,;: '\"")
     res = re.sub(
-        r"^(?:(?:nama\s+(?:produk|barang|product|item)|product|produk|barang|item|sku|kode)\s*[:\-]?\s*)+",
+        r"^(?:(?:nama\s+(?:produk|barang|product|item)|product|produk|barang|item|sku|kode)(?:\s*:\s*|\s+-\s+|\s+))+",
         "",
         cleaned,
         flags=re.IGNORECASE,

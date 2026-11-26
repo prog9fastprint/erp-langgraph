@@ -75,6 +75,123 @@ def _extract_total_count(tool_result: Any, displayed_count: int) -> int:
     return displayed_count
 
 
+def _is_zero_metric(*values: Any) -> bool:
+    """Return True when every provided metric value is effectively zero."""
+    return all(abs(float(v or 0.0)) < 0.005 for v in values)
+
+
+def _append_zero_branch_footnote(
+    lines: List[str],
+    zero_branches: List[str],
+    label: str = "Cabang tanpa aktivitas / saldo Rp 0,00 (tidak ditampilkan di tabel)",
+) -> None:
+    """Append one compact footnote listing omitted zero-activity branches."""
+    if not zero_branches:
+        return
+    clean_names = list(dict.fromkeys(str(b).strip() for b in zero_branches if str(b).strip()))
+    if clean_names:
+        lines.append(f"\n*{label}: {', '.join(clean_names)}.*")
+
+
+def _resolve_company_display_label(
+    tool_result: Any,
+    extracted_params: Optional[Dict[str, Any]] = None,
+    default_company_id: Optional[int] = None,
+) -> Optional[str]:
+    """Resolve readable branch/company label from tool response or scoped company_id."""
+    if isinstance(tool_result, dict) and tool_result.get("company_name"):
+        return str(tool_result["company_name"]).strip()
+    cid = (
+        (tool_result.get("company_id") if isinstance(tool_result, dict) else None)
+        or (extracted_params.get("company_id") if isinstance(extracted_params, dict) else None)
+        or default_company_id
+    )
+    if cid is not None:
+        from app.graph.nodes.extractor import COMPANY_NAME_MAP
+        try:
+            return COMPANY_NAME_MAP.get(int(cid), f"Company #{int(cid)}")
+        except (TypeError, ValueError):
+            pass
+    return None
+
+
+def _resolve_period_bounds(
+    tool_result: Any,
+    extracted_params: Optional[Dict[str, Any]] = None,
+) -> Tuple[Optional[str], Optional[str]]:
+    """Extract period date_from/date_to from tool result envelope or extracted_params."""
+    period = tool_result.get("period") if isinstance(tool_result, dict) and isinstance(tool_result.get("period"), dict) else {}
+    df = (
+        (tool_result.get("date_from") if isinstance(tool_result, dict) else None)
+        or period.get("date_from")
+        or (extracted_params.get("date_from") if isinstance(extracted_params, dict) else None)
+    )
+    dt = (
+        (tool_result.get("date_to") if isinstance(tool_result, dict) else None)
+        or period.get("date_to")
+        or (extracted_params.get("date_to") if isinstance(extracted_params, dict) else None)
+    )
+    return (str(df) if df else None), (str(dt) if dt else None)
+
+
+def _resolve_product_display_price(prod: Dict[str, Any]) -> float:
+    """Resolve best sales price prioritizing positive effective pricelist over nominal fallbacks."""
+    for key in (
+        "effective_sales_price",
+        "default_sales_price",
+        "sales_price",
+        "list_price",
+        "price",
+        "last_unit_price",
+    ):
+        val = prod.get(key)
+        if val is not None:
+            try:
+                fval = float(val)
+                if fval > 0:
+                    return fval
+            except (TypeError, ValueError):
+                pass
+    return float(
+        prod.get("default_sales_price")
+        or prod.get("list_price")
+        or prod.get("last_unit_price")
+        or 0.0
+    )
+
+
+def _format_contact_table_rows(
+    contacts: List[Dict[str, Any]],
+    max_rows: Optional[int] = None,
+) -> List[str]:
+    """Render standardized Markdown rows for contact/buyer tables with list-field fallbacks."""
+    rows: List[str] = []
+    subset = contacts[:max_rows] if max_rows is not None else contacts
+    for idx, c in enumerate(subset, start=1):
+        c_name = c.get("name") or "-"
+        hp = c.get("phone") or c.get("mobile") or "-"
+        city = c.get("city") or c.get("state") or "-"
+        ch_list = c.get("channels") or []
+        ch_src = ", ".join(str(x) for x in ch_list if x) if isinstance(ch_list, list) else str(ch_list or "")
+        if not ch_src:
+            ch_src = c.get("first_time_source") or "-"
+        sp_list = c.get("sales_phones") or []
+        s_hp = ", ".join(str(x) for x in sp_list if x) if isinstance(sp_list, list) else str(sp_list or "")
+        if not s_hp:
+            s_hp = c.get("sales_phone") or "-"
+        o_cnt = int(c.get("orders_count") or 0)
+        t_spent = float(c.get("total_spent") or 0.0)
+        spent_str = f"{o_cnt} order ({_format_rupiah(t_spent)})" if o_cnt > 0 or t_spent > 0 else "-"
+        recent = c.get("recent_orders") or []
+        recent_str = ", ".join(
+            f"`{ro.get('so_number')}` ({ro.get('company_name') or '-'}, `{ro.get('status') or '-'}`)"
+            for ro in recent[:2]
+            if isinstance(ro, dict) and ro.get("so_number")
+        ) or "-"
+        rows.append(f"| {idx} | **{c_name}** | {hp} | {city} | {ch_src} | {s_hp} | {spent_str} | {recent_str} |")
+    return rows
+
+
 def _append_pagination_footer(
     lines: List[str],
     displayed_count: int,
@@ -189,7 +306,15 @@ def _format_single_tool_presentation(
         accounts = tool_result.get("accounts") or []
         total_count = _extract_total_count(tool_result, len(accounts))
         totals = tool_result.get("totals") or {}
-        lines.append("### Informasi Saldo Chart of Account (Accounting Balance)\n")
+        comp_lbl = _resolve_company_display_label(tool_result, extracted_params, default_company_id)
+        d_from, d_to = _resolve_period_bounds(tool_result, extracted_params)
+        scope_notes: List[str] = []
+        if comp_lbl:
+            scope_notes.append(f"Cabang: {comp_lbl}")
+        if d_from or d_to:
+            scope_notes.append(f"Periode: {d_from or '-'} s/d {d_to or '-'}")
+        scope_suffix = f" ({', '.join(scope_notes)})" if scope_notes else ""
+        lines.append(f"### Informasi Saldo Chart of Account (Accounting Balance){scope_suffix}\n")
 
         # Tier 1: Single account presentation (Direct KPI + Bullet List)
         if len(accounts) == 1:
@@ -235,7 +360,12 @@ def _format_single_tool_presentation(
                 kred = _format_rupiah(acc.get("period_credit", acc.get("total_credit", 0.0)))
                 net = _format_rupiah(acc.get("ending_balance", acc.get("net_balance", 0.0)))
                 lines.append(f"| `{code}` | {name} | {op} | {deb} | {kred} | **{net}** |")
-            _append_pagination_footer(lines, len(accounts), total_count)
+            _append_pagination_footer(
+                lines,
+                len(accounts),
+                total_count,
+                filter_hint="Klik **Lihat Full Table** atau sebutkan kode/nama akun spesifik untuk menelusuri seluruh data.",
+            )
         elif not totals:
             net = _format_rupiah(tool_result.get("net_balance", 0.0))
             deb = _format_rupiah(tool_result.get("total_debit", 0.0))
@@ -289,9 +419,10 @@ def _format_single_tool_presentation(
     # 2.2 Profit & Loss (Laba Rugi)
     if tool == "get_profit_and_loss":
         summary = tool_result.get("summary") or {}
-        d_from = tool_result.get("date_from") or "-"
-        d_to = tool_result.get("date_to") or "-"
-        lines.append(f"### Laporan Laba Rugi (Profit & Loss) — Periode: {d_from} s/d {d_to}\n")
+        d_from, d_to = _resolve_period_bounds(tool_result, extracted_params)
+        comp_lbl = _resolve_company_display_label(tool_result, extracted_params, default_company_id)
+        comp_tag = f" ({comp_lbl})" if comp_lbl else ""
+        lines.append(f"### Laporan Laba Rugi (Profit & Loss){comp_tag} — Periode: {d_from or '-'} s/d {d_to or '-'}\n")
         lines.append("| Metrik Keuangan | Nilai Nominal |")
         lines.append("|:---|:---|")
         lines.append(f"| **Pendapatan Usaha (Revenue)** | {_format_rupiah(summary.get('total_revenue', 0.0))} |")
@@ -323,8 +454,10 @@ def _format_single_tool_presentation(
     # 2.3 Balance Sheet (Neraca Keuangan)
     if tool == "get_balance_sheet":
         summary = tool_result.get("summary") or {}
-        as_of = tool_result.get("as_of_date") or "-"
-        lines.append(f"### Laporan Neraca Keuangan (Balance Sheet) — Posisi per: {as_of}\n")
+        as_of = tool_result.get("as_of_date") or (extracted_params.get("as_of_date") if isinstance(extracted_params, dict) else None) or "-"
+        comp_lbl = _resolve_company_display_label(tool_result, extracted_params, default_company_id)
+        comp_tag = f" ({comp_lbl})" if comp_lbl else ""
+        lines.append(f"### Laporan Neraca Keuangan (Balance Sheet){comp_tag} — Posisi per: {as_of}\n")
         lines.append("| Posisi Keuangan | Nilai Nominal |")
         lines.append("|:---|:---|")
         lines.append(f"| **Total Aset (Assets)** | **{_format_rupiah(summary.get('total_assets', 0.0))}** |")
@@ -728,16 +861,27 @@ def _format_single_tool_presentation(
             lines.append("| No | Tanggal | Referensi | Produk / SKU | Operasi | Lokasi / Rak | Mutasi Qty | Saldo Akhir |")
             lines.append("|:---|:---|:---|:---|:---|:---|:---|:---|")
             for idx, h in enumerate(hist, start=1):
-                tgl = h.get("date") or "-"
-                ref = h.get("reference") or "-"
-                p_label = h.get("code") or h.get("product_name") or "-"
+                raw_tgl = str(h.get("date") or "-")
+                tgl = raw_tgl[:16].replace("T", " ") if "T" in raw_tgl else raw_tgl
+                ref = h.get("source_ref") or h.get("reference") or h.get("identified_number") or "-"
+                prod_obj = h.get("product") if isinstance(h.get("product"), dict) else {}
+                p_code = prod_obj.get("code") or h.get("code")
+                p_name = prod_obj.get("name") or h.get("product_name")
+                p_label = f"`{p_code}` {p_name}".strip() if (p_code and p_name) else (f"`{p_code}`" if p_code else (p_name or "-"))
                 op = h.get("operation_type") or "-"
-                loc = h.get("location_name") or "-"
-                qty_done = h.get("qty_done", 0.0)
-                bal = h.get("balance")
-                bal_str = f"{bal:g}" if bal is not None else "-"
+                wh_obj = h.get("warehouse") if isinstance(h.get("warehouse"), dict) else {}
+                loc_obj = h.get("location") if isinstance(h.get("location"), dict) else {}
+                loc = " / ".join(p for p in (wh_obj.get("name"), loc_obj.get("name") or h.get("location_name")) if p) or "-"
+                qty_done = float(h.get("qty_change") if h.get("qty_change") is not None else (h.get("qty_done") or 0.0))
+                bal = h.get("final_stock") if h.get("final_stock") is not None else h.get("balance")
+                bal_str = f"{float(bal):g}" if bal is not None else "-"
                 lines.append(f"| {idx} | {tgl} | `{ref}` | {p_label} | {op} | {loc} | **{qty_done:+g}** | {bal_str} |")
-            _append_pagination_footer(lines, len(hist), total_count)
+            _append_pagination_footer(
+                lines,
+                len(hist),
+                total_count,
+                filter_hint="Gunakan kata kunci SKU/produk atau periode tanggal lebih spesifik, atau klik **Lihat Full Table** untuk menelusuri seluruh data.",
+            )
         else:
             lines.append("Tidak ada riwayat pergerakan stok tercatat pada periode ini.")
         return "\n".join(lines)
@@ -989,6 +1133,8 @@ def _format_single_tool_presentation(
         st_filter = tool_result.get("status_filter", "active") if isinstance(tool_result, dict) else "active"
         sort_by = tool_result.get("sort_by") if isinstance(tool_result, dict) else (extracted_params or {}).get("sort_by")
         has_company = any(bool(o.get("company_name")) for o in orders)
+        d_from, d_to = _resolve_period_bounds(tool_result, extracted_params)
+        period_note = f", Periode: {d_from or '-'} s/d {d_to or '-'}" if (d_from or d_to) else ""
 
         if orders and sort_by == "amount_desc":
             top_o = orders[0]
@@ -1002,7 +1148,7 @@ def _format_single_tool_presentation(
                 f"(**{top_comp}**, pelanggan **{top_cust}**, status `{top_st}`) sebesar **{_format_rupiah(top_amt)}**.\n"
             )
 
-        lines.append(f"### Daftar Pesanan Penjualan & Quotation ({len(orders)} dari {total_cnt} Dokumen, Status: `{st_filter}`)\n")
+        lines.append(f"### Daftar Pesanan Penjualan & Quotation ({len(orders)} dari {total_cnt} Dokumen, Status: `{st_filter}`{period_note})\n")
         if orders:
             if has_company:
                 lines.append("| No | Cabang | No. SO / Quotation | Tanggal | Pelanggan | Kontak HP | Channel | Status | Total Nominal |")
@@ -1027,6 +1173,12 @@ def _format_single_tool_presentation(
                 lines.append(f"| | **TOTAL** | | | | | | | **{_format_rupiah(tot_sum)}** |")
             else:
                 lines.append(f"| | **TOTAL** | | | | | | **{_format_rupiah(tot_sum)}** |")
+            _append_pagination_footer(
+                lines,
+                len(orders),
+                total_cnt,
+                filter_hint="Gunakan filter periode tanggal/status atau klik **Lihat Full Table** untuk melihat seluruh daftar order.",
+            )
         else:
             lines.append("*Tidak ada dokumen sales order atau quotation yang sesuai dengan kriteria filter.*")
         return "\n".join(lines)
@@ -1054,22 +1206,13 @@ def _format_single_tool_presentation(
         if contacts:
             lines.append("| No | Nama Kontak | No. HP / WA | Kota | Channel | Sales HP | Order / Total Belanja | Dokumen Terbaru |")
             lines.append("|:---:|:---|:---|:---|:---|:---|:---|:---|")
-            for idx, c in enumerate(contacts, start=1):
-                c_name = c.get("name") or "-"
-                hp = c.get("phone") or c.get("mobile") or "-"
-                city = c.get("city") or c.get("state") or "-"
-                ch_src = c.get("first_time_source") or "-"
-                s_hp = c.get("sales_phone") or "-"
-                o_cnt = int(c.get("orders_count") or 0)
-                t_spent = float(c.get("total_spent") or 0.0)
-                spent_str = f"{o_cnt} order ({_format_rupiah(t_spent)})" if o_cnt > 0 or t_spent > 0 else "-"
-                recent = c.get("recent_orders") or []
-                recent_str = ", ".join(
-                    f"`{ro.get('so_number')}` ({ro.get('company_name') or '-'}, `{ro.get('status') or '-'}`)"
-                    for ro in recent[:2]
-                    if isinstance(ro, dict) and ro.get("so_number")
-                ) or "-"
-                lines.append(f"| {idx} | **{c_name}** | {hp} | {city} | {ch_src} | {s_hp} | {spent_str} | {recent_str} |")
+            lines.extend(_format_contact_table_rows(contacts))
+            _append_pagination_footer(
+                lines,
+                len(contacts),
+                total_cnt,
+                filter_hint="Sebutkan nama/nomor HP kontak spesifik atau klik **Lihat Full Table** untuk melihat seluruh data.",
+            )
 
             if len(contacts) <= 3:
                 for c in contacts:
@@ -1167,10 +1310,14 @@ def _format_single_tool_presentation(
         if not isinstance(tool_result, dict):
             return "Ringkasan data penjualan tidak ditemukan."
 
-        period = tool_result.get("period") or {}
-        df = period.get("date_from") or ""
-        dt = period.get("date_to") or ""
-        p_str = f" (Periode {df} s/d {dt})" if (df or dt) else ""
+        df, dt = _resolve_period_bounds(tool_result, extracted_params)
+        comp_lbl = _resolve_company_display_label(tool_result, extracted_params, default_company_id)
+        meta_parts: List[str] = []
+        if comp_lbl:
+            meta_parts.append(f"Cabang: {comp_lbl}")
+        if df or dt:
+            meta_parts.append(f"Periode {df or '-'} s/d {dt or '-'}")
+        p_str = f" ({', '.join(meta_parts)})" if meta_parts else ""
 
         conf = tool_result.get("confirmed_metrics") or {}
         real_rev = float(conf.get("realized_revenue") or 0.0)
@@ -1670,21 +1817,36 @@ def _format_single_tool_presentation(
     return f"Hasil eksekusi data ERP: {str(tool_result)}"
 
 
+def _resolve_mc_period_note(mc_results: Dict[int, Any], extracted_params: Optional[Dict[str, Any]]) -> str:
+    """Resolve optional period suffix for multi-company report headers."""
+    for res in mc_results.values():
+        if isinstance(res, dict):
+            df, dt = _resolve_period_bounds(res, extracted_params)
+            if df or dt:
+                return f" (Periode: {df or '-'} s/d {dt or '-'})"
+    df, dt = _resolve_period_bounds(None, extracted_params)
+    return f" (Periode: {df or '-'} s/d {dt or '-'})" if (df or dt) else ""
+
+
 def _format_multi_company_presentation(state: AgentState) -> str:
     """
     Format multi-company comparison and network-wide rollups into structured Markdown.
-    Includes per-company breakdown, grand total rollup summary, and partial permission warnings.
+    Includes per-company breakdown, grand total rollup summary, omitted zero-branch footnote,
+    and partial permission warnings.
     """
     from app.graph.nodes.extractor import COMPANY_NAME_MAP
 
     tool = state.get("detected_tool") or "get_account_balance"
     mc_results = state.get("multi_company_results") or {}
     unauth = state.get("unauthorized_companies") or []
+    ext_params = state.get("extracted_params") or {}
+    period_note = _resolve_mc_period_note(mc_results, ext_params)
     lines: List[str] = []
+    zero_branches: List[str] = []
 
     # 1. Account Balance Multi-Company Presentation
     if tool == "get_account_balance":
-        lines.append("### Laporan Saldo Akun Multi-Perusahaan (Combined Accounting Balance)\n")
+        lines.append(f"### Laporan Saldo Akun Multi-Perusahaan (Combined Accounting Balance){period_note}\n")
         lines.append("| No | Perusahaan / Cabang | Saldo Awal | Mutasi Debit | Mutasi Kredit | Saldo Akhir |")
         lines.append("|:---|:---|:---|:---|:---|:---|")
         tot_op = 0.0
@@ -1697,9 +1859,11 @@ def _format_multi_company_presentation(state: AgentState) -> str:
             c_name = COMPANY_NAME_MAP.get(cid, f"Cabang {cid}")
             res = mc_results.get(cid)
             if not res:
-                st_text = "Akses Dibatasi (HTTP 403)" if cid in unauth else "Tidak Ada Data"
-                lines.append(f"| {row_idx} | {c_name} | - | - | - | *{st_text}* |")
-                row_idx += 1
+                if cid in unauth:
+                    lines.append(f"| {row_idx} | {c_name} | - | - | - | *Akses Dibatasi (HTTP 403)* |")
+                    row_idx += 1
+                else:
+                    zero_branches.append(c_name)
                 continue
 
             totals = res.get("totals") or {}
@@ -1707,6 +1871,10 @@ def _format_multi_company_presentation(state: AgentState) -> str:
             deb = float(totals.get("period_debit", res.get("total_debit", 0.0)) or 0.0)
             kred = float(totals.get("period_credit", res.get("total_credit", 0.0)) or 0.0)
             end = float(totals.get("ending_balance", res.get("net_balance", 0.0)) or 0.0)
+
+            if _is_zero_metric(op, deb, kred, end):
+                zero_branches.append(c_name)
+                continue
 
             tot_op += op
             tot_deb += deb
@@ -1719,14 +1887,17 @@ def _format_multi_company_presentation(state: AgentState) -> str:
             )
             row_idx += 1
 
+        if row_idx == 1 and zero_branches:
+            lines.append("| - | *Seluruh cabang bersaldo Rp 0,00* | Rp 0,00 | Rp 0,00 | Rp 0,00 | **Rp 0,00** |")
         lines.append(
             f"| | **TOTAL GABUNGAN** | **{_format_rupiah(tot_op)}** | **{_format_rupiah(tot_deb)}** | "
             f"**{_format_rupiah(tot_kred)}** | **{_format_rupiah(tot_end)}** |"
         )
+        _append_zero_branch_footnote(lines, zero_branches)
 
     # 2. Profit & Loss Multi-Company Presentation
     elif tool == "get_profit_and_loss":
-        lines.append("### Laporan Laba Rugi Multi-Perusahaan (Combined Profit & Loss)\n")
+        lines.append(f"### Laporan Laba Rugi Multi-Perusahaan (Combined Profit & Loss){period_note}\n")
         lines.append("| No | Perusahaan / Cabang | Pendapatan Usaha | HPP (COGS) | Laba Kotor | Laba / (Rugi) Bersih |")
         lines.append("|:---|:---|:---|:---|:---|:---|")
         tot_rev = 0.0
@@ -1739,9 +1910,11 @@ def _format_multi_company_presentation(state: AgentState) -> str:
             c_name = COMPANY_NAME_MAP.get(cid, f"Cabang {cid}")
             res = mc_results.get(cid)
             if not res:
-                st_text = "Akses Dibatasi (HTTP 403)" if cid in unauth else "Tidak Ada Data"
-                lines.append(f"| {row_idx} | {c_name} | - | - | - | *{st_text}* |")
-                row_idx += 1
+                if cid in unauth:
+                    lines.append(f"| {row_idx} | {c_name} | - | - | - | *Akses Dibatasi (HTTP 403)* |")
+                    row_idx += 1
+                else:
+                    zero_branches.append(c_name)
                 continue
 
             summary = res.get("summary") or res
@@ -1749,6 +1922,10 @@ def _format_multi_company_presentation(state: AgentState) -> str:
             cogs = float(summary.get("cogs", 0.0) or 0.0)
             gross = float(summary.get("gross_profit", 0.0) or 0.0)
             net = float(summary.get("net_profit", 0.0) or 0.0)
+
+            if _is_zero_metric(rev, cogs, gross, net):
+                zero_branches.append(c_name)
+                continue
 
             tot_rev += rev
             tot_cogs += cogs
@@ -1761,10 +1938,13 @@ def _format_multi_company_presentation(state: AgentState) -> str:
             )
             row_idx += 1
 
+        if row_idx == 1 and zero_branches:
+            lines.append("| - | *Seluruh cabang tanpa aktivitas pendapatan/beban* | Rp 0,00 | Rp 0,00 | Rp 0,00 | **Rp 0,00** |")
         lines.append(
             f"| | **TOTAL GABUNGAN** | **{_format_rupiah(tot_rev)}** | **{_format_rupiah(tot_cogs)}** | "
             f"**{_format_rupiah(tot_gross)}** | **{_format_rupiah(tot_net)}** |"
         )
+        _append_zero_branch_footnote(lines, zero_branches)
 
         # Rincian akun per cabang jika terdapat breakdown aktif
         has_breakdown = any(
@@ -1799,7 +1979,12 @@ def _format_multi_company_presentation(state: AgentState) -> str:
 
     # 3. Balance Sheet Multi-Company Presentation
     elif tool == "get_balance_sheet":
-        lines.append("### Laporan Neraca Multi-Perusahaan (Combined Balance Sheet)\n")
+        as_of_note = ""
+        for res in mc_results.values():
+            if isinstance(res, dict) and res.get("as_of_date"):
+                as_of_note = f" (Posisi per: {res['as_of_date']})"
+                break
+        lines.append(f"### Laporan Neraca Multi-Perusahaan (Combined Balance Sheet){as_of_note}\n")
         lines.append("| No | Perusahaan / Cabang | Total Aset | Total Liabilitas | Total Ekuitas |")
         lines.append("|:---|:---|:---|:---|:---|")
         tot_ast = 0.0
@@ -1811,15 +1996,21 @@ def _format_multi_company_presentation(state: AgentState) -> str:
             c_name = COMPANY_NAME_MAP.get(cid, f"Cabang {cid}")
             res = mc_results.get(cid)
             if not res:
-                st_text = "Akses Dibatasi (HTTP 403)" if cid in unauth else "Tidak Ada Data"
-                lines.append(f"| {row_idx} | {c_name} | - | - | *{st_text}* |")
-                row_idx += 1
+                if cid in unauth:
+                    lines.append(f"| {row_idx} | {c_name} | - | - | *Akses Dibatasi (HTTP 403)* |")
+                    row_idx += 1
+                else:
+                    zero_branches.append(c_name)
                 continue
 
             summary = res.get("summary") or res
             ast = float(summary.get("total_assets", 0.0) or 0.0)
             lia = float(summary.get("total_liabilities", 0.0) or 0.0)
             equ = float(summary.get("total_equity", 0.0) or 0.0)
+
+            if _is_zero_metric(ast, lia, equ):
+                zero_branches.append(c_name)
+                continue
 
             tot_ast += ast
             tot_lia += lia
@@ -1831,10 +2022,13 @@ def _format_multi_company_presentation(state: AgentState) -> str:
             )
             row_idx += 1
 
+        if row_idx == 1 and zero_branches:
+            lines.append("| - | *Seluruh cabang memiliki neraca Rp 0,00* | Rp 0,00 | Rp 0,00 | **Rp 0,00** |")
         lines.append(
             f"| | **TOTAL GABUNGAN** | **{_format_rupiah(tot_ast)}** | **{_format_rupiah(tot_lia)}** | "
             f"**{_format_rupiah(tot_equ)}** |"
         )
+        _append_zero_branch_footnote(lines, zero_branches)
 
     # 4. Stock Level Multi-Company Presentation
     elif tool == "get_stock_level":
@@ -1849,21 +2043,27 @@ def _format_multi_company_presentation(state: AgentState) -> str:
             c_name = COMPANY_NAME_MAP.get(cid, f"Cabang {cid}")
             res = mc_results.get(cid)
             if not res:
-                st_text = "Akses Dibatasi (HTTP 403)" if cid in unauth else "Tidak Ada Data"
-                lines.append(f"| {row_idx} | {c_name} | - | - | - | - | - | *{st_text}* |")
-                row_idx += 1
+                if cid in unauth:
+                    lines.append(f"| {row_idx} | {c_name} | - | - | - | - | - | *Akses Dibatasi (HTTP 403)* |")
+                    row_idx += 1
+                else:
+                    zero_branches.append(c_name)
                 continue
 
             items = res.get("stocks") or res.get("items") or [res]
+            branch_wrote_row = False
             for it in items:
                 sku = it.get("code") or it.get("sku") or "-"
                 p_name = it.get("product_name") or it.get("name") or "-"
                 qty = float(it.get("quantity", it.get("qty_on_hand", 0.0)) or 0.0)
                 avail = float(it.get("available_quantity", qty) or 0.0)
+                if _is_zero_metric(qty, avail):
+                    continue
                 breakdown = it.get("breakdown") or []
 
                 tot_qty += qty
                 tot_avail += avail
+                branch_wrote_row = True
 
                 if breakdown:
                     wh_list = [bd.get("warehouse_name") or f"WH #{bd.get('warehouse_id')}" for bd in breakdown if bd.get("warehouse_name") or bd.get("warehouse_id")]
@@ -1881,14 +2081,23 @@ def _format_multi_company_presentation(state: AgentState) -> str:
                     f"| {row_idx} | {c_name} | `{sku}` | {p_name} | {wh_str} | {loc_str} | {qty_str} | {avail_str} |"
                 )
                 row_idx += 1
+            if not branch_wrote_row:
+                zero_branches.append(c_name)
 
+        if row_idx == 1 and zero_branches:
+            lines.append("| - | *Seluruh cabang memiliki stok 0 unit* | - | - | - | - | 0 unit | 0 unit |")
         lines.append(
             f"| | **TOTAL NASIONAL** | | | | | **{tot_qty:g} unit** | **{tot_avail:g} unit** |"
+        )
+        _append_zero_branch_footnote(
+            lines,
+            zero_branches,
+            label="Cabang dengan stok 0 / tidak tersedia (tidak ditampilkan di tabel)",
         )
 
     # 5. Vendor Invoices / Vendor Bills Multi-Company Presentation
     elif tool in ("fetch_vendor_invoices", "get_vendor_bills"):
-        lines.append("### Ringkasan Tagihan Vendor Multi-Perusahaan\n")
+        lines.append(f"### Ringkasan Tagihan Vendor Multi-Perusahaan{period_note}\n")
         lines.append("| No | Perusahaan / Cabang | Total Tagihan | Belum Dibayar | Sudah Dibayar | Status |")
         lines.append("|:---|:---|:---|:---|:---|:---|")
         tot_amt = 0.0
@@ -1900,15 +2109,21 @@ def _format_multi_company_presentation(state: AgentState) -> str:
             c_name = COMPANY_NAME_MAP.get(cid, f"Cabang {cid}")
             res = mc_results.get(cid)
             if not res:
-                st_text = "Akses Dibatasi (HTTP 403)" if cid in unauth else "Tidak Ada Data"
-                lines.append(f"| {row_idx} | {c_name} | - | - | - | *{st_text}* |")
-                row_idx += 1
+                if cid in unauth:
+                    lines.append(f"| {row_idx} | {c_name} | - | - | - | *Akses Dibatasi (HTTP 403)* |")
+                    row_idx += 1
+                else:
+                    zero_branches.append(c_name)
                 continue
 
             calc = res.get("calculations") or res.get("summary") or res
             amt = float(calc.get("total_amount", calc.get("total_bill_amount", 0.0)) or 0.0)
             unp = float(calc.get("total_unpaid", 0.0) or 0.0)
             paid = float(calc.get("total_paid", 0.0) or 0.0)
+
+            if _is_zero_metric(amt, unp, paid):
+                zero_branches.append(c_name)
+                continue
 
             tot_amt += amt
             tot_unp += unp
@@ -1920,10 +2135,13 @@ def _format_multi_company_presentation(state: AgentState) -> str:
             )
             row_idx += 1
 
+        if row_idx == 1 and zero_branches:
+            lines.append("| - | *Seluruh cabang tanpa tagihan vendor* | Rp 0,00 | Rp 0,00 | Rp 0,00 | - |")
         lines.append(
             f"| | **TOTAL GABUNGAN** | **{_format_rupiah(tot_amt)}** | **{_format_rupiah(tot_unp)}** | "
             f"**{_format_rupiah(tot_paid)}** | |"
         )
+        _append_zero_branch_footnote(lines, zero_branches)
 
     # 6. Top Selling Products Multi-Company Presentation (Consolidated National Ranking)
     elif tool == "get_top_selling_products":
@@ -1939,9 +2157,12 @@ def _format_multi_company_presentation(state: AgentState) -> str:
             branch_rows: List[Dict[str, Any]] = []
             agg_channels: Dict[str, Dict[str, float]] = {}
 
-            for cid, res in mc_results.items():
+            for cid in sorted(mc_results.keys()):
+                res = mc_results[cid]
                 c_name = COMPANY_NAME_MAP.get(cid, f"Cabang {cid}")
                 if not res or not isinstance(res, dict):
+                    if cid not in unauth:
+                        zero_branches.append(c_name)
                     continue
                 p_list = res.get("products") or []
                 ch_list = res.get("channel_breakdown") or []
@@ -1973,6 +2194,8 @@ def _format_multi_company_presentation(state: AgentState) -> str:
                         "total_revenue": b_rev,
                         "top_channel": top_ch_label,
                     })
+                elif cid not in unauth:
+                    zero_branches.append(c_name)
 
             sort_key = (
                 (lambda r: (r["total_qty"], r["total_revenue"]))
@@ -1988,7 +2211,7 @@ def _format_multi_company_presentation(state: AgentState) -> str:
                     f"Penjualan terbanyak{target_label} tercatat di cabang **{win['company_name']}** "
                     f"(**{win['total_qty']:g} unit**, **{_format_rupiah(win['total_revenue'])}**).\n"
                 )
-            lines.append(f"### Peringkat Penjualan per Cabang{target_label}\n")
+            lines.append(f"### Peringkat Penjualan per Cabang{target_label}{period_note}\n")
             if branch_rows:
                 lines.append("| Peringkat | Cabang | Produk / SKU | Kuantitas Terjual | Total Omzet | Channel Teratas |")
                 lines.append("|:---:|:---|:---|:---:|:---|:---|")
@@ -2004,6 +2227,7 @@ def _format_multi_company_presentation(state: AgentState) -> str:
                 lines.append(f"| | **TOTAL** | | **{tot_qty:g} unit** | **{_format_rupiah(tot_rev)}** | |")
             else:
                 lines.append(f"Tidak ditemukan transaksi penjualan terkonfirmasi{target_label} pada periode ini.")
+            _append_zero_branch_footnote(lines, zero_branches)
 
             if agg_channels:
                 sorted_ch = sorted(
@@ -2049,9 +2273,21 @@ def _format_multi_company_presentation(state: AgentState) -> str:
             limit = int(params.get("limit") or 10)
             top_list = sorted_merged[:limit]
 
-            lines.append(f"### Laporan Produk Pendapatan Tertinggi Multi-Cabang (Top {len(top_list)} Nasional)\n")
+            active_branch_cids = [
+                cid for cid in sorted(mc_results.keys())
+                if any(p["branch_rev"].get(cid, 0.0) > 0 for p in top_list)
+            ]
+            if not active_branch_cids:
+                active_branch_cids = sorted(mc_results.keys())
+            zero_branches = [
+                COMPANY_NAME_MAP.get(cid, f"Cabang {cid}")
+                for cid in sorted(mc_results.keys())
+                if cid not in active_branch_cids and cid not in unauth
+            ]
+
+            lines.append(f"### Laporan Produk Pendapatan Tertinggi Multi-Cabang (Top {len(top_list)} Nasional){period_note}\n")
             headers = ["No", "Kode / SKU", "Nama Produk"]
-            for cid in sorted(mc_results.keys()):
+            for cid in active_branch_cids:
                 c_name = COMPANY_NAME_MAP.get(cid, f"Cabang {cid}")
                 headers.append(f"Omzet {c_name}")
             headers.append("Total Omzet Gabungan")
@@ -2059,12 +2295,12 @@ def _format_multi_company_presentation(state: AgentState) -> str:
             lines.append("| " + " | ".join(headers) + " |")
             lines.append("|:" + ":|:".join(["---"] * len(headers)) + ":|")
 
-            branch_totals = {cid: 0.0 for cid in sorted(mc_results.keys())}
+            branch_totals = {cid: 0.0 for cid in active_branch_cids}
             grand_total = 0.0
 
             for idx, p in enumerate(top_list, start=1):
                 row = [str(idx), f"`{p['code']}`", p["name"]]
-                for cid in sorted(mc_results.keys()):
+                for cid in active_branch_cids:
                     b_rev = p["branch_rev"].get(cid, 0.0)
                     branch_totals[cid] += b_rev
                     row.append(_format_rupiah(b_rev) if b_rev > 0 else "-")
@@ -2073,23 +2309,29 @@ def _format_multi_company_presentation(state: AgentState) -> str:
                 lines.append("| " + " | ".join(row) + " |")
 
             tot_row = ["", "**TOTAL GABUNGAN**", ""]
-            for cid in sorted(mc_results.keys()):
+            for cid in active_branch_cids:
                 tot_row.append(f"**{_format_rupiah(branch_totals[cid])}**")
             tot_row.append(f"**{_format_rupiah(grand_total)}**")
             lines.append("| " + " | ".join(tot_row) + " |")
+            _append_zero_branch_footnote(lines, zero_branches)
 
     elif tool == "get_sales_summary":
-        lines.append("### Perbandingan Performa Penjualan Multi-Cabang\n")
+        lines.append(f"### Perbandingan Performa Penjualan Multi-Cabang{period_note}\n")
         lines.append("| Cabang | Omzet Terealisasi | Jumlah Order | Rata-Rata Order (AOV) | Pipeline Quotation |")
         lines.append("|:---|:---|:---:|:---|:---|")
         tot_rev = 0.0
         tot_orders = 0
         tot_pipe = 0.0
+        rows_written = 0
         for cid in sorted(mc_results.keys()):
             res = mc_results[cid]
             c_name = COMPANY_NAME_MAP.get(cid, f"Cabang {cid}")
             if not res or not isinstance(res, dict):
-                lines.append(f"| **{c_name}** | *Tidak ada data* | - | - | - |")
+                if cid in unauth:
+                    lines.append(f"| **{c_name}** | *Akses Dibatasi (HTTP 403)* | - | - | - |")
+                    rows_written += 1
+                else:
+                    zero_branches.append(c_name)
                 continue
             conf = res.get("confirmed_metrics") or {}
             rev = float(conf.get("realized_revenue") or 0.0)
@@ -2097,12 +2339,19 @@ def _format_multi_company_presentation(state: AgentState) -> str:
             aov = float(conf.get("average_order_value") or 0.0)
             pipe = res.get("pipeline_metrics") or {}
             pval = float(pipe.get("quotation_potential_value") or 0.0)
+            if cnt == 0 and _is_zero_metric(rev, pval):
+                zero_branches.append(c_name)
+                continue
             tot_rev += rev
             tot_orders += cnt
             tot_pipe += pval
+            rows_written += 1
             lines.append(f"| **{c_name}** | **{_format_rupiah(rev)}** | {cnt:,} | {_format_rupiah(aov)} | {_format_rupiah(pval)} |")
+        if rows_written == 0 and zero_branches:
+            lines.append("| *Seluruh cabang tanpa aktivitas penjualan* | Rp 0,00 | 0 | Rp 0,00 | Rp 0,00 |")
         aov_grand = (tot_rev / tot_orders) if tot_orders > 0 else 0.0
         lines.append(f"| **TOTAL GABUNGAN** | **{_format_rupiah(tot_rev)}** | **{tot_orders:,}** | **{_format_rupiah(aov_grand)}** | **{_format_rupiah(tot_pipe)}** |")
+        _append_zero_branch_footnote(lines, zero_branches)
 
     elif tool == "get_sales_orders":
         merged_orders: List[Dict[str, Any]] = []
@@ -2113,11 +2362,17 @@ def _format_multi_company_presentation(state: AgentState) -> str:
             res = mc_results[cid]
             c_name = COMPANY_NAME_MAP.get(cid, f"Cabang {cid}")
             if not res or not isinstance(res, dict):
-                branch_rows.append(f"| **{c_name}** | - | *Tidak ada data* | - |")
+                if cid in unauth:
+                    branch_rows.append(f"| **{c_name}** | - | *Akses Dibatasi (HTTP 403)* | - |")
+                else:
+                    zero_branches.append(c_name)
                 continue
             cnt = int(res.get("total_count") or 0)
             tot = float(res.get("total_amount_sum") or 0.0)
             st = res.get("status_filter") or "active"
+            if cnt == 0 and _is_zero_metric(tot):
+                zero_branches.append(c_name)
+                continue
             grand_cnt += cnt
             grand_sum += tot
             branch_rows.append(f"| **{c_name}** | {cnt:,} | **{_format_rupiah(tot)}** | `{st}` |")
@@ -2128,9 +2383,9 @@ def _format_multi_company_presentation(state: AgentState) -> str:
                         row_copy["company_name"] = c_name
                     merged_orders.append(row_copy)
 
-        ext_params = state.get("extracted_params") or {}
+        user_query_mc = state.get("user_query") or ""
         if ext_params.get("sort_by") == "amount_desc" or any(
-            k in user_query.lower() for k in ("terbanyak", "terbesar", "tertinggi", "nominal")
+            k in user_query_mc.lower() for k in ("terbanyak", "terbesar", "tertinggi", "nominal")
         ):
             merged_orders.sort(key=lambda r: float(r.get("total_amount") or 0.0), reverse=True)
 
@@ -2141,7 +2396,7 @@ def _format_multi_company_presentation(state: AgentState) -> str:
                 f"(**{top_o.get('company_name') or '-'}**, pelanggan **{top_o.get('customer_name') or '-'}**, status `{top_o.get('status') or '-'}`) "
                 f"sebesar **{_format_rupiah(float(top_o.get('total_amount') or 0.0))}**.\n"
             )
-            lines.append("### Daftar Quotation & Pesanan Penjualan Lintas Cabang\n")
+            lines.append(f"### Daftar Quotation & Pesanan Penjualan Lintas Cabang{period_note}\n")
             lines.append("| No | Cabang | No. SO / Quotation | Tanggal | Pelanggan | Kontak HP | Channel | Status | Total Nominal |")
             lines.append("|:---:|:---|:---|:---:|:---|:---|:---|:---:|:---|")
             for idx, o in enumerate(merged_orders[:20], start=1):
@@ -2153,11 +2408,15 @@ def _format_multi_company_presentation(state: AgentState) -> str:
                 )
             lines.append("")
 
-        lines.append("### Ringkasan Pesanan Penjualan Multi-Cabang\n")
+        lines.append(f"### Ringkasan Pesanan Penjualan Multi-Cabang{period_note}\n")
         lines.append("| Cabang | Jumlah Pesanan | Total Nominal | Status Filter |")
         lines.append("|:---|:---:|:---|:---:|")
-        lines.extend(branch_rows)
+        if branch_rows:
+            lines.extend(branch_rows)
+        elif zero_branches:
+            lines.append("| *Seluruh cabang tanpa pesanan pada filter ini* | 0 | Rp 0,00 | - |")
         lines.append(f"| **TOTAL GABUNGAN** | **{grand_cnt:,}** | **{_format_rupiah(grand_sum)}** | |")
+        _append_zero_branch_footnote(lines, zero_branches)
 
     elif tool == "get_contacts":
         merged_contacts: List[Dict[str, Any]] = []
@@ -2169,7 +2428,7 @@ def _format_multi_company_presentation(state: AgentState) -> str:
             for c in (res.get("contacts") or []):
                 if not isinstance(c, dict):
                     continue
-                dedup_key = c.get("id") or (c.get("name"), c.get("phone"))
+                dedup_key = c.get("contact_id") or c.get("id") or (c.get("name"), c.get("phone"))
                 if dedup_key in seen_contact_keys:
                     continue
                 seen_contact_keys.add(dedup_key)
@@ -2179,21 +2438,13 @@ def _format_multi_company_presentation(state: AgentState) -> str:
         if merged_contacts:
             lines.append("| No | Nama Kontak | No. HP / WA | Kota | Channel | Sales HP | Order / Total Belanja | Dokumen Terbaru |")
             lines.append("|:---:|:---|:---|:---|:---|:---|:---|:---|")
-            for idx, c in enumerate(merged_contacts[:20], start=1):
-                o_cnt = int(c.get("orders_count") or 0)
-                t_spent = float(c.get("total_spent") or 0.0)
-                spent_str = f"{o_cnt} order ({_format_rupiah(t_spent)})" if o_cnt > 0 or t_spent > 0 else "-"
-                recent = c.get("recent_orders") or []
-                recent_str = ", ".join(
-                    f"`{ro.get('so_number')}` ({ro.get('company_name') or '-'}, `{ro.get('status') or '-'}`)"
-                    for ro in recent[:2]
-                    if isinstance(ro, dict) and ro.get("so_number")
-                ) or "-"
-                lines.append(
-                    f"| {idx} | **{c.get('name') or '-'}** | {c.get('phone') or c.get('mobile') or '-'} | "
-                    f"{c.get('city') or c.get('state') or '-'} | {c.get('first_time_source') or '-'} | "
-                    f"{c.get('sales_phone') or '-'} | {spent_str} | {recent_str} |"
-                )
+            lines.extend(_format_contact_table_rows(merged_contacts, max_rows=20))
+            _append_pagination_footer(
+                lines,
+                min(20, len(merged_contacts)),
+                len(merged_contacts),
+                filter_hint="Sebutkan nama/nomor HP kontak spesifik untuk pencarian lebih fokus.",
+            )
         else:
             lines.append("*Tidak ada data kontak yang ditemukan pada cabang yang diperiksa.*")
 
@@ -2234,6 +2485,53 @@ def _format_multi_company_presentation(state: AgentState) -> str:
                 )
         if rows_written == 0:
             lines.append("| - | - | - | *Tidak ada produk di bawah ambang batas stok.* | - | - | - | - |")
+
+    elif tool == "get_product_info":
+        lines.append("### Perbandingan Harga Produk Multi-Cabang\n")
+        lines.append("| No | Perusahaan / Cabang | SKU | Nama Produk | Harga Jual | Sumber Harga |")
+        lines.append("|:---:|:---|:---|:---|:---|:---|")
+        row_idx = 1
+        for cid in sorted(mc_results.keys()):
+            c_name = COMPANY_NAME_MAP.get(cid, f"Cabang {cid}")
+            res = mc_results.get(cid)
+            if not res or not isinstance(res, dict):
+                if cid in unauth:
+                    lines.append(f"| {row_idx} | {c_name} | - | - | - | *Akses Dibatasi (HTTP 403)* |")
+                    row_idx += 1
+                else:
+                    zero_branches.append(c_name)
+                continue
+
+            if "products" in res:
+                prods = [p for p in (res.get("products") or []) if isinstance(p, dict)]
+            elif res.get("code") or res.get("name"):
+                prods = [res]
+            else:
+                prods = []
+
+            if not prods:
+                zero_branches.append(c_name)
+                continue
+
+            for p in prods[:5]:
+                sku = p.get("code") or p.get("sku") or p.get("default_code") or "-"
+                p_name = p.get("name") or p.get("full_name") or "-"
+                uom = p.get("uom")
+                uom_name = uom.get("name", "Unit") if isinstance(uom, dict) else (uom or "Unit")
+                price_val = _resolve_product_display_price(p)
+                p_source = p.get("price_source") or "-"
+                lines.append(
+                    f"| {row_idx} | {c_name} | `{sku}` | {p_name} | **{_format_rupiah(price_val)}** / {uom_name} | `{p_source}` |"
+                )
+                row_idx += 1
+
+        if row_idx == 1 and zero_branches:
+            lines.append("| - | - | - | *Tidak ada produk cocok ditemukan pada cabang terkait.* | - | - |")
+        _append_zero_branch_footnote(
+            lines,
+            zero_branches,
+            label="Cabang tanpa data produk cocok (tidak ditampilkan di tabel)",
+        )
 
     # Generic Fallback for other tools
     else:
@@ -2357,6 +2655,24 @@ def _format_rag_question_section(
     )
 
 
+def _plan_dedup_key(plan: Dict[str, Any]) -> Tuple[Any, ...]:
+    """Build normalized signature to skip duplicate tool plans rendering identical tables."""
+    t_name = str(plan.get("tool") or "")
+    params = plan.get("params") if isinstance(plan.get("params"), dict) else {}
+    norm_params = json.dumps(
+        {k: v for k, v in params.items() if k != "company_id"},
+        sort_keys=True,
+        default=str,
+    )
+    cids = tuple(int(c) for c in (plan.get("company_ids") or []) if c)
+    if not cids and plan.get("company_id") is not None:
+        cids = (int(plan["company_id"]),)
+    elif not cids and params.get("company_id") is not None:
+        cids = (int(params["company_id"]),)
+    has_mc = bool(plan.get("multi_company_results"))
+    return (t_name, norm_params, cids, has_mc, str(plan.get("status") or ""))
+
+
 def _build_question_ordered_answer(
     state: AgentState,
     llm_general_answers: Optional[Dict[int, str]] = None,
@@ -2393,6 +2709,8 @@ def _build_question_ordered_answer(
     # Map question_index -> rendered sections
     buckets: Dict[int, List[str]] = {}
     q_labels: Dict[int, str] = {}
+    seen_plan_keys = set()
+    seen_rendered_blocks = set()
 
     for sq in sub_questions:
         if isinstance(sq, dict) and "question_index" in sq:
@@ -2406,6 +2724,11 @@ def _build_question_ordered_answer(
         t_name = plan.get("tool")
         if not t_name:
             continue
+        p_key = _plan_dedup_key(plan)
+        if p_key in seen_plan_keys:
+            continue
+        seen_plan_keys.add(p_key)
+
         q_idx = int(plan.get("question_index") if plan.get("question_index") is not None else idx)
         if plan.get("question_text") and q_idx not in q_labels:
             q_labels[q_idx] = plan["question_text"]
@@ -2465,6 +2788,10 @@ def _build_question_ordered_answer(
                 rendered = _format_empty_plan_notice(plan, default_company_id=state.get("company_id"))
 
         if rendered:
+            norm_rendered = rendered.strip()
+            if norm_rendered in seen_rendered_blocks:
+                continue
+            seen_rendered_blocks.add(norm_rendered)
             buckets.setdefault(q_idx, []).append(rendered)
 
     # Map RAG queries by matching text in sub_questions when available
@@ -2778,10 +3105,16 @@ def format_deterministic_answer(state: AgentState) -> str:
                 tn = p.get("tool", "unnamed_tool")
                 tool_counts[tn] = tool_counts.get(tn, 0) + 1
 
+            seen_mt_keys = set()
+            seen_mt_sections = set()
             for idx, plan in enumerate(active_tools):
                 t_name = plan.get("tool")
                 if not t_name:
                     continue
+                p_dedup = _plan_dedup_key(plan)
+                if p_dedup in seen_mt_keys:
+                    continue
+                seen_mt_keys.add(p_dedup)
                 key = f"{t_name}_{idx}" if tool_counts.get(t_name, 0) > 1 else t_name
                 plan_mc_results = plan.get("multi_company_results")
                 if isinstance(plan_mc_results, dict) and plan_mc_results:
@@ -2796,7 +3129,10 @@ def format_deterministic_answer(state: AgentState) -> str:
                     }
                     mc_formatted = _format_multi_company_presentation(plan_state)  # type: ignore[arg-type]
                     if mc_formatted:
-                        sections.append(mc_formatted)
+                        norm_mc = mc_formatted.strip()
+                        if norm_mc not in seen_mt_sections:
+                            seen_mt_sections.add(norm_mc)
+                            sections.append(mc_formatted)
                     continue
 
                 # Check plan result first, then composite key, then base tool name
@@ -2807,20 +3143,16 @@ def format_deterministic_answer(state: AgentState) -> str:
                     res = multi_results[t_name]
 
                 if multi_status.get(key) == "EMPTY":
-                    sections.append(
-                        _format_empty_plan_notice(plan, default_company_id=state.get("company_id"))
-                    )
+                    formatted_sec = _format_empty_plan_notice(plan, default_company_id=state.get("company_id"))
                 elif res and plan.get("status") != "error":
                     plan_default_cid = plan.get("company_id") or (plan.get("params") or {}).get("company_id") or state.get("company_id")
-                    formatted = _format_single_tool_presentation(
+                    formatted_sec = _format_single_tool_presentation(
                         t_name,
                         res,
                         plan.get("sub_query") or user_query,
                         plan.get("params"),
                         default_company_id=plan_default_cid,
                     )
-                    if formatted:
-                        sections.append(formatted)
                 else:
                     domain_label = "Modul ERP"
                     if "stock" in t_name or "product" in t_name or "location" in t_name:
@@ -2831,16 +3163,22 @@ def format_deterministic_answer(state: AgentState) -> str:
                         domain_label = "Penjualan (Sales)"
                     plan_err = plan.get("error") or (res.get("error") if isinstance(res, dict) else None)
                     if plan.get("status") == "error" or plan_err:
-                        sections.append(
+                        formatted_sec = (
                             f"### Kendala Modul {domain_label} (`{t_name}`)\n\n"
                             f"> [!WARNING]\n"
                             f"> Gagal memuat data modul ini: {plan_err or 'Terjadi kendala pada layanan ERP.'}"
                         )
                     else:
-                        sections.append(
+                        formatted_sec = (
                             f"### Informasi {domain_label} (`{t_name}`)\n\n"
                             f"Tidak ditemukan data atau terjadi kendala saat memuat informasi untuk modul ini."
                         )
+
+                if formatted_sec:
+                    norm_sec = formatted_sec.strip()
+                    if norm_sec not in seen_mt_sections:
+                        seen_mt_sections.add(norm_sec)
+                        sections.append(formatted_sec)
         else:
             for key, res in multi_results.items():
                 base_tool = key.rsplit("_", 1)[0] if ("_" in key and key.rsplit("_", 1)[1].isdigit()) else key
@@ -3420,6 +3758,7 @@ _PAGINATED_TABLE_TOOLS_META: Dict[str, str] = {
     "get_scrap_records": "scraps",
     "get_warehouses": "warehouses",
     "get_product_categories": "categories",
+    "get_account_balance": "accounts",
     "get_journal_entries": "entries",
     "get_general_ledger": "accounts",
     "get_vendor_bills": "bills",
@@ -3428,12 +3767,46 @@ _PAGINATED_TABLE_TOOLS_META: Dict[str, str] = {
     "get_marketplace_orders": "orders",
 }
 
+_NATIVE_MC_TABLE_TOOLS = {
+    "get_sales_orders",
+    "get_contacts",
+    "get_marketplace_orders",
+    "get_kilat_order_diagnostics",
+    "get_product_mapping_status",
+    "get_stock_sync_simulation",
+    "get_price_comparison",
+    "get_fee_and_escrow_anomalies",
+    "get_competitor_insights",
+}
+
+_EXPLICIT_TABULAR_BREAKDOWN_RE = re.compile(
+    r"\b(?:breakdown|jabarkan|tabel|table|per\s+akun|per\s+cabang|rincian\s+akun|detail\s+akun)\b",
+    re.IGNORECASE,
+)
+
+
+def _should_keep_verbatim_deterministic(
+    deterministic_answer: str,
+    user_query: Optional[str],
+    state: AgentState,
+    is_multi_q: bool,
+) -> bool:
+    """Return True when Markdown tables must not be collapsed into short LLM prose summaries."""
+    if state.get("is_multi_company", False) or is_multi_q or len(deterministic_answer) > 1500:
+        return True
+    if "\n|" not in deterministic_answer:
+        return False
+    if _EXPLICIT_TABULAR_BREAKDOWN_RE.search(user_query or ""):
+        return True
+    ext_params = state.get("extracted_params") or {}
+    return bool(isinstance(ext_params, dict) and ext_params.get("include_breakdown") and len(deterministic_answer) > 600)
+
 
 def _build_table_query_meta(state: AgentState) -> Optional[Dict[str, Any]]:
     """Build lightweight query metadata for remote table pagination/export when rows are truncated."""
     if state.get("verification_status") != "VALID":
         return None
-    if state.get("is_multi_company") or state.get("is_multi_tool"):
+    if state.get("is_multi_tool"):
         return None
     active_tools = state.get("active_tools") or []
     if len(active_tools) > 1:
@@ -3451,8 +3824,16 @@ def _build_table_query_meta(state: AgentState) -> Optional[Dict[str, Any]]:
     if not isinstance(tool_result, dict):
         return None
 
+    is_native_mc_single_call = bool(
+        state.get("is_multi_company")
+        and not (state.get("multi_company_results") or {})
+        and (tool in _NATIVE_MC_TABLE_TOOLS or isinstance(tool_result.get("company_ids"), list))
+    )
+    if state.get("is_multi_company") and not is_native_mc_single_call:
+        return None
+
     list_key = _PAGINATED_TABLE_TOOLS_META.get(tool)
-    if tool == "get_stock_level" and tool_result.get("mode") == "location_scan":
+    if tool == "get_stock_level" and tool_result.get("mode") in ("location_scan", "company_scan"):
         list_key = "items"
     if not list_key:
         return None
@@ -3477,6 +3858,10 @@ def _build_table_query_meta(state: AgentState) -> Optional[Dict[str, Any]]:
     clean_params = sanitize_tool_params(raw_params)
     clean_params.pop("offset", None)
     clean_params.pop("limit", None)
+    if is_native_mc_single_call and not clean_params.get("company_ids"):
+        eff_cids = [int(c) for c in (state.get("company_ids") or tool_result.get("company_ids") or []) if c]
+        if len(eff_cids) > 1:
+            clean_params["company_ids"] = eff_cids
     if tool == "get_stock_level":
         if tool_result.get("location_id") is not None and not clean_params.get("location_id"):
             clean_params["location_id"] = tool_result["location_id"]
@@ -3595,8 +3980,9 @@ async def asynthesizer_node(
         except Exception as dispatch_err:
             logger.debug(f"Could not dispatch deterministic_chunk: {dispatch_err}")
 
-    is_multi_co = state.get("is_multi_company", False)
-    is_large_deterministic = is_multi_co or is_multi_q or len(deterministic_answer) > 1500
+    is_large_deterministic = _should_keep_verbatim_deterministic(
+        deterministic_answer, user_query, state, is_multi_q
+    )
 
     if model is not None and status == "VALID":
         try:
@@ -3789,8 +4175,9 @@ def synthesizer_node(
                 deterministic_answer = updated_det
                 final_text = deterministic_answer
 
-    is_multi_co = state.get("is_multi_company", False)
-    is_large_deterministic = is_multi_co or is_multi_q or len(deterministic_answer) > 1500
+    is_large_deterministic = _should_keep_verbatim_deterministic(
+        deterministic_answer, user_query, state, is_multi_q
+    )
 
     if model is not None and status == "VALID":
         try:

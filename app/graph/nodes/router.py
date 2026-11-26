@@ -656,6 +656,29 @@ def find_previous_user_query(messages: Optional[List[BaseMessage]]) -> Optional[
     return None
 
 
+def _find_previous_erp_query(messages: Optional[List[BaseMessage]]) -> Optional[str]:
+    """
+    Find the latest substantive HumanMessage that routes to a concrete ERP domain,
+    allowing intermediate short follow-ups ('semua cabang', 'breakdown datanya') to chain.
+    """
+    if not messages:
+        return None
+    for msg in reversed(messages[:-1]):
+        if isinstance(msg, HumanMessage) or getattr(msg, "type", "") in ("human", "user"):
+            content_str = str(getattr(msg, "content", "") or "").strip()
+            if not content_str or is_retry_query(content_str):
+                continue
+            try:
+                cand = classify_query_rule_based(content_str)
+                if isinstance(cand, dict) and cand.get("detected_domain") in (
+                    "accounting", "inventory", "sales", "marketplace"
+                ):
+                    return content_str
+            except Exception:
+                pass
+    return find_previous_user_query(messages)
+
+
 _NON_PRODUCT_SALES_TOKENS = {
     "perusahaan", "cabang", "toko", "outlet", "kantor", "pusat", "semua", "seluruh",
     "hari", "minggu", "bulan", "tahun", "kemarin", "ini", "itu", "lalu", "terakhir",
@@ -1127,6 +1150,61 @@ def classify_query_rule_based(query: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+_HQ_CROSS_BRANCH_TOOLS = {
+    "get_sales_orders",
+    "get_contacts",
+    "get_top_selling_products",
+    "get_sales_summary",
+    "get_inventory_velocity_forecast",
+    "get_account_health",
+    "get_marketplace_orders",
+    "get_kilat_order_diagnostics",
+    "get_product_mapping_status",
+    "get_stock_sync_simulation",
+    "get_sync_execution_logs",
+    "get_price_comparison",
+    "get_fee_and_escrow_anomalies",
+    "get_deduction_and_settlement_summary",
+    "get_cashflow_and_balance_summary",
+    "get_competitor_insights",
+}
+
+_HQ_PIN_RE = re.compile(r"\b(?:head\s*office|headoffice|kantor\s*pusat|ho|hq)\b", re.IGNORECASE)
+
+
+def _should_hq_auto_expand(
+    active_cid: Optional[int],
+    explicit_single: Optional[int],
+    multi_cids: List[int],
+    detected_tool: Optional[str],
+    query_low: str,
+    has_anaphoric_reference_fn: Any,
+) -> bool:
+    """
+    Determine whether an active HQ/Pusat session should automatically expand across branches:
+    - HEAD OFFICE (id=3): auto-expand all operational cross-branch sales, customer, marketplace,
+      and velocity tools when no single branch is named (unless user explicitly pins HQ/HO).
+    - Kantor Pusat (id=1): expand only explicit cross-branch sales probes or anaphoric continuations
+      to keep default unit-test single-company behavior intact.
+    - Accounting and warehouse stock-by-warehouse tools stay strict single-company unless requested.
+    """
+    if explicit_single is not None or multi_cids or _HQ_PIN_RE.search(query_low):
+        return False
+    if active_cid == 3:
+        return detected_tool in _HQ_CROSS_BRANCH_TOOLS
+    if active_cid == 1 and detected_tool in (
+        "get_sales_orders", "get_contacts", "get_top_selling_products", "get_sales_summary"
+    ):
+        return bool(
+            re.search(
+                r"\b(?:quotation\s+mana|penjualan\s+.*?\s+mana|apakah\s+ada\s+penjualan|ter\s*banyak\s+di\s+quotation)\b",
+                query_low,
+            )
+            or has_anaphoric_reference_fn(query_low)
+        )
+    return False
+
+
 def _annotate_multi_company(res: Dict[str, Any], state: AgentState, user_query: str) -> Dict[str, Any]:
     if not isinstance(res, dict):
         return res
@@ -1135,6 +1213,7 @@ def _annotate_multi_company(res: Dict[str, Any], state: AgentState, user_query: 
     from app.graph.nodes.extractor import (
         resolve_all_branch_company_ids,
         resolve_branch_company_id,
+        resolve_prior_multi_company_scope,
         COMPANY_NAME_MAP,
         has_anaphoric_reference,
     )
@@ -1143,26 +1222,23 @@ def _annotate_multi_company(res: Dict[str, Any], state: AgentState, user_query: 
 
     q_low = (user_query or "").lower()
     active_cid = state.get("company_id")
-    is_hq_active = active_cid in (1, 3)
 
     is_branch_ranking_query = bool(
         res.get("detected_tool") in ("get_top_selling_products", "get_stock_level")
         and re.search(r"\b(?:di\s*mana|cabang\s+mana|toko\s+mana|outlet\s+mana|gudang\s+mana)\b", q_low)
     )
-    is_hq_cross_branch_sales_q = bool(
-        is_hq_active
-        and explicit_single is None
-        and not multi_cids
-        and res.get("detected_tool") in ("get_sales_orders", "get_contacts", "get_top_selling_products", "get_sales_summary")
-        and (
-            re.search(r"\b(?:quotation\s+mana|penjualan\s+.*?\s+mana|apakah\s+ada\s+penjualan|ter\s*banyak\s+di\s+quotation)\b", q_low)
-            or has_anaphoric_reference(q_low)
-        )
+    is_hq_cross_branch_q = _should_hq_auto_expand(
+        active_cid=active_cid,
+        explicit_single=explicit_single,
+        multi_cids=multi_cids,
+        detected_tool=res.get("detected_tool"),
+        query_low=q_low,
+        has_anaphoric_reference_fn=has_anaphoric_reference,
     )
 
-    if is_all or (is_branch_ranking_query and explicit_single is None and not multi_cids) or is_hq_cross_branch_sales_q:
+    if is_all or (is_branch_ranking_query and explicit_single is None and not multi_cids) or is_hq_cross_branch_q:
         auth_cids = [int(c) for c in (state.get("authorized_company_ids") or []) if c]
-        if is_hq_cross_branch_sales_q and len(auth_cids) > 1:
+        if is_hq_cross_branch_q and len(auth_cids) > 1:
             effective_cids = auth_cids
         else:
             effective_cids = list(COMPANY_NAME_MAP.keys())
@@ -1185,6 +1261,12 @@ def _annotate_multi_company(res: Dict[str, Any], state: AgentState, user_query: 
         res["is_multi_company"] = True
         res["company_ids"] = effective_cids
         res["company_id"] = (effective_cids or [1])[0]
+    else:
+        recovered_mc = resolve_prior_multi_company_scope(state.get("messages"), user_query)
+        if recovered_mc:
+            res["is_multi_company"] = True
+            res["company_ids"] = recovered_mc
+            res["company_id"] = recovered_mc[0]
     return res
 
 
@@ -1207,6 +1289,7 @@ def _resolve_clause_company_scope(
     from app.graph.nodes.extractor import (
         resolve_all_branch_company_ids,
         resolve_branch_company_id,
+        resolve_prior_multi_company_scope,
         COMPANY_NAME_MAP,
         has_anaphoric_reference,
     )
@@ -1215,26 +1298,23 @@ def _resolve_clause_company_scope(
     explicit_single = resolve_branch_company_id(clause)
     c_low = (clause or "").lower()
     active_cid = int(state.get("company_id") or settings.DEFAULT_COMPANY_ID)
-    is_hq_active = active_cid in (1, 3)
 
     is_branch_ranking = bool(
         detected_tool in ("get_top_selling_products", "get_stock_level")
         and re.search(r"\b(?:di\s*mana|cabang\s+mana|toko\s+mana|outlet\s+mana|gudang\s+mana)\b", c_low)
     )
-    is_hq_sales = bool(
-        is_hq_active
-        and explicit_single is None
-        and not multi_cids
-        and detected_tool in ("get_sales_orders", "get_contacts", "get_top_selling_products", "get_sales_summary")
-        and (
-            re.search(r"\b(?:quotation\s+mana|penjualan\s+.*?\s+mana|apakah\s+ada\s+penjualan|ter\s*banyak\s+di\s+quotation)\b", c_low)
-            or has_anaphoric_reference(c_low)
-        )
+    is_hq_expand = _should_hq_auto_expand(
+        active_cid=active_cid,
+        explicit_single=explicit_single,
+        multi_cids=multi_cids,
+        detected_tool=detected_tool,
+        query_low=c_low,
+        has_anaphoric_reference_fn=has_anaphoric_reference,
     )
 
-    if is_all or (is_branch_ranking and explicit_single is None and not multi_cids) or is_hq_sales:
+    if is_all or (is_branch_ranking and explicit_single is None and not multi_cids) or is_hq_expand:
         auth_cids = [int(c) for c in (state.get("authorized_company_ids") or []) if c]
-        eff_cids = auth_cids if (is_hq_sales and len(auth_cids) > 1) else list(COMPANY_NAME_MAP.keys())
+        eff_cids = auth_cids if (is_hq_expand and len(auth_cids) > 1) else list(COMPANY_NAME_MAP.keys())
         return eff_cids[0], eff_cids, True
     if len(multi_cids) > 1:
         return multi_cids[0], multi_cids, True
@@ -1245,6 +1325,9 @@ def _resolve_clause_company_scope(
         eff_cids = [int(c) for c in state["company_ids"] if c]
         if len(eff_cids) > 1:
             return eff_cids[0], eff_cids, True
+    recovered_mc = resolve_prior_multi_company_scope(state.get("messages"), clause)
+    if recovered_mc and len(recovered_mc) > 1:
+        return recovered_mc[0], recovered_mc, True
     return active_cid, [active_cid], False
 
 
@@ -1701,9 +1784,13 @@ def _router_node_impl(
     # when an active ERP inquiry exists in prior messages.
     history_messages = state.get("messages") or []
     if len(history_messages) > 1:
-        prior_q = find_previous_user_query(history_messages)
+        prior_q = _find_previous_erp_query(history_messages)
         if prior_q:
-            from app.graph.nodes.extractor import resolve_branch_company_id, strip_company_scope_keywords
+            from app.graph.nodes.extractor import (
+                resolve_all_branch_company_ids,
+                resolve_branch_company_id,
+                strip_company_scope_keywords,
+            )
 
             clean_uq = user_query.strip().rstrip("?!.,;:'\"> ").lower()
             is_location_interrogative = clean_uq in {
@@ -1714,11 +1801,13 @@ def _router_node_impl(
                 "website", "offline", "online", "quotation", "penawaran", "order", "so",
                 "contact", "kontak", "produk", "barang", "faktur", "invoice", "jurnal",
                 "mana", "sini", "situ", "atas", "bawah", "dalam", "luar",
+                "tabel", "table", "semua", "cabang", "perusahaan", "sana",
             }
             m_loc_hint = re.search(r"\b(?:di\s+|cabang\s+|gudang\s+|lokasi\s+|rak\s+)([A-Za-z0-9\_\-]+)", clean_uq)
             is_branch_mention = bool(resolve_branch_company_id(clean_uq)) or (
                 bool(m_loc_hint) and m_loc_hint.group(1).lower() not in _NON_BRANCH_FOLLOWUP_TOKENS
             )
+            _, is_all_scope_followup = resolve_all_branch_company_ids(clean_uq)
             is_followup_retry = is_retry_query(clean_uq) or bool(
                 re.search(r"\b(coba\s+(?:(?:di)?cek\s+|(?:di)?periksa\s+|(?:di)?cari\s+)?lagi|(?:di)?cek\s+lagi|coba\s+lagi|ulang(i)?|tes\s+lagi|(?:di)?cek\s+ulang)\b", clean_uq)
             )
@@ -1728,7 +1817,7 @@ def _router_node_impl(
                 or any(term in clean_uq for term in ("contact", "kontak", "quotation", "penawaran"))
             )
             is_short_followup = len(clean_uq.split()) <= 7 and not has_sales_entity_shift and (
-                is_branch_mention or is_followup_retry or is_location_interrogative
+                is_branch_mention or is_all_scope_followup or is_followup_retry or is_location_interrogative
             )
 
             if is_short_followup:
@@ -1738,7 +1827,7 @@ def _router_node_impl(
                         if is_location_interrogative:
                             effective_sub = f"{prior_q} {clean_uq}".strip()
                             effective_user = effective_sub
-                        elif is_branch_mention:
+                        elif is_branch_mention or is_all_scope_followup:
                             effective_sub = user_query
                             sanitized_prior = strip_company_scope_keywords(prior_q)
                             effective_user = f"{sanitized_prior} {user_query}".strip() if sanitized_prior else user_query
@@ -1785,7 +1874,7 @@ def _router_node_impl(
                 try:
                     prior_result = classify_query_rule_based(prior_q)
                     if prior_result is not None and prior_result.get("detected_domain") in ("accounting", "inventory", "sales", "marketplace"):
-                        if is_branch_mention:
+                        if is_branch_mention or is_all_scope_followup:
                             sanitized_prior = strip_company_scope_keywords(prior_q)
                             effective_sub = f"{sanitized_prior} {user_query}".strip() if sanitized_prior else user_query
                         else:

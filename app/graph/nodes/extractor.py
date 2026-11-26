@@ -200,11 +200,27 @@ LOCATION_STOP_WORDS = {
     "setiap", "semua", "seluruh", "tiap", "masing-masing", "all", "every", "each", "gudang", "rak",
 }
 
+_MONTH_NAME_MAP: Dict[str, int] = {
+    "januari": 1, "jan": 1,
+    "februari": 2, "feb": 2,
+    "maret": 3, "mar": 3,
+    "april": 4, "apr": 4,
+    "mei": 5,
+    "juni": 6, "jun": 6,
+    "juli": 7, "jul": 7,
+    "agustus": 8, "agu": 8, "aug": 8,
+    "september": 9, "sept": 9, "sep": 9,
+    "oktober": 10, "okt": 10, "oct": 10,
+    "november": 11, "nov": 11,
+    "desember": 12, "des": 12, "dec": 12,
+}
+
 TEMPORAL_KEYWORDS = (
     "bulan", "hari", "minggu", "tahun", "kemarin", "today", "yesterday",
+    "kuartal", "triwulan", "semester",
     "januari", "februari", "maret", "april", "mei", "juni",
     "juli", "agustus", "september", "oktober", "november", "desember",
-    "jan", "feb", "mar", "apr", "jun", "jul", "aug", "agu", "sep", "okt", "nov", "des",
+    "jan", "feb", "mar", "apr", "jun", "jul", "aug", "agu", "sept", "sep", "okt", "oct", "nov", "des", "dec",
     "lalu", "terakhir", "kebelakang", "sejak", "sampai", "hingga",
 )
 
@@ -256,6 +272,53 @@ def resolve_branch_company_id(text: Optional[str]) -> Optional[int]:
     return ids[0] if ids else None
 
 
+def resolve_prior_multi_company_scope(
+    messages: Optional[Sequence[Any]],
+    query: str,
+) -> Optional[List[int]]:
+    """
+    Recover prior multi-company scope on continuation/breakdown follow-ups when
+    upstream session state did not persist is_multi_company across turns.
+    Stops immediately if the latest explicit HumanMessage narrowed to a single branch.
+    """
+    if not messages:
+        return None
+    q_low = (query or "").lower().strip()
+    is_continuation = has_anaphoric_reference(q_low) or bool(
+        re.search(r"\b(?:breakdown|jabarkan|rincian(?:nya)?|tabel|table|datanya|detail(?:nya)?|list|daftar)\b", q_low)
+    )
+    if not is_continuation:
+        return None
+
+    prior_msgs = list(messages[:-1]) if (q_low and q_low in str(getattr(messages[-1], "content", "") or "").lower()) else list(messages)
+    for msg in reversed(prior_msgs[-6:]):
+        content = str(getattr(msg, "content", "") or "").strip()
+        if not content:
+            continue
+        msg_type = getattr(msg, "type", "")
+        if isinstance(msg, HumanMessage) or msg_type in ("human", "user"):
+            cids, is_all = resolve_all_branch_company_ids(content)
+            if is_all:
+                return cids
+            if len(cids) > 1:
+                return cids
+            if len(cids) == 1 or resolve_branch_company_id(content) is not None:
+                return None
+        else:
+            if any(
+                marker in content
+                for marker in (
+                    "Multi-Perusahaan",
+                    "Multi-Cabang",
+                    "Lintas Cabang",
+                    "TOTAL GABUNGAN",
+                    "TOTAL NASIONAL",
+                )
+            ):
+                return sorted(list(COMPANY_NAME_MAP.keys()))
+    return None
+
+
 def strip_company_scope_keywords(text: Optional[str]) -> str:
     """
     Strip multi-company rollup expressions ('semua cabang', 'seluruh cabang', '+ headoffice')
@@ -279,37 +342,49 @@ def strip_company_scope_keywords(text: Optional[str]) -> str:
     return cleaned
 
 
+def _extract_standalone_year(text_low: str) -> Optional[int]:
+    """Extract explicit 4-digit calendar year while ignoring document paths and SKU codes."""
+    m_kw = re.search(r"\b(?:tahun|thn|periode)\s+(20\d\d)\b", text_low)
+    if m_kw:
+        return int(m_kw.group(1))
+    for m_yr in re.finditer(r"(?<![/\-\.#])\b(20[2-3]\d)\b(?![/\-])", text_low):
+        prefix = text_low[:m_yr.start()].rstrip()
+        if re.search(r"\b(?:sku|kode|barcode)\s*[:#]?$", prefix):
+            continue
+        return int(m_yr.group(1))
+    return None
+
+
 def has_temporal_expression(text: Optional[str]) -> bool:
-    """Check if query text contains explicit dates, date ranges, or relative temporal keywords."""
+    """Check if query text contains explicit dates, quarters, months, years, or relative temporal keywords."""
     if not text:
         return False
     cleaned = text.lower()
-    if any(k in cleaned for k in TEMPORAL_KEYWORDS):
+    if any(re.search(rf"\b{re.escape(k)}\b", cleaned) for k in TEMPORAL_KEYWORDS):
+        return True
+    if re.search(r"\b(?:q|kuartal|triwulan)\s*[- ]?[1-4]\b", cleaned):
+        return True
+    if re.search(r"\b(?:semester|smt)\s*[- ]?[12]\b", cleaned):
         return True
     if re.search(r"\b\d{4}[-/]\d{1,2}(?:[-/]\d{1,2})?\b", cleaned):
         return True
     if re.search(r"\b\d{1,2}[-/]\d{1,2}[-/]\d{2,4}\b", cleaned):
         return True
+    if _extract_standalone_year(cleaned) is not None:
+        return True
     return False
+
 
 def resolve_relative_dates(
     text: str,
     ref_date: Optional[date] = None,
 ) -> Tuple[Optional[str], Optional[str]]:
     """
-    Resolve relative Indonesian temporal expressions into ISO YYYY-MM-DD date range.
-
-    Supported phrases:
-    - 'bulan ini': 1st day of current month to last day of current month
-    - 'bulan lalu': 1st day of previous month to last day of previous month
-    - 'hari ini': current date
-    - 'kemarin': previous day
-    - 'minggu ini': Monday to Sunday of the current week
-    - 'N hari terakhir': N days window ending today
-    - Explicit dates: YYYY-MM-DD format
+    Resolve relative Indonesian temporal expressions, quarters, semesters, months,
+    and standalone calendar years into ISO YYYY-MM-DD date range.
     """
     today = ref_date or get_current_erp_date()
-    cleaned = text.lower()
+    cleaned = (text or "").lower()
 
     # 1. Check for explicit dates (YYYY-MM-DD, YYYY/MM/DD, DD/MM/YYYY, DD-MM-YYYY)
     explicit_dates = []
@@ -368,17 +443,45 @@ def resolve_relative_dates(
         start_date = today - timedelta(days=max(0, n_days - 1))
         return start_date.strftime("%Y-%m-%d"), today.strftime("%Y-%m-%d")
 
-    # 8. Tahun spesifik (e.g. 'tahun 2026', 'thn 2025', 'periode 2026')
-    year_match = re.search(r"\b(?:tahun|thn|periode)\s+(\d{4})\b", cleaned)
-    if year_match:
-        yr = int(year_match.group(1))
-        return f"{yr}-01-01", f"{yr}-12-31"
+    # 8. Quarters (e.g. 'Q4 2026', 'kuartal 1', 'triwulan 3')
+    q_match = re.search(r"\b(?:q|kuartal|triwulan)\s*[- ]?([1-4])\b", cleaned)
+    if q_match:
+        q_num = int(q_match.group(1))
+        yr = _extract_standalone_year(cleaned) or today.year
+        quarter_ranges = {
+            1: (f"{yr}-01-01", f"{yr}-03-31"),
+            2: (f"{yr}-04-01", f"{yr}-06-30"),
+            3: (f"{yr}-07-01", f"{yr}-09-30"),
+            4: (f"{yr}-10-01", f"{yr}-12-31"),
+        }
+        return quarter_ranges[q_num]
 
-    # 9. Tahun ini (current year)
+    # 9. Semesters (e.g. 'semester 1 2026', 'smt 2')
+    s_match = re.search(r"\b(?:semester|smt)\s*[- ]?([12])\b", cleaned)
+    if s_match:
+        s_num = int(s_match.group(1))
+        yr = _extract_standalone_year(cleaned) or today.year
+        return (f"{yr}-01-01", f"{yr}-06-30") if s_num == 1 else (f"{yr}-07-01", f"{yr}-12-31")
+
+    # 10. Named months (e.g. 'november 2026', 'bulan oktober', 'des 2025')
+    month_pat = "|".join(sorted(_MONTH_NAME_MAP.keys(), key=len, reverse=True))
+    m_month = re.search(rf"\b({month_pat})\b", cleaned)
+    if m_month:
+        mo = _MONTH_NAME_MAP[m_month.group(1)]
+        yr = _extract_standalone_year(cleaned) or today.year
+        _, last_day_num = calendar.monthrange(yr, mo)
+        return f"{yr}-{mo:02d}-01", f"{yr}-{mo:02d}-{last_day_num:02d}"
+
+    # 11. Explicit or standalone calendar year (e.g. 'tahun 2026', 'mainstore 2025')
+    standalone_yr = _extract_standalone_year(cleaned)
+    if standalone_yr is not None:
+        return f"{standalone_yr}-01-01", f"{standalone_yr}-12-31"
+
+    # 12. Tahun ini (current year)
     if "tahun ini" in cleaned:
         return f"{today.year}-01-01", f"{today.year}-12-31"
 
-    # 10. Tahun lalu (previous year)
+    # 13. Tahun lalu (previous year)
     if "tahun lalu" in cleaned or "tahun kemarin" in cleaned:
         prev_yr = today.year - 1
         return f"{prev_yr}-01-01", f"{prev_yr}-12-31"
@@ -496,11 +599,12 @@ STOCK_STOPWORDS = (
     "ini", "itu", "barang", "produk", "product", "item", "sku", "kode", "semua", "ada", "tersedia",
     "stok", "stock", "sisa", "stocknya", "stoknya",
     "yang", "mana", "paling", "tersedikit", "sedikit", "terbanyak", "terkecil", "terendah", "tertinggi", "dimana",
-    "di", "ke", "dari", "pada", "untuk", "terkait", "tentang",
-    "gudang", "lokasi", "customer", "pelanggan",
-    "dan", "serta", "juga", "faktur", "tagihan", "invoice", "jurnal", "saldo",
+    "di", "ke", "dari", "pada", "untuk", "terkait", "tentang", "atau", "dan", "serta", "juga",
+    "gudang", "lokasi", "customer", "pelanggan", "masing-masing", "masing", "bandingkan", "coba",
+    "segera", "kira-kira", "butuh", "order", "forecasting", "prediksi",
+    "faktur", "tagihan", "invoice", "jurnal", "saldo",
 )
-STOCK_DELIMITERS = r"\b(?:dan|serta|di|ke|pada|untuk|bulan|hari|berapa|status|faktur|tagihan|invoice|saldo|jurnal|gudang|lokasi)\b"
+STOCK_DELIMITERS = r"\b(?:dan|atau|serta|di|ke|pada|untuk|bulan|hari|berapa|status|faktur|tagihan|invoice|saldo|jurnal|gudang|lokasi)\b"
 
 _NON_PRODUCT_PHRASE_RE = re.compile(
     r"^(?:yang|mana)\b|\b(?:tersedikit|paling\s+sedikit|stok\s+menipis|stock\s+menipis|habis|kritis|terbanyak|terkecil|terendah)\b",
@@ -1144,10 +1248,14 @@ _TOP_SALES_STOPWORDS = {
     "barang", "item", "sku", "kode", "yang", "mana", "dimana", "cabang", "perusahaan",
     "toko", "outlet", "kantor", "pusat", "semua", "seluruh", "tahun", "bulan", "hari",
     "minggu", "kemarin", "ini", "itu", "lalu", "terakhir", "berapa", "cek", "tampilkan",
-    "daftar", "peringkat", "dari", "di", "ke", "pada", "untuk", "dan", "serta", "atau",
+    "daftar", "list", "peringkat", "dari", "di", "ke", "pada", "untuk", "dan", "serta", "atau",
     "unit", "qty", "revenue", "ytd", "mtd",
     "jenis", "apapun", "macam", "tipe", "segala", "aneka", "apa", "saja", "aja",
-    "apakah", "ada", "terkait", "khusus", "semuanya", "tidak",
+    "apakah", "ada", "terkait", "khusus", "semuanya", "tidak", "nya",
+    "q1", "q2", "q3", "q4", "kuartal", "triwulan", "semester",
+    "target", "owner", "minta", "bisa", "engga", "enggak", "gak", "menurutmu",
+    "masing-masing", "masing", "per", "order", "segera", "forecasting", "prediksi",
+    "estimasi", "buat", "buatin", "kenapa", "alasannya", "fastmoving", "slowmoving", "lowmoving",
     "wa", "whatsapp", "shopee", "tokopedia", "tokped", "tiktok", "lazada", "blibli",
     "website", "offline", "channel",
 }
@@ -1196,6 +1304,8 @@ def _extract_prior_sales_context(
             ctx["date_from"] = prior_params["date_from"]
         if prior_params.get("date_to"):
             ctx["date_to"] = prior_params["date_to"]
+        if prior_params.get("status"):
+            ctx["prior_status"] = prior_params["status"]
         prior_tool = state.get("detected_tool") or ""
         if prior_tool in ("get_top_selling_products", "get_sales_summary"):
             ctx["prior_confirmed_sales"] = True
@@ -1204,12 +1314,17 @@ def _extract_prior_sales_context(
         # Inspect recent HumanMessages excluding current turn (last element)
         prior_msgs = list(messages[:-1]) if len(messages) > 1 else []
         for msg in reversed(prior_msgs):
-            if getattr(msg, "type", None) != "human":
-                continue
             content = str(getattr(msg, "content", "") or "").strip()
             if not content:
                 continue
             low = content.lower()
+            if not ctx.get("prior_status"):
+                if re.search(r"\b(?:dibatalkan|batal|cancel)\b|`cancel`", low):
+                    ctx["prior_status"] = "cancel"
+                elif re.search(r"\b(?:draft\s+quotation|status\s*:\s*`?quotation`?|hanya\s+quotation)\b", low):
+                    ctx["prior_status"] = "quotation"
+            if getattr(msg, "type", None) != "human" and not isinstance(msg, HumanMessage):
+                continue
             if not ctx.get("product_search"):
                 top_ext = _fallback_extract_top_selling_products(content, today)
                 if top_ext.get("search"):
@@ -1227,7 +1342,7 @@ def _extract_prior_sales_context(
             if not ctx.get("prior_confirmed_sales"):
                 if re.search(r"\b(?:penjualan|terjual|omzet|omset)\b", low) and not re.search(r"\b(?:quotation|penawaran)\b", low):
                     ctx["prior_confirmed_sales"] = True
-            if ctx.get("product_search") and ctx.get("date_from"):
+            if ctx.get("product_search") and ctx.get("date_from") and ctx.get("prior_status"):
                 break
 
     return ctx
@@ -1269,7 +1384,9 @@ def _fallback_extract_top_selling_products(query: str, ref_date: Optional[date] 
         if m_pre:
             words = [
                 w for w in m_pre.group(1).split()
-                if w.lower() not in _TOP_SALES_STOPWORDS and not _is_pure_branch_token(w)
+                if w.lower() not in _TOP_SALES_STOPWORDS
+                and not _is_pure_branch_token(w)
+                and not re.match(r"^(?:20\d\d|q[1-4])$", w.lower())
             ]
             if words:
                 params["search"] = " ".join(words)
@@ -1286,7 +1403,7 @@ def _fallback_extract_top_selling_products(query: str, ref_date: Optional[date] 
                 w for w in raw_phrase.split()
                 if w.lower() not in _TOP_SALES_STOPWORDS
                 and not _is_pure_branch_token(w)
-                and not re.match(r"^20\d\d$", w)
+                and not re.match(r"^(?:20\d\d|q[1-4])$", w.lower())
             ]
             if words:
                 params["search"] = " ".join(words)
@@ -1302,37 +1419,35 @@ def _fallback_extract_top_selling_products(query: str, ref_date: Optional[date] 
         except ValueError:
             pass
 
-    # Extract explicit 4-digit year (e.g. 2026)
-    m_year = re.search(r"\b(20\d\d)\b", query)
-    if m_year:
-        yr = int(m_year.group(1))
-        params["date_from"] = f"{yr}-01-01"
-        params["date_to"] = f"{yr}-12-31"
+    df, dt = resolve_relative_dates(query, today)
+    if df or dt:
+        if df:
+            params["date_from"] = df
+        if dt:
+            params["date_to"] = dt
     else:
-        df, dt = resolve_relative_dates(query, today)
-        if df or dt:
-            if df:
-                params["date_from"] = df
-            if dt:
-                params["date_to"] = dt
-        else:
-            params["date_from"] = f"{today.year}-01-01"
-            params["date_to"] = f"{today.year}-12-31"
+        params["date_from"] = f"{today.year}-01-01"
+        params["date_to"] = f"{today.year}-12-31"
 
     return params
 
 
 _CONTACT_STOPWORDS = {
-    "detail", "info", "informasi", "profil", "profile", "data", "daftar", "list",
+    "detail", "detailnya", "info", "informasi", "profil", "profile", "data", "daftar", "list",
+    "lengkap", "selengkapnya", "rincian", "rinciannya", "semuanya",
     "cek", "cari", "tampilkan", "lihat", "siapa", "saja", "aja", "apa", "mana",
-    "dimana", "di", "ke", "dari", "pada", "untuk", "yang", "itu", "ini", "tersebut",
+    "dimana", "di", "ke", "dari", "pada", "untuk", "dengan", "yang", "yg", "itu", "ini", "tersebut",
     "tadi", "nya", "kontak", "contact", "contacts", "contactnya", "kontaknya",
     "pelanggan", "customer", "customers", "pembeli", "klien", "client", "vendor",
     "supplier", "pemasok", "toko", "no", "nomor", "hp", "telp", "telepon", "wa",
     "whatsapp", "alamat", "email", "kota", "shopee", "tokopedia", "tokped", "tiktok",
     "lazada", "blibli", "website", "offline", "channel", "penjualan", "pembelian",
+    "paling", "banyak", "terbanyak", "terbesar", "tertinggi", "teratas", "top",
+    "peringkat", "ranking", "beli", "membeli", "belanja", "terbaru",
+    "kita", "kami", "maksutku", "maksudku", "nah", "sih", "buat", "buatin",
     "order", "transaksi", "bulan", "tahun", "hari", "minggu", "kemarin", "semua",
     "seluruh", "cabang", "perusahaan", "dong", "ya", "kak", "min", "tolong",
+    "q1", "q2", "q3", "q4", "kuartal", "triwulan", "semester",
 }
 
 
@@ -1373,24 +1488,18 @@ def _fallback_extract_contacts(
             w.strip("?!.,:;\"'")
             for w in cand_src.split()
             if w.strip("?!.,:;\"'").lower() not in _CONTACT_STOPWORDS
+            and w.strip("?!.,:;\"'").lower() not in _MONTH_NAME_MAP
             and not _is_pure_branch_token(w.strip("?!.,:;\"'"))
-            and not re.match(r"^20\d\d$", w.strip("?!.,:;\"'"))
+            and not re.match(r"^(?:20\d\d|q[1-4]|\d{1,3})$", w.strip("?!.,:;\"'").lower())
         ]
         if words:
             params["search"] = " ".join(words)
 
-    # Explicit date parsing
-    m_year = re.search(r"\b(20\d\d)\b", query)
-    if m_year:
-        yr = int(m_year.group(1))
-        params["date_from"] = f"{yr}-01-01"
-        params["date_to"] = f"{yr}-12-31"
-    else:
-        df, dt = resolve_relative_dates(query, today)
-        if df:
-            params["date_from"] = df
-        if dt:
-            params["date_to"] = dt
+    df, dt = resolve_relative_dates(query, today)
+    if df:
+        params["date_from"] = df
+    if dt:
+        params["date_to"] = dt
 
     # Anaphoric / channel follow-up inheritance (e.g. "di wa itu contactnya siapa saja")
     is_followup = (
@@ -1434,21 +1543,29 @@ def _fallback_extract_sales_orders(
     """Deterministic heuristic extraction for sales.get_sales_orders."""
     params: Dict[str, Any] = {"limit": 20, "offset": 0, "status": "confirmed"}
 
-    clean_q = query.lower()
+    clean_q = (query or "").lower()
+    explicit_status = False
     if "cancel" in clean_q or "batal" in clean_q or "dibatalkan" in clean_q:
         params["status"] = "cancel"
+        explicit_status = True
     elif re.search(r"\b(?:semua\s+(?:status|order|quotation)|all\s+status)\b", clean_q) or (
-        ("semua" in clean_q or "all" in clean_q) and not re.search(r"\b(?:semua|seluruh)\s+(?:cabang|perusahaan|toko|outlet)\b", clean_q)
+        ("semua" in clean_q or "all" in clean_q)
+        and not re.search(r"\b(?:semua|seluruh)\s+(?:cabang|perusahaan|toko|outlet|data|datanya)\b", clean_q)
     ):
         params["status"] = "all"
+        explicit_status = True
     elif "lunas" in clean_q or "paid" in clean_q:
         params["status"] = "paid"
+        explicit_status = True
     elif "invoiced" in clean_q or "faktur" in clean_q:
         params["status"] = "invoiced"
+        explicit_status = True
     elif re.search(r"\b(?:draft\s+quotation|status\s+quotation|masih\s+quotation|belum\s+(?:confirm|terkonfirmasi)|hanya\s+quotation|only\s+quotation|(?:daftar|list|tampilkan)\s+quotation)\b", clean_q):
         params["status"] = "quotation"
+        explicit_status = True
     elif "quotation" in clean_q or "penawaran" in clean_q:
         params["status"] = "active"
+        explicit_status = True
 
     if re.search(r"\b(?:ter\s*banyak|ter\s*besar|ter\s*tinggi|paling\s+(?:banyak|besar|tinggi)|top|nominal)\b", clean_q):
         params["sort_by"] = "amount_desc"
@@ -1457,8 +1574,13 @@ def _fallback_extract_sales_orders(
     if ch:
         params["channel_name"] = ch
 
+    is_breakdown_or_followup = has_anaphoric_reference(query) or bool(
+        re.search(r"\b(?:breakdown|jabarkan|rincian(?:nya)?|tabel|table|datanya|detail(?:nya)?|semua\s+cabang)\b", clean_q)
+    )
+    prior_ctx = _extract_prior_sales_context(messages, today, state=state) if (is_breakdown_or_followup or ch) else {}
+    if not explicit_status and is_breakdown_or_followup and prior_ctx.get("prior_status"):
+        params["status"] = prior_ctx["prior_status"]
     if (has_anaphoric_reference(query) or ch) and not re.search(r"\b(?:terbanyak|terbesar|tertinggi)\b", clean_q):
-        prior_ctx = _extract_prior_sales_context(messages, today, state=state)
         if prior_ctx.get("product_search"):
             params["product_search"] = prior_ctx["product_search"]
 
@@ -1470,19 +1592,20 @@ def _fallback_extract_sales_orders(
                 params["limit"] = val
         except ValueError:
             pass
+    elif re.search(r"\b(?:jabarkan|semua\s+datanya|dalam\s+table|dalam\s+tabel)\b", clean_q):
+        params["limit"] = 50
 
-    m_year = re.search(r"\b(20\d\d)\b", query)
-    if m_year:
-        yr = int(m_year.group(1))
-        params["date_from"] = f"{yr}-01-01"
-        params["date_to"] = f"{yr}-12-31"
-    else:
-        df, dt = resolve_relative_dates(query, today)
-        if df or dt:
-            if df:
-                params["date_from"] = df
-            if dt:
-                params["date_to"] = dt
+    df, dt = resolve_relative_dates(query, today)
+    if df or dt:
+        if df:
+            params["date_from"] = df
+        if dt:
+            params["date_to"] = dt
+    elif is_breakdown_or_followup and prior_ctx.get("date_from"):
+        params["date_from"] = prior_ctx["date_from"]
+        if prior_ctx.get("date_to"):
+            params["date_to"] = prior_ctx["date_to"]
+        params["_inherited_dates"] = True
 
     return params
 
@@ -1529,21 +1652,14 @@ def _fallback_extract_sales_summary(query: str, today: date) -> Dict[str, Any]:
         params["status"] = "quotation"
     elif "cancel" in clean_q or "batal" in clean_q:
         params["status"] = "cancel"
-    elif "semua" in clean_q or "all" in clean_q:
+    elif "semua" in clean_q and not re.search(r"\b(?:semua|seluruh)\s+(?:cabang|perusahaan|toko|outlet)\b", clean_q):
         params["status"] = "all"
 
-    m_year = re.search(r"\b(20\d\d)\b", query)
-    if m_year:
-        yr = int(m_year.group(1))
-        params["date_from"] = f"{yr}-01-01"
-        params["date_to"] = f"{yr}-12-31"
-    else:
-        df, dt = resolve_relative_dates(query, today)
-        if df or dt:
-            if df:
-                params["date_from"] = df
-            if dt:
-                params["date_to"] = dt
+    df, dt = resolve_relative_dates(query, today)
+    if df:
+        params["date_from"] = df
+    if dt:
+        params["date_to"] = dt
 
     return params
 
@@ -2042,7 +2158,13 @@ def _extract_single_tool_params(
             extracted_dict = dict(fast_params)
     elif tool_name == "get_sales_orders" and retry_count == 0:
         fast_params = _fallback_extract_sales_orders(sub_query, today, state.get("messages"), state=state)
-        if fast_params.get("status") == "active" or fast_params.get("sort_by") == "amount_desc" or fast_params.get("channel_name") or fast_params.get("product_search"):
+        if (
+            fast_params.get("status") in ("active", "cancel", "quotation", "paid", "invoiced")
+            or fast_params.get("sort_by") == "amount_desc"
+            or fast_params.get("channel_name")
+            or fast_params.get("product_search")
+            or fast_params.get("_inherited_dates")
+        ):
             extracted_dict = dict(fast_params)
 
     # 1. LLM Structured Output Attempt
@@ -2757,6 +2879,14 @@ def extractor_node(
         result_update["company_id"] = primary_cid
         primary_params["company_id"] = primary_cid
     else:
+        recovered_mc = resolve_prior_multi_company_scope(state.get("messages"), user_query)
+        if recovered_mc and len(recovered_mc) > 1:
+            result_update["is_multi_company"] = True
+            result_update["company_ids"] = recovered_mc
+            primary_cid = recovered_mc[0]
+            result_update["company_id"] = primary_cid
+            primary_params["company_id"] = primary_cid
+            return result_update
         # Standard single-company fallback
         result_update["is_multi_company"] = False
         result_update["multi_company_results"] = {}
