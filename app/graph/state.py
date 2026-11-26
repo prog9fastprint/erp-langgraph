@@ -78,6 +78,8 @@ class AgentState(TypedDict, total=False):
     company_id: Optional[int]
     company_ids: Optional[List[int]]
     authorized_company_ids: Optional[List[int]]
+    payload_company_id: Optional[int]
+    company_scope_source: Optional[Literal["text", "payload", "default"]]
     is_multi_company: Optional[bool]
     multi_company_results: Optional[Dict[int, Any]]
     unauthorized_companies: Optional[List[int]]
@@ -148,6 +150,8 @@ def create_initial_state(
     auth_token: Optional[str] = None,
     user_id: Optional[str] = None,
     user_roles: Optional[List[str]] = None,
+    payload_company_id: Optional[int] = None,
+    company_scope_source: Optional[Literal["text", "payload", "default"]] = None,
 ) -> AgentState:
     """
     Construct a clean initial AgentState dictionary with standard defaults.
@@ -183,6 +187,8 @@ def create_initial_state(
         "company_id": primary_cid,
         "company_ids": effective_cids,
         "authorized_company_ids": list(authorized_company_ids) if authorized_company_ids else [],
+        "payload_company_id": payload_company_id,
+        "company_scope_source": company_scope_source,
         "is_multi_company": is_multi_co,
         "multi_company_results": {},
         "unauthorized_companies": [],

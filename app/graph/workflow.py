@@ -13,14 +13,18 @@ import logging
 import re
 import threading
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple
 import uuid
 import weakref
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import StateGraph, START, END
 
-from app.core.branches import resolve_all_branch_company_ids, resolve_branch_company_id
+from app.core.branches import (
+    resolve_all_branch_company_ids,
+    resolve_branch_company_id,
+    resolve_sticky_branch_from_history,
+)
 from app.core.config import settings
 from app.core.context import (
     chunk_text_for_streaming,
@@ -353,73 +357,53 @@ def _enforce_checkpoint_lru_bound(
     return evicted
 
 
-def _resolve_effective_company_id(
+def _resolve_effective_company_scope(
     user_query: str,
     company_id: Optional[int],
+    company_ids: Optional[List[int]],
     company_id_explicit: Optional[bool],
     checkpoint_values: Optional[Dict[str, Any]],
-) -> int:
+    prior_history_messages: Optional[List[BaseMessage]] = None,
+) -> Tuple[int, List[int], bool, Optional[int], Literal["text", "payload", "default"]]:
     """
-    Resolve effective company_id with strict 4-tier priority:
-      1. Explicit branch name in current user_query text
-      2. Explicit company_id provided by API payload / caller (including company_id=1)
-      3. Sticky company_id from previous checkpoint turn
-      4. Fallback to company_id argument or settings.DEFAULT_COMPANY_ID
-    """
-    # Priority 1: Explicit branch name mentioned in current query text
-    branch_from_text = resolve_branch_company_id(user_query)
-    if branch_from_text is not None:
-        return int(branch_from_text)
+    Resolve effective primary company_id, target company_ids list, multi-company flag,
+    tracked caller payload_company_id, and company_scope_source ('text' | 'payload' | 'default').
 
+    Supports thread-sticky in-chat branch overrides when upstream callers (e.g. Django
+    ChatProxyView) resend the unchanged ERP top-bar session company_id on every turn,
+    while honoring genuine top-bar company switches (when payload company_id changes).
+    """
     # Compatibility: if caller omitted company_id_explicit, treat non-default ID as explicit
     is_explicit = (
         bool(company_id_explicit)
         if company_id_explicit is not None
         else (company_id is not None and company_id != settings.DEFAULT_COMPANY_ID)
     )
+    prior_payload_cid = checkpoint_values.get("payload_company_id") if checkpoint_values else None
+    effective_payload_cid = (
+        int(company_id)
+        if (is_explicit and company_id is not None)
+        else (int(prior_payload_cid) if prior_payload_cid is not None else None)
+    )
 
-    # Priority 2: Explicit company_id supplied in payload/caller (including company_id=1)
-    if is_explicit and company_id is not None:
-        return int(company_id)
-
-    # Priority 3: Sticky company_id from previous checkpoint turn
-    if checkpoint_values and checkpoint_values.get("company_id"):
-        return int(checkpoint_values["company_id"])
-
-    # Priority 4: Fallback to provided company_id or DEFAULT_COMPANY_ID
-    return int(company_id) if company_id is not None else int(settings.DEFAULT_COMPANY_ID)
-
-
-def _resolve_effective_company_ids(
-    user_query: str,
-    company_id: Optional[int],
-    company_ids: Optional[List[int]],
-    company_id_explicit: Optional[bool],
-    checkpoint_values: Optional[Dict[str, Any]],
-) -> Tuple[int, List[int], bool]:
-    """
-    Resolve effective primary company_id and target company_ids list.
-    Returns:
-        Tuple of (primary_company_id, company_ids_list, is_multi_company)
-    """
     # 1. Caller passed explicit company_ids
     if company_ids and len(company_ids) > 1:
         cids = [int(c) for c in company_ids]
-        return cids[0], cids, True
+        return cids[0], cids, True, effective_payload_cid, "payload"
     elif company_ids and len(company_ids) == 1:
         cid = int(company_ids[0])
-        return cid, [cid], False
+        return cid, [cid], False, effective_payload_cid, "payload"
 
-    # 2. Text contains 'semua cabang' or multiple branch mentions
+    # 2. Text contains 'semua cabang' or explicit branch mention(s)
     text_cids, is_all = resolve_all_branch_company_ids(user_query)
     if is_all:
         primary = company_id if (company_id and company_id in text_cids) else (text_cids[0] if text_cids else settings.DEFAULT_COMPANY_ID)
-        return primary, text_cids, True
+        return int(primary), text_cids, True, effective_payload_cid, "text"
     if len(text_cids) > 1:
         primary = company_id if (company_id and company_id in text_cids) else text_cids[0]
-        return primary, text_cids, True
+        return int(primary), text_cids, True, effective_payload_cid, "text"
     if len(text_cids) == 1:
-        return text_cids[0], [text_cids[0]], False
+        return int(text_cids[0]), [int(text_cids[0])], False, effective_payload_cid, "text"
 
     # 3. Preserve multi-company scope on anaphoric or channel/contact follow-ups
     if (
@@ -439,16 +423,88 @@ def _resolve_effective_company_ids(
         if is_short_followup:
             cids = [int(c) for c in checkpoint_values["company_ids"] if c]
             primary = int(checkpoint_values.get("company_id") or cids[0])
-            return primary, cids, True
+            prior_src = checkpoint_values.get("company_scope_source") or "text"
+            return primary, cids, True, effective_payload_cid, prior_src
 
-    # 4. Fallback to standard single-company resolution
-    single_cid = _resolve_effective_company_id(
+    # 4a. Preserve thread-sticky in-chat text override when caller resent the unchanged session company_id
+    if (
+        checkpoint_values
+        and checkpoint_values.get("company_scope_source") == "text"
+        and checkpoint_values.get("company_id") is not None
+        and (
+            not is_explicit
+            or company_id is None
+            or (prior_payload_cid is not None and int(company_id) == int(prior_payload_cid))
+        )
+    ):
+        sticky_cid = int(checkpoint_values["company_id"])
+        return sticky_cid, [sticky_cid], False, effective_payload_cid, "text"
+
+    # 4b. Stateless restart / checkpoint eviction recovery from hydrated history
+    if checkpoint_values is None and prior_history_messages:
+        hist_cid = resolve_sticky_branch_from_history(prior_history_messages)
+        if hist_cid is not None:
+            return int(hist_cid), [int(hist_cid)], False, effective_payload_cid, "text"
+
+    # 4c. Genuine explicit company_id supplied in payload/caller (including dropdown switch or company_id=1)
+    if is_explicit and company_id is not None:
+        cid = int(company_id)
+        return cid, [cid], False, cid, "payload"
+
+    # 4d. Sticky company_id from previous checkpoint turn
+    if checkpoint_values and checkpoint_values.get("company_id") is not None:
+        cid = int(checkpoint_values["company_id"])
+        prior_src = checkpoint_values.get("company_scope_source") or "payload"
+        return cid, [cid], False, effective_payload_cid, prior_src
+
+    # 4e. Fallback to provided company_id or DEFAULT_COMPANY_ID
+    cid = int(company_id) if company_id is not None else int(settings.DEFAULT_COMPANY_ID)
+    return cid, [cid], False, effective_payload_cid, "default"
+
+
+def _resolve_effective_company_id(
+    user_query: str,
+    company_id: Optional[int],
+    company_id_explicit: Optional[bool],
+    checkpoint_values: Optional[Dict[str, Any]],
+) -> int:
+    """
+    Resolve effective company_id with 4-tier priority + thread-sticky in-chat text override:
+      1. Explicit branch name in current user_query text
+      2. Thread-sticky in-chat branch override when caller resends unchanged session company_id
+      3. Genuine explicit company_id provided by API payload / caller (including company_id=1)
+      4. Sticky company_id from previous checkpoint turn or settings.DEFAULT_COMPANY_ID
+    """
+    cid, _, _, _, _ = _resolve_effective_company_scope(
         user_query=user_query,
         company_id=company_id,
+        company_ids=None,
         company_id_explicit=company_id_explicit,
         checkpoint_values=checkpoint_values,
     )
-    return single_cid, [single_cid], False
+    return cid
+
+
+def _resolve_effective_company_ids(
+    user_query: str,
+    company_id: Optional[int],
+    company_ids: Optional[List[int]],
+    company_id_explicit: Optional[bool],
+    checkpoint_values: Optional[Dict[str, Any]],
+) -> Tuple[int, List[int], bool]:
+    """
+    Resolve effective primary company_id and target company_ids list.
+    Returns:
+        Tuple of (primary_company_id, company_ids_list, is_multi_company)
+    """
+    primary, cids, is_mc, _, _ = _resolve_effective_company_scope(
+        user_query=user_query,
+        company_id=company_id,
+        company_ids=company_ids,
+        company_id_explicit=company_id_explicit,
+        checkpoint_values=checkpoint_values,
+    )
+    return primary, cids, is_mc
 
 
 async def _prepare_workflow_execution(
@@ -485,19 +541,28 @@ async def _prepare_workflow_execution(
         _touch_checkpoint_lru(active_graph, effective_thread_id)
 
     checkpoint_values = checkpoint.values if (checkpoint and checkpoint.values) else None
-    effective_company_id, effective_company_ids, is_multi_company = _resolve_effective_company_ids(
-        user_query=user_query,
-        company_id=company_id,
-        company_ids=company_ids,
-        company_id_explicit=company_id_explicit,
-        checkpoint_values=checkpoint_values,
-    )
 
     # History hydration for stateless requests or recovery after checkpoint eviction/restart
     hydrated_messages = None
     existing_messages = checkpoint_values.get("messages", []) if checkpoint_values else []
     if not existing_messages and history:
         hydrated_messages = _hydrate_messages_from_history(history, user_query)
+
+    prior_history_msgs = hydrated_messages[:-1] if hydrated_messages and len(hydrated_messages) > 1 else None
+    (
+        effective_company_id,
+        effective_company_ids,
+        is_multi_company,
+        effective_payload_company_id,
+        effective_company_scope_source,
+    ) = _resolve_effective_company_scope(
+        user_query=user_query,
+        company_id=company_id,
+        company_ids=company_ids,
+        company_id_explicit=company_id_explicit,
+        checkpoint_values=checkpoint_values,
+        prior_history_messages=prior_history_msgs,
+    )
 
     initial_state = create_initial_state(
         user_query=user_query,
@@ -508,6 +573,8 @@ async def _prepare_workflow_execution(
         company_id=effective_company_id,
         company_ids=effective_company_ids,
         authorized_company_ids=authorized_company_ids,
+        payload_company_id=effective_payload_company_id,
+        company_scope_source=effective_company_scope_source,
         is_multi_company=is_multi_company,
         messages=hydrated_messages,
     )
@@ -518,11 +585,18 @@ async def _prepare_workflow_execution(
             initial_state["prior_detected_tool"] = checkpoint_values.get("detected_tool")
             initial_state["prior_detected_domain"] = checkpoint_values.get("detected_domain")
             initial_state["prior_extracted_params"] = checkpoint_values.get("extracted_params")
-        elif prev_q_mode == "contextual_analysis" and checkpoint_values.get("prior_tool_result") is not None:
-            initial_state["prior_tool_result"] = checkpoint_values.get("prior_tool_result")
-            initial_state["prior_detected_tool"] = checkpoint_values.get("prior_detected_tool")
-            initial_state["prior_detected_domain"] = checkpoint_values.get("prior_detected_domain")
-            initial_state["prior_extracted_params"] = checkpoint_values.get("prior_extracted_params")
+        elif (
+            prev_q_mode in ("contextual_analysis", "clarification")
+            or checkpoint_values.get("detected_domain") == "clarification"
+        ):
+            if checkpoint_values.get("prior_tool_result") is not None:
+                initial_state["prior_tool_result"] = checkpoint_values.get("prior_tool_result")
+            if checkpoint_values.get("prior_detected_tool"):
+                initial_state["prior_detected_tool"] = checkpoint_values.get("prior_detected_tool")
+            if checkpoint_values.get("prior_detected_domain"):
+                initial_state["prior_detected_domain"] = checkpoint_values.get("prior_detected_domain")
+            if checkpoint_values.get("prior_extracted_params") is not None:
+                initial_state["prior_extracted_params"] = checkpoint_values.get("prior_extracted_params")
         elif checkpoint_values.get("detected_domain") and checkpoint_values.get("detected_domain") != "clarification":
             initial_state["prior_detected_domain"] = checkpoint_values.get("detected_domain")
             initial_state["prior_detected_tool"] = checkpoint_values.get("detected_tool")

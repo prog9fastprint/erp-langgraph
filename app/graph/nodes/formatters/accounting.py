@@ -194,7 +194,9 @@ def format_get_general_ledger(
     accounts = tool_result.get("accounts") or []
     d_from = tool_result.get("date_from") or "-"
     d_to = tool_result.get("date_to") or "-"
-    lines.append(f"### Buku Besar Akun (General Ledger) — Periode: {d_from} s/d {d_to}\n")
+    comp_lbl = _resolve_company_display_label(tool_result, extracted_params, default_company_id)
+    comp_tag = f" (Cabang: {comp_lbl})" if comp_lbl else ""
+    lines.append(f"### Buku Besar Akun (General Ledger){comp_tag} — Periode: {d_from} s/d {d_to}\n")
     if not accounts:
         lines.append("Tidak ada transaksi buku besar yang tercatat pada filter ini.")
         return "\n".join(lines)

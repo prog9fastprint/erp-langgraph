@@ -17,8 +17,10 @@ BRANCH_COMPANY_MAP: Dict[str, int] = {
     "toko pusat": 2,
     "head office": 3,
     "head-office": 3,
+    "headoffice": 3,
     "ho": 3,
     "main store": 4,
+    "main-store": 4,
     "mainstore": 4,
     "ms": 4,
     "makasar": 5,
@@ -110,11 +112,58 @@ _BRANCH_PREFIX = r"(?:di\s*cabang|dicabang|cabang|di\s*toko|toko|di\s*kantor|kan
 _NON_BRANCH_MS_FOLLOW_RE = re.compile(
     r"^\s+(?:word|excel|office|powerpoint|access|sql|teams|windows|dos|edge|outlook|project|visio)\b"
 )
+_CONTRASTIVE_NEGATED_BRANCH_RE = re.compile(
+    r"(?:\b(?:kenapa|mengapa|kok)\s+(?:masih|tetap|malah)|"
+    r"\b(?:bukan|jangan|selain)(?:\s+(?:di|cabang|toko|kantor))?)\s*$",
+    re.IGNORECASE,
+)
+
+# Canonical branch suffix tokens embedded in FastPrint COA account codes (e.g. '11204HO', '40000MS')
+BRANCH_ACCOUNT_SUFFIX_MAP: Dict[str, int] = {
+    "HO": 3,
+    "MS": 4,
+    "MKS": 5,
+    "BDG": 6,
+    "SBY": 7,
+    "JKT": 8,
+    "MDN": 10,
+    "BKS": 13,
+    "TGR": 14,
+    "MLG": 15,
+}
+_ACCOUNT_BRANCH_SUFFIX_RE = re.compile(r"\d([A-Za-z]{2,3})(?:$|[-\.\s])")
+_AI_REPORT_BRANCH_HEADER_RE = re.compile(
+    r"(?:\(\s*Cabang\s*:\s*([^,\)\n]+?)(?:\s*,|\s*\))|"
+    r"###\s+Laporan\s+(?:Laba\s+Rugi|Neraca\s+Keuangan)[^\n\(]*\([^)]+\)\s*\(([^,\)\n]+?)\))",
+    re.IGNORECASE,
+)
+
+
+def is_cross_branch_account_code(
+    account_code: Optional[str],
+    target_company_id: Optional[int],
+) -> bool:
+    """Return True if account_code carries an explicit branch suffix belonging to another company."""
+    if not account_code or target_company_id is None:
+        return False
+    m = _ACCOUNT_BRANCH_SUFFIX_RE.search(str(account_code).strip())
+    if not m:
+        return False
+    suffix = m.group(1).upper()
+    owner_cid = BRANCH_ACCOUNT_SUFFIX_MAP.get(suffix)
+    if owner_cid is None:
+        return False
+    try:
+        return owner_cid != int(target_company_id)
+    except (TypeError, ValueError):
+        return False
 
 
 def resolve_all_branch_company_ids(text: Optional[str]) -> Tuple[List[int], bool]:
     """
     Resolve multiple branch/city mentions or 'semua cabang' into a list of company_ids.
+    Filters out contrastive/negated branches (e.g. 'kenapa masih ho bukanya aku minta mainstore')
+    when at least one positive target branch is present in the same text.
 
     Returns:
         Tuple of (list_of_company_ids, is_all_companies_flag)
@@ -127,7 +176,7 @@ def resolve_all_branch_company_ids(text: Optional[str]) -> Tuple[List[int], bool
     if any(re.search(rf"\b{re.escape(kw)}\b", cleaned) for kw in ALL_COMPANIES_KEYWORDS):
         return sorted(list(COMPANY_NAME_MAP.keys())), True
 
-    matched_spans: List[Tuple[int, int, int]] = []  # (start_idx, end_idx, company_id)
+    matched_spans: List[Tuple[int, int, int, bool]] = []  # (start_idx, end_idx, company_id, is_negated)
     for branch_key in sorted(BRANCH_COMPANY_MAP.keys(), key=lambda k: -len(k)):
         esc_key = re.escape(branch_key)
         if branch_key in _PREFIX_ONLY_BRANCH_KEYS:
@@ -141,13 +190,18 @@ def resolve_all_branch_company_ids(text: Optional[str]) -> Tuple[List[int], bool
                 if _NON_BRANCH_MS_FOLLOW_RE.match(cleaned[m.end():]):
                     continue
             start, end = m.span()
-            if not any(max(start, s) < min(end, e) for s, e, _ in matched_spans):
-                matched_spans.append((start, end, BRANCH_COMPANY_MAP[branch_key]))
+            if not any(max(start, s) < min(end, e) for s, e, _, _ in matched_spans):
+                prefix_window = cleaned[max(0, start - 32):start]
+                is_negated = bool(_CONTRASTIVE_NEGATED_BRANCH_RE.search(prefix_window))
+                matched_spans.append((start, end, BRANCH_COMPANY_MAP[branch_key], is_negated))
 
     matched_spans.sort(key=lambda x: x[0])
+    positive_spans = [item for item in matched_spans if not item[3]]
+    effective_spans = positive_spans if positive_spans else matched_spans
+
     seen = set()
     ordered_ids: List[int] = []
-    for _, _, cid in matched_spans:
+    for _, _, cid, _ in effective_spans:
         if cid not in seen:
             seen.add(cid)
             ordered_ids.append(cid)
@@ -242,13 +296,53 @@ def strip_company_scope_keywords(text: Optional[str]) -> str:
     return cleaned
 
 
+def resolve_sticky_branch_from_history(
+    prior_messages: Optional[Sequence[Any]],
+) -> Optional[int]:
+    """
+    Recover the latest explicit single-branch override from conversation history
+    during stateless hydration (e.g. after server reload or checkpoint eviction).
+    Returns None if a newer assistant report explicitly rendered a different branch
+    or a newer user turn requested multi-company scope.
+    """
+    if not prior_messages:
+        return None
+
+    latest_ai_cid: Optional[int] = None
+    for msg in reversed(list(prior_messages)):
+        content = str(getattr(msg, "content", "") or "").strip()
+        if not content:
+            continue
+        msg_type = getattr(msg, "type", "")
+        if isinstance(msg, HumanMessage) or msg_type in ("human", "user"):
+            cids, is_all = resolve_all_branch_company_ids(content)
+            if is_all or len(cids) > 1:
+                return None
+            if len(cids) == 1:
+                human_cid = cids[0]
+                if latest_ai_cid is not None and latest_ai_cid != human_cid:
+                    return None
+                return human_cid
+        elif latest_ai_cid is None:
+            m_hdr = _AI_REPORT_BRANCH_HEADER_RE.search(content)
+            if m_hdr:
+                branch_lbl = (m_hdr.group(1) or m_hdr.group(2) or "").strip()
+                ai_cid = resolve_branch_company_id(branch_lbl)
+                if ai_cid is not None:
+                    latest_ai_cid = ai_cid
+    return None
+
+
 __all__ = [
     "BRANCH_COMPANY_MAP",
+    "BRANCH_ACCOUNT_SUFFIX_MAP",
     "COMPANY_NAME_MAP",
     "ALL_COMPANIES_KEYWORDS",
     "LOCATION_STOP_WORDS",
+    "is_cross_branch_account_code",
     "resolve_all_branch_company_ids",
     "resolve_branch_company_id",
     "resolve_prior_multi_company_scope",
+    "resolve_sticky_branch_from_history",
     "strip_company_scope_keywords",
 ]

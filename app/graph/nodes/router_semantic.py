@@ -18,7 +18,12 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
 
-from app.core.branches import resolve_all_branch_company_ids, resolve_branch_company_id
+from app.core.branches import (
+    COMPANY_NAME_MAP,
+    resolve_all_branch_company_ids,
+    resolve_branch_company_id,
+    strip_company_scope_keywords,
+)
 from app.core.config import settings
 from app.core.context import (
     has_anaphoric_reference,
@@ -251,6 +256,121 @@ def _build_non_tool_route(domain: str, query_mode: str, user_query: str) -> Dict
     }
 
 
+_BRANCH_SWITCH_FILLER_TOKENS = {
+    "coba", "cek", "dicek", "periksa", "diperiksa", "lihat", "lihatin",
+    "tampilkan", "tampilin", "cari", "dicari", "tolong", "mohon", "bisa",
+    "di", "ke", "dari", "pada", "untuk", "buat", "yang", "yg",
+    "cabang", "toko", "kantor", "perusahaan", "company", "branch", "outlet", "pt",
+    "kalau", "kalo", "kl", "bagaimana", "gimana", "gmn", "jika", "bila",
+    "kenapa", "mengapa", "kok", "masih", "tetap", "malah", "padahal",
+    "bukan", "bukannya", "bukanya", "jangan", "tapi", "tetapi", "melainkan",
+    "aku", "saya", "gue", "gw", "ku", "kami", "kita", "minta", "mau", "ingin", "butuh",
+    "aja", "saja", "dong", "ya", "yah", "deh", "sih", "nih", "tuh", "lah", "kan",
+    "lagi", "ulang", "ulangi", "sekali", "dulu", "sekarang", "juga", "pula",
+    "datanya", "data", "hasilnya", "hasil", "detailnya", "detail", "rinciannya", "rincian",
+    "itu", "ini", "tersebut", "tadi", "nya", "dan", "serta", "atau", "sama", "vs",
+}
+
+
+def _try_route_branch_switch_followup(
+    user_query: str,
+    state: AgentState,
+) -> Optional[Dict[str, Any]]:
+    """
+    Deterministically re-run the prior ERP tool on a new branch/company scope when the user
+    sends a pure branch-switch or contrastive branch-correction follow-up (e.g. 'coba cek di
+    mainstore', 'mainstore', 'kenapa masih ho bukanya aku minta mainstore', 'di semua cabang').
+    Prevents the Scoped LLM Router from misinterpreting branch names like 'mainstore' as
+    warehouse inventory ambiguity and triggering clarification loops.
+    """
+    history_messages = state.get("messages") or []
+    if len(history_messages) <= 1:
+        return None
+
+    text_cids, is_all = resolve_all_branch_company_ids(user_query)
+    if not text_cids and not is_all:
+        return None
+
+    residual = strip_company_scope_keywords(user_query)
+    residual_words = re.findall(r"[a-z0-9]+", residual.lower())
+    remaining_content = [w for w in residual_words if w not in _BRANCH_SWITCH_FILLER_TOKENS]
+    if remaining_content:
+        return None
+
+    from app.graph.nodes.router import (
+        _find_previous_erp_query,
+        _infer_prior_erp_domain_and_tool,
+    )
+
+    prior_domain, prior_tool = _infer_prior_erp_domain_and_tool(history_messages, state)
+    if prior_domain not in ("accounting", "inventory", "sales", "marketplace") or not prior_tool:
+        return None
+
+    prior_q = _find_previous_erp_query(history_messages)
+    sanitized_prior = strip_company_scope_keywords(prior_q) if prior_q else ""
+    wants_detail = bool(re.search(r"\b(?:detail(?:nya)?|rincian(?:nya)?)\b", user_query, re.IGNORECASE))
+    prior_has_detail = bool(re.search(r"\b(?:detail|rincian|breakdown)\b", sanitized_prior, re.IGNORECASE))
+
+    if is_all:
+        effective_query = (
+            f"{sanitized_prior} semua cabang".strip()
+            if sanitized_prior
+            else user_query
+        )
+        active_cid = state.get("company_id")
+        primary_cid = int(active_cid) if (active_cid and int(active_cid) in text_cids) else text_cids[0]
+        route_res = _build_single_tool_route(
+            tool_name=prior_tool,
+            domain=prior_domain,
+            user_query=effective_query,
+        )
+        route_res["user_query"] = effective_query
+        route_res["company_id"] = primary_cid
+        route_res["company_ids"] = list(text_cids)
+        route_res["is_multi_company"] = True
+        route_res["company_scope_source"] = "text"
+        return route_res
+
+    if len(text_cids) > 1:
+        b_names = " dan ".join(COMPANY_NAME_MAP.get(cid, f"Cabang {cid}") for cid in text_cids)
+        effective_query = (
+            f"{sanitized_prior} di {b_names}".strip()
+            if sanitized_prior
+            else user_query
+        )
+        route_res = _build_single_tool_route(
+            tool_name=prior_tool,
+            domain=prior_domain,
+            user_query=effective_query,
+        )
+        route_res["user_query"] = effective_query
+        route_res["company_id"] = text_cids[0]
+        route_res["company_ids"] = list(text_cids)
+        route_res["is_multi_company"] = True
+        route_res["company_scope_source"] = "text"
+        return route_res
+
+    target_cid = text_cids[0]
+    branch_name = COMPANY_NAME_MAP.get(target_cid, f"Cabang {target_cid}")
+    if sanitized_prior:
+        detail_suffix = " detail" if (wants_detail and not prior_has_detail) else ""
+        effective_query = f"{sanitized_prior}{detail_suffix} di {branch_name}".strip()
+    else:
+        effective_query = user_query
+
+    route_res = _build_single_tool_route(
+        tool_name=prior_tool,
+        domain=prior_domain,
+        user_query=effective_query,
+    )
+    route_res["user_query"] = effective_query
+    route_res["company_id"] = target_cid
+    route_res["company_ids"] = [target_cid]
+    route_res["is_multi_company"] = False
+    route_res["company_scope_source"] = "text"
+    return route_res
+
+
 def check_hard_guardrails(
     user_query: str,
     state: AgentState,
@@ -326,6 +446,10 @@ def check_hard_guardrails(
                             drill_res["is_multi_company"] = False
                 return drill_res
 
+            branch_followup_res = _try_route_branch_switch_followup(user_query, state)
+            if branch_followup_res is not None:
+                return branch_followup_res
+
     return None
 
 
@@ -361,9 +485,17 @@ def _build_retrieval_queries(
 ) -> Tuple[List[str], List[Dict[str, Any]]]:
     """
     Build per-clause retrieval queries plus optional prior-tool context injection so
-    short follow-ups and clarification replies never suffer Top-K recall misses.
+    short follow-ups and clarification replies never suffer Top-K recall misses,
+    while stripping branch names that otherwise bias retrieval toward inventory samples.
     """
-    queries = [c.strip() for c in clauses if c and c.strip()] or [user_query]
+    raw_clauses = [c.strip() for c in clauses if c and c.strip()] or [user_query]
+    queries: List[str] = []
+    for clause in raw_clauses:
+        stripped_c = strip_company_scope_keywords(clause)
+        eff_c = stripped_c if (stripped_c and len(stripped_c) >= 3) else clause
+        if eff_c not in queries:
+            queries.append(eff_c)
+
     injected_tools: List[Dict[str, Any]] = []
     registry = get_tool_registry_service()
 
@@ -371,8 +503,10 @@ def _build_retrieval_queries(
         history_messages = state.get("messages") or []
         prior_q = find_previous_user_query(history_messages)
         if prior_q and prior_q.strip().lower() != user_query.strip().lower():
-            enriched = f"{user_query} {prior_q}".strip()
-            if enriched not in queries:
+            clean_uq = strip_company_scope_keywords(user_query) or user_query
+            clean_prior = strip_company_scope_keywords(prior_q) or prior_q
+            enriched = f"{clean_uq} {clean_prior}".strip()
+            if enriched and enriched not in queries:
                 queries.append(enriched)
 
         prior_tool = state.get("prior_detected_tool")
@@ -499,10 +633,19 @@ def build_scoped_router_system_prompt(
             f"- Tool sebelumnya: {state['prior_detected_tool']} (domain: {state.get('prior_detected_domain')})"
         )
     if state.get("company_id"):
-        prior_context_lines.append(f"- Active company_id sesi: {state['company_id']}")
+        cid_val = int(state["company_id"])
+        c_name = COMPANY_NAME_MAP.get(cid_val, f"Company #{cid_val}")
+        src_note = " (override cabang dari chat)" if state.get("company_scope_source") == "text" else ""
+        prior_context_lines.append(f"- Active cabang/company sesi: {c_name} (company_id: {cid_val}){src_note}")
     if len(clauses) > 1:
         prior_context_lines.append(f"- Terdeteksi {len(clauses)} klausa/sub-pertanyaan: {clauses}")
     context_block = "\n".join(prior_context_lines) if prior_context_lines else "- Tidak ada konteks tool sebelumnya."
+
+    branch_catalog_text = (
+        "Head Office/HO (ID 3), Main Store/Mainstore/MS (ID 4), Makassar (ID 5), Bandung (ID 6), "
+        "Surabaya (ID 7), Jakarta (ID 8), Toko Fast Print Surabaya (ID 9), Medan (ID 10), "
+        "Bekasi (ID 13), Tangerang (ID 14), Malang (ID 15), Fastmart (ID 17), Kantor Pusat (ID 1), Toko Pusat (ID 2)"
+    )
 
     return (
         "Anda adalah NLU Intent & Tool Router untuk FastPrint ERP AI Orchestrator (READ-ONLY).\n"
@@ -510,6 +653,14 @@ def build_scoped_router_system_prompt(
         "berdasarkan daftar kandidat tool hasil retrieval di bawah ini serta riwayat percakapan.\n\n"
         f"KANDIDAT TOOL (Top-K Retrieval):\n{tool_cards_block}\n\n"
         f"KONTEKS SESI:\n{context_block}\n\n"
+        f"CABANG / PERUSAHAAN FASTPRINT (COMPANY SCOPE):\n"
+        f"- Daftar entitas cabang resmi: {branch_catalog_text}.\n"
+        "- PENTING: 'Mainstore' / 'Main Store' (company_id=4) dan 'HO' / 'Head Office' (company_id=3) adalah "
+        "NAMA CABANG/PERUSAHAAN ERP, BUKAN semata-mata gudang/lokasi stok.\n"
+        "- Jika pengguna hanya mengganti cabang (misal 'coba cek di mainstore', 'kalau di surabaya?', 'mainstore'), "
+        "JANGAN minta klarifikasi — langsung pilih ulang tool dari konteks sebelumnya untuk cabang baru tersebut.\n"
+        "- Permintaan seperti 'akun bank mainstore' atau 'saldo kas mainstore' jelas merujuk ke akuntansi cabang Main Store "
+        "(`get_account_balance` atau `get_general_ledger` sesuai konteks), BUKAN lokasi gudang.\n\n"
         "MODE EKSEKUSI (query_mode & domain):\n"
         "1. 'live_erp': Pertanyaan data operasional/angka real-time yang cocok dengan >=1 tool pada KANDIDAT TOOL. "
         "Isi `planned_tools` (bisa lebih dari 1 untuk multi-intent; isi `sub_query` sesuai klausa relevan).\n"
@@ -535,7 +686,8 @@ def build_scoped_router_system_prompt(
         "- Jika riwayat percakapan sudah memuat jawaban klarifikasi pengguna (misal user membalas 'yang marketplace' atau mengklik chip), "
         "langsung eksekusi tool target tanpa bertanya ulang.\n"
         "- Saat meminta klarifikasi: tulis `clarification_question` 1-2 kalimat singkat Bahasa Indonesia, "
-        "dan berikan 2-4 `clarification_options` (`label` 2-5 kata TANPA emoji, `query` prompt lengkap siap eksekusi).\n\n"
+        "dan berikan 2-4 `clarification_options` (`label` 2-5 kata TANPA emoji, `query` prompt lengkap siap eksekusi; "
+        "sertakan nama cabang aktif bila sesi sedang berfokus pada cabang tertentu).\n\n"
         "GUARDRAIL WAJIB:\n"
         "- Pilih nama tool HANYA dari daftar KANDIDAT TOOL di atas (jangan mengarang nama tool baru).\n"
         "- Perhatikan catatan 'Bukan untuk' pada setiap kandidat tool sebelum memilih.\n"

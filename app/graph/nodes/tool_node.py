@@ -9,7 +9,12 @@ import logging
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
-from app.core.branches import COMPANY_NAME_MAP, LOCATION_STOP_WORDS, resolve_branch_company_id
+from app.core.branches import (
+    COMPANY_NAME_MAP,
+    LOCATION_STOP_WORDS,
+    resolve_branch_company_id,
+    strip_company_scope_keywords,
+)
 from app.core.config import settings
 from app.core.context import (
     clean_product_identifier,
@@ -19,6 +24,7 @@ from app.core.context import (
     sanitize_erp_payload,
     should_preserve_plan_on_retry,
 )
+from app.graph.nodes.extractors.accounting import _extract_gl_account_hint
 from app.graph.state import AgentState
 from app.schemas.tools import TOOL_DOMAIN_MAP
 from app.services.django_client import (
@@ -29,6 +35,7 @@ from app.services.django_client import (
 logger = logging.getLogger("tool_node")
 
 MAX_PRICE_COMPARISON_ACCOUNTS = 5
+MAX_GL_CATEGORY_ACCOUNTS = 5
 
 # Single source of truth mapping canonical tool names to DjangoCoreClient fetch_* method names
 _TOOL_FETCH_METHOD_MAP: Dict[str, str] = {
@@ -268,6 +275,172 @@ async def _resolve_and_execute_price_comparison(
     }, None
 
 
+async def _resolve_and_execute_gl_category(
+    clean_params: Dict[str, Any],
+    erp_client: DjangoCoreClient,
+    user_token: Optional[str],
+    target_company_id: Optional[int],
+    user_query: str,
+    gl_handler: Any,
+) -> Optional[Tuple[Any, Optional[str]]]:
+    """
+    Pre-resolve matching active accounts for broad General Ledger category queries
+    (e.g. 'buku besar akun kas', 'buku besar akun bank', 'buku besar bank bca') scoped
+    strictly to target_company_id, fetching up to MAX_GL_CATEGORY_ACCOUNTS active ledgers.
+    Returns None to fall back to standard execution when no hint or balance lookup is unavailable.
+    """
+    if not user_query or not hasattr(erp_client, "fetch_account_balance"):
+        return None
+    hint = _extract_gl_account_hint(strip_company_scope_keywords(user_query))
+    if not hint:
+        return None
+
+    bal_params: Dict[str, Any] = {
+        "non_zero_only": True,
+        "include_breakdown": True,
+    }
+    if hint.get("account_type"):
+        bal_params["account_type"] = hint["account_type"]
+    if hint.get("search"):
+        bal_params["search"] = hint["search"]
+    if clean_params.get("date_from"):
+        bal_params["date_from"] = clean_params["date_from"]
+    if clean_params.get("date_to"):
+        bal_params["date_to"] = clean_params["date_to"]
+
+    try:
+        bal_res = await erp_client.fetch_account_balance(
+            params=bal_params,
+            user_token=user_token,
+            company_id=target_company_id,
+        )
+    except Exception as exc:
+        logger.debug("GL account category pre-lookup skipped: %s", exc)
+        return None
+
+    if not isinstance(bal_res, dict) or not isinstance(bal_res.get("accounts"), list):
+        return None
+
+    raw_accounts = [a for a in bal_res["accounts"] if isinstance(a, dict)]
+    if not raw_accounts and bal_params.get("non_zero_only"):
+        retry_params = dict(bal_params)
+        retry_params["non_zero_only"] = False
+        try:
+            bal_res_retry = await erp_client.fetch_account_balance(
+                params=retry_params,
+                user_token=user_token,
+                company_id=target_company_id,
+            )
+            if isinstance(bal_res_retry, dict) and isinstance(bal_res_retry.get("accounts"), list):
+                raw_accounts = [a for a in bal_res_retry["accounts"] if isinstance(a, dict)]
+        except Exception:
+            pass
+
+    if not raw_accounts:
+        return None
+
+    mode = hint.get("mode", "")
+    filtered = raw_accounts
+    if mode == "kas":
+        kas_only = [
+            a for a in raw_accounts
+            if "kas" in str(a.get("account_name") or "").lower()
+            and "bank" not in str(a.get("account_name") or "").lower()
+        ]
+        if kas_only:
+            filtered = kas_only
+    elif mode == "bank":
+        bank_only = [
+            a for a in raw_accounts
+            if "bank" in str(a.get("account_name") or "").lower()
+        ]
+        if bank_only:
+            filtered = bank_only
+
+    def _activity_score(acc: Dict[str, Any]) -> Tuple[float, float]:
+        p_deb = abs(float(acc.get("period_debit", acc.get("total_debit", 0.0)) or 0.0))
+        p_cred = abs(float(acc.get("period_credit", acc.get("total_credit", 0.0)) or 0.0))
+        end_b = abs(float(acc.get("ending_balance", acc.get("net_balance", 0.0)) or 0.0))
+        return (p_deb + p_cred, end_b)
+
+    ranked = sorted(filtered, key=_activity_score, reverse=True)
+    selected: List[Dict[str, Any]] = []
+    seen_ids = set()
+    for acc in ranked:
+        acc_key = acc.get("account_id") or acc.get("account_code")
+        if not acc_key or acc_key in seen_ids:
+            continue
+        seen_ids.add(acc_key)
+        selected.append(acc)
+        if len(selected) >= MAX_GL_CATEGORY_ACCOUNTS:
+            break
+
+    if not selected:
+        return None
+
+    if len(selected) == 1:
+        single = selected[0]
+        if single.get("account_code"):
+            clean_params["account_code"] = str(single["account_code"]).strip()
+        elif single.get("account_id") is not None:
+            clean_params["account_id"] = int(single["account_id"])
+        return None
+
+    async def _fetch_one_gl(acc: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        sub_params = dict(clean_params)
+        if acc.get("account_code"):
+            sub_params["account_code"] = str(acc["account_code"]).strip()
+        elif acc.get("account_id") is not None:
+            sub_params["account_id"] = int(acc["account_id"])
+        try:
+            res = await gl_handler(
+                params=sub_params,
+                user_token=user_token,
+                company_id=target_company_id,
+            )
+            return res if isinstance(res, dict) else None
+        except Exception as sub_err:
+            logger.debug("Sub-GL fetch failed for account %s: %s", acc.get("account_code"), sub_err)
+            return None
+
+    sub_results = await asyncio.gather(*[_fetch_one_gl(a) for a in selected])
+    valid_subs = [r for r in sub_results if isinstance(r, dict)]
+    if not valid_subs:
+        return None
+
+    merged_accounts: List[Dict[str, Any]] = []
+    seen_codes = set()
+    for r in valid_subs:
+        for item in r.get("accounts") or []:
+            if not isinstance(item, dict):
+                continue
+            key = item.get("account_id") or item.get("account_code")
+            if key and key in seen_codes:
+                continue
+            if key:
+                seen_codes.add(key)
+            merged_accounts.append(item)
+
+    if not merged_accounts:
+        return None
+
+    first_valid = valid_subs[0]
+    merged_payload: Dict[str, Any] = {
+        "date_from": first_valid.get("date_from") or clean_params.get("date_from"),
+        "date_to": first_valid.get("date_to") or clean_params.get("date_to"),
+        "accounts": merged_accounts,
+    }
+    if target_company_id is not None:
+        try:
+            cid_int = int(target_company_id)
+            merged_payload["company_id"] = cid_int
+            if cid_int in COMPANY_NAME_MAP:
+                merged_payload["company_name"] = COMPANY_NAME_MAP[cid_int]
+        except (TypeError, ValueError):
+            pass
+    return merged_payload, None
+
+
 async def _execute_single_tool(
     tool_name: str,
     params: Dict[str, Any],
@@ -481,6 +654,31 @@ async def _execute_single_tool(
     handler = dispatch_map.get(tool_name)
     if not handler:
         return None, f"Tool '{tool_name}' not registered in dispatch map"
+
+    # Pre-resolve matching branch accounts for broad GL category queries (e.g. 'buku besar akun kas/bank')
+    if (
+        tool_name == "get_general_ledger"
+        and not clean_params.get("account_id")
+        and not clean_params.get("account_code")
+    ):
+        gl_pre = await _resolve_and_execute_gl_category(
+            clean_params=clean_params,
+            erp_client=erp_client,
+            user_token=user_token,
+            target_company_id=target_company_id,
+            user_query=user_query,
+            gl_handler=handler,
+        )
+        if gl_pre is not None:
+            raw_gl, gl_err = gl_pre
+            if gl_err:
+                return None, gl_err
+            final_gl = (
+                sanitize_erp_payload(raw_gl, max_records=50)
+                if settings.ENABLE_PAYLOAD_SANITIZATION
+                else raw_gl
+            )
+            return final_gl, None
 
     try:
         raw_result = await handler(

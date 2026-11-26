@@ -74,6 +74,7 @@ from app.core.branches import (
     BRANCH_COMPANY_MAP,
     COMPANY_NAME_MAP,
     LOCATION_STOP_WORDS,
+    is_cross_branch_account_code,
     resolve_all_branch_company_ids,
     resolve_branch_company_id,
     resolve_prior_multi_company_scope,
@@ -115,6 +116,7 @@ from app.graph.nodes.extractors import (
     _fallback_extract_contacts,
     _fallback_extract_deduction_summary,
     _fallback_extract_fee_anomalies,
+    _extract_gl_account_hint,
     _fallback_extract_general_ledger,
     _fallback_extract_inventory_velocity_forecast,
     _fallback_extract_journal_entries,
@@ -330,9 +332,9 @@ def _extract_single_tool_params(
                 f"Current Month Range: {month_start} to {month_end}\n\n"
                 f"Extract filter entities strictly adhering to the schema.\n"
                 f"Guidelines for extracted fields:\n"
-                f"- For 'search': Extract ONLY key entity names or document numbers (e.g. 'TikTok', 'PT Sumber Makmur', 'BCA'). Do NOT include full conversational phrases like 'aku mau tanya', 'saldo di jurnal', or relative dates.\n"
+                f"- For 'search': Extract ONLY key entity names or document numbers (e.g. 'TikTok', 'PT Sumber Makmur', 'BCA'). Do NOT include full conversational phrases like 'aku mau tanya', 'saldo di jurnal', relative dates, OR branch/company names (e.g. 'Mainstore', 'Main Store', 'Head Office', 'HO', 'Surabaya', 'Bandung').\n"
                 f"- For 'vendor_name': Extract only clean vendor / supplier company names (e.g. 'MEGACOM BEC', 'PT Sumber Makmur'). Do NOT append branch or city names into vendor_name.\n"
-                f"- For 'account_code' (in get_account_balance): Only set if user provided an actual account code (e.g. '11285', '111100'). If the user provided a name like 'bank tiktok' or 'marketplace tiktok', do NOT set 'account_code' to the name.\n"
+                f"- For 'account_code' (in get_account_balance / get_general_ledger): Only set if the user explicitly provided an actual account code in the current query (e.g. '11285', '111100'). If the user provided a name like 'bank tiktok' or a generic category like 'akun bank' / 'akun kas', do NOT set 'account_code'. NEVER copy a branch-specific account_code (e.g. '11204HO', '11200HO', '11204') from prior history when the user switched branches or did not cite that code.\n"
                 f"- For 'code' (in get_stock_level): Extract the product SKU code, barcode, OR product name into 'code'. Strip filler words like 'product', 'produk', 'barang', 'item', 'sku', 'kode'.\n"
                 f"- For 'code' vs 'search' (in get_product_info): Put ONLY explicit SKU/barcode identifiers (e.g. '1362', '91030300', 'HVS-A4-70') into 'code'. Put product names or partial model keywords (e.g. 'L210', 'stiker hologram', 'botol kalkir') into 'search'.\n"
                 f"- For 'codes' (in get_stock_level): If the user specifies multiple product SKU codes or barcodes (e.g. '91010600 dan 91030300', 'SKU A, B, dan C'), extract all of them as a list of strings into 'codes' rather than a single 'code'.\n"
@@ -770,6 +772,63 @@ def _extract_single_tool_params(
         if v_clean:
             extracted_dict["vendor_name"] = v_clean
 
+    # Clean branch name noise from search on accounting tools (preserve strict slash document numbers)
+    if tool_name in ("get_account_balance", "get_journal_entries", "fetch_vendor_invoices", "get_vendor_bills") and extracted_dict.get("search"):
+        s_clean = str(extracted_dict["search"]).strip()
+        if not re.search(r"\b(?:[A-Za-z0-9_\-]+/)+\d{4}/\d+\b", s_clean):
+            for b_name in sorted(BRANCH_COMPANY_MAP.keys(), key=lambda k: -len(k)):
+                b_pattern = rf"\b(?:di\s*cabang|dicabang|cabang|di\s*toko|toko|di\s*kantor|kantor|di)?\s*{re.escape(b_name)}\b"
+                s_clean = re.sub(b_pattern, "", s_clean, flags=re.IGNORECASE).strip().strip("-,:; ")
+            s_clean = re.sub(r"\s+", " ", s_clean).strip()
+            if s_clean:
+                extracted_dict["search"] = s_clean
+            else:
+                extracted_dict.pop("search", None)
+
+    # Guard against stale or cross-branch account_code hallucinated from prior conversation history
+    if tool_name in ("get_account_balance", "get_general_ledger") and extracted_dict.get("account_code"):
+        raw_acc_code = str(extracted_dict["account_code"]).strip()
+        combined_turn_text = f"{sub_query} {user_query}"
+        explicitly_in_query = bool(
+            re.search(rf"(?<![A-Za-z0-9]){re.escape(raw_acc_code)}(?![A-Za-z0-9])", combined_turn_text, re.IGNORECASE)
+        )
+        if not explicitly_in_query:
+            eff_target_cid = extracted_dict.get("company_id") or state.get("company_id")
+            prior_params = state.get("prior_extracted_params") or {}
+            prior_cid = prior_params.get("company_id")
+            branch_switched = bool(
+                detected_branch is not None
+                and prior_cid is not None
+                and int(detected_branch) != int(prior_cid)
+            )
+            same_branch_drill = (
+                not branch_switched
+                and resolve_pnl_drilldown_from_history(sub_query, state.get("messages"))
+            )
+            is_generic_cat = bool(_extract_gl_account_hint(strip_company_scope_keywords(combined_turn_text)))
+            has_explicit_acc_anaphora = bool(
+                re.search(r"\b(?:akun\s+(?:itu|tersebut|tadi|ini)|kode\s+(?:itu|tersebut|tadi))\b", combined_turn_text, re.IGNORECASE)
+            )
+            if (
+                is_cross_branch_account_code(raw_acc_code, eff_target_cid)
+                or branch_switched
+                or (is_generic_cat and not same_branch_drill and not has_explicit_acc_anaphora)
+            ):
+                extracted_dict.pop("account_code", None)
+
+    # Backfill get_account_balance category/search when LLM left filters empty after branch cleanup
+    if (
+        tool_name == "get_account_balance"
+        and not extracted_dict.get("account_code")
+        and not extracted_dict.get("account_id")
+        and not extracted_dict.get("account_type")
+        and not extracted_dict.get("search")
+    ):
+        fb_bal = _fallback_extract_account_balance(strip_company_scope_keywords(sub_query), today)
+        for k in ("account_type", "search", "non_zero_only"):
+            if fb_bal.get(k) is not None:
+                extracted_dict[k] = fb_bal[k]
+
     # Document number detection & include_lines
     doc_m = re.search(r"\b((?:[A-Za-z0-9_\-]+/)+\d{4}/\d+)\b", sub_query) or re.search(r"\b((?:[A-Za-z0-9_\-]+/)+\d{4}/\d+)\b", user_query)
     if doc_m:
@@ -812,6 +871,18 @@ def _extract_single_tool_params(
             elif tool_name == "get_journal_entries":
                 extracted_dict.pop("status", None)
                 extracted_dict.pop("search", None)
+            elif tool_name == "get_account_balance":
+                extracted_dict.pop("search", None)
+                extracted_dict.pop("non_zero_only", None)
+                if extracted_dict.get("account_code"):
+                    ac_str = str(extracted_dict["account_code"]).strip()
+                    if not re.search(rf"(?<![A-Za-z0-9]){re.escape(ac_str)}(?![A-Za-z0-9])", user_query, re.IGNORECASE):
+                        extracted_dict.pop("account_code", None)
+            elif tool_name == "get_general_ledger":
+                if extracted_dict.get("account_code"):
+                    ac_str = str(extracted_dict["account_code"]).strip()
+                    if not re.search(rf"(?<![A-Za-z0-9]){re.escape(ac_str)}(?![A-Za-z0-9])", user_query, re.IGNORECASE):
+                        extracted_dict.pop("account_code", None)
             elif tool_name == "get_sales_orders":
                 extracted_dict["status"] = "all"
                 extracted_dict.pop("search", None)

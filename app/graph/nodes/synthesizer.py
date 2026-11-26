@@ -13,7 +13,7 @@ from langchain_core.callbacks import adispatch_custom_event
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
-from app.core.branches import COMPANY_NAME_MAP
+from app.core.branches import COMPANY_NAME_MAP, resolve_all_branch_company_ids
 from app.core.config import settings
 from app.core.context import (
     get_current_erp_date,
@@ -718,6 +718,21 @@ def format_deterministic_answer(state: AgentState) -> str:
             if p.get("location_name"):
                 _add_hint(f"Lokasi: **{p['location_name']}**")
 
+        if not state.get("is_multi_company"):
+            eff_cid = state.get("company_id")
+            if eff_cid is None:
+                for p in all_params:
+                    if isinstance(p, dict) and p.get("company_id") is not None:
+                        eff_cid = p.get("company_id")
+                        break
+            if eff_cid is not None:
+                try:
+                    c_label = COMPANY_NAME_MAP.get(int(eff_cid))
+                    if c_label:
+                        _add_hint(f"Cabang: **{c_label}**")
+                except (TypeError, ValueError):
+                    pass
+
         hint_str = f" ({', '.join(filter_hints)})" if filter_hints else ""
         if domain in ("sales", "inventory", "marketplace") or tool in (
             "get_contacts", "get_sales_orders", "get_sales_order_detail", "get_top_selling_products", "get_sales_summary"
@@ -1315,6 +1330,34 @@ def _is_routable_followup_query(query_str: str) -> bool:
         return True
 
 
+def _embed_active_branch_in_chip_query(query: str, state: AgentState) -> str:
+    """
+    Append the active branch scope to a chip query when the thread is operating under
+    an in-chat branch override (company_scope_source == 'text'), unless the query already
+    names a branch, targets all branches, or is a slash command.
+    """
+    q = (query or "").strip()
+    if not q or q.startswith("/"):
+        return q
+    if state.get("company_scope_source") != "text" or state.get("is_multi_company"):
+        return q
+    cid = state.get("company_id")
+    if cid is None:
+        return q
+    try:
+        branch_name = COMPANY_NAME_MAP.get(int(cid))
+    except (TypeError, ValueError):
+        return q
+    if not branch_name:
+        return q
+    existing_cids, is_all = resolve_all_branch_company_ids(q)
+    if existing_cids or is_all:
+        return q
+    if q.endswith("?"):
+        return f"{q[:-1].rstrip()} di {branch_name}?"
+    return f"{q} di {branch_name}"
+
+
 def _finalize_followups(
     followups: List[Dict[str, str]],
     user_query: Optional[str],
@@ -1322,7 +1365,8 @@ def _finalize_followups(
 ) -> List[Dict[str, str]]:
     """
     Deduplicate, strip self-repeating chips matching current user_query,
-    validate routability via classify_query_rule_based, and backfill cleanly.
+    validate routability via classify_query_rule_based, embed active in-chat branch scope,
+    and backfill cleanly.
     """
     norm_user = re.sub(r"\s+", " ", (user_query or "").strip().rstrip("?!.,;:'\"> ")).lower()
     seen_queries = set()
@@ -1335,15 +1379,19 @@ def _finalize_followups(
         lbl_raw = str(chip.get("label") or "").strip()
         if not q_raw or not lbl_raw:
             return
-        norm_q = re.sub(r"\s+", " ", q_raw.rstrip("?!.,;:'\"> ")).lower()
-        if norm_q == norm_user or norm_q in seen_queries:
+        norm_raw = re.sub(r"\s+", " ", q_raw.rstrip("?!.,;:'\"> ")).lower()
+        if norm_raw == norm_user:
             return
         if check_route and not _is_routable_followup_query(q_raw):
+            return
+        q_scoped = _embed_active_branch_in_chip_query(q_raw, state)
+        norm_q = re.sub(r"\s+", " ", q_scoped.rstrip("?!.,;:'\"> ")).lower()
+        if norm_q == norm_user or norm_q in seen_queries:
             return
         seen_queries.add(norm_q)
         valid_chips.append({
             "label": _clean_label_emojis(lbl_raw) or lbl_raw[:35],
-            "query": q_raw,
+            "query": q_scoped,
             "icon": "fa-arrow-right",
         })
 
@@ -2182,6 +2230,8 @@ def _build_clarification_synthesis_output(state: AgentState) -> Optional[Dict[st
         )
 
     chips = _sanitize_clarification_options(state.get("clarification_options"))
+    for chip in chips:
+        chip["query"] = _embed_active_branch_in_chip_query(chip["query"], state)
     out_dict: Dict[str, Any] = {
         "final_answer": question,
         "deterministic_answer": question,

@@ -76,22 +76,28 @@ def _fallback_extract_account_balance(
     if acc_codes:
         params["account_code"] = acc_codes[0]
 
-    has_bank_word = bool(re.search(r"\b(?:rekening\s*bank|bank(?:\s*(?:&|and|dan)\s*cash)?|rekening)\b", q_low))
+    has_bank_word = bool(re.search(r"\b(?:rekening\s*bank|akun\s*bank|saldo\s*bank|bank(?:\s*(?:&|and|dan)\s*cash)?|rekening)\b", q_low))
     has_kas_word = bool(re.search(r"\b(?:kas|cash)\b", q_low))
     if (
         (has_bank_word and has_kas_word)
         or re.search(
-            r"\b(?:rekening\s+bank|bank\s*(?:&|and|dan)\s*cash|kas\s*(?:&|dan)\s*(?:rekening\s+)?bank|semua\s+(?:bank|kas|rekening))\b",
+            r"\b(?:rekening\s+bank|akun\s+bank|saldo\s+bank|bank\s*(?:&|and|dan)\s*cash|kas\s*(?:&|dan)\s*(?:rekening\s+)?bank|semua\s+(?:bank|kas|rekening))\b",
             q_low,
         )
     ):
         params["account_type"] = "Bank and Cash"
+    elif re.search(r"\b(?:akun\s+kas|saldo\s+kas)\b", q_low) and not params.get("account_code"):
+        params["account_type"] = "Bank and Cash"
+        if re.search(r"\bkas\s+kecil\b", q_low):
+            params["search"] = "KAS KECIL"
+        elif not has_bank_word:
+            params["search"] = "KAS"
 
     if re.search(r"\b(?:aktif|non[\s\-]?zero|tidak\s+nol|berisi)\b", q_low):
         params["non_zero_only"] = True
 
     m_bank_brand = re.search(
-        r"\b(bca|mandiri|bri|bni|cimb(?:\s+niaga)?|permata|danamon|ocbc|bsi|btn|mega|panin|uob|maybank)\b",
+        r"\b(bca|mandiri|bri|bni|cimb(?:\s+niaga)?|permata|danamon|ocbc|bsi|btn|mega|panin|uob|maybank|hsbc|dbs|icbc|seabank)\b",
         q_low,
     )
     if m_bank_brand and not params.get("account_code"):
@@ -358,3 +364,40 @@ def _fallback_extract_bank_reconciliation(query: str, ref_date: Optional[date] =
     if date_to:
         params["date_to"] = date_to
     return params
+
+
+def _extract_gl_account_hint(query: Optional[str]) -> Optional[Dict[str, str]]:
+    """
+    Extract a generic accounting category or bank/cash keyword hint from a General Ledger
+    query when no explicit account_code was provided (e.g. 'buku besar akun kas',
+    'buku besar akun bank', 'buku besar bank bca', 'buku besar piutang usaha').
+    """
+    if not query:
+        return None
+    q_low = query.lower().strip()
+    m_bank_brand = re.search(
+        r"\b(bca|mandiri|bri|bni|cimb(?:\s+niaga)?|permata|danamon|ocbc|bsi|btn|mega|panin|uob|maybank|hsbc|dbs|icbc|seabank)\b",
+        q_low,
+    )
+    if m_bank_brand:
+        brand = m_bank_brand.group(1).strip()
+        return {
+            "account_type": "Bank and Cash",
+            "search": brand.upper() if len(brand) <= 4 else brand.title(),
+            "mode": "bank_brand",
+        }
+    if re.search(r"\bkas\s+kecil\b", q_low):
+        return {"account_type": "Bank and Cash", "search": "KAS KECIL", "mode": "kas"}
+    has_kas = bool(re.search(r"\b(?:kas|cash)\b", q_low))
+    has_bank = bool(re.search(r"\b(?:bank|rekening)\b", q_low))
+    if has_kas and has_bank:
+        return {"account_type": "Bank and Cash", "mode": "bank_and_cash"}
+    if has_kas:
+        return {"account_type": "Bank and Cash", "search": "KAS", "mode": "kas"}
+    if has_bank:
+        return {"account_type": "Bank and Cash", "mode": "bank"}
+    if re.search(r"\bpiutang\b", q_low):
+        return {"account_type": "Receivable", "mode": "receivable"}
+    if re.search(r"\b(?:hutang|utang)\b", q_low):
+        return {"account_type": "Payable", "mode": "payable"}
+    return None
