@@ -15,7 +15,6 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from app.core.branches import COMPANY_NAME_MAP
 from app.core.context import (
-    extract_period_from_messages,
     get_current_erp_date,
     is_analytical_thinking_query,
     trim_conversation_messages,
