@@ -324,6 +324,7 @@ def _build_gemini_model(
     model_name: Optional[str] = None,
     temperature: float = 0.0,
     enable_key_fallback: bool = True,
+    reasoning_effort: Optional[str] = None,
 ) -> BaseChatModel:
     """
     Construct ChatOpenAI instance targeting Google Gemini's OpenAI-compatible endpoint.
@@ -341,6 +342,10 @@ def _build_gemini_model(
     healthy_keys = [k for k in keys if not is_provider_unhealthy(f"gemini:{k[-6:]}")]
     effective_keys = healthy_keys if healthy_keys else keys
 
+    extra_kwargs: Dict[str, Any] = {}
+    if reasoning_effort and str(reasoning_effort).strip():
+        extra_kwargs["reasoning_effort"] = str(reasoning_effort).strip()
+
     primary_key = effective_keys[0]
     primary_model = CircuitBreakerChatOpenAI(
         model=target_model,
@@ -349,6 +354,7 @@ def _build_gemini_model(
         temperature=temperature,
         request_timeout=settings.REQUEST_TIMEOUT_SEC,
         provider_name=f"gemini:{primary_key[-6:]}",
+        **extra_kwargs,
     )
 
     if enable_key_fallback and len(effective_keys) > 1:
@@ -360,6 +366,7 @@ def _build_gemini_model(
                 temperature=temperature,
                 request_timeout=settings.REQUEST_TIMEOUT_SEC,
                 provider_name=f"gemini:{k[-6:]}",
+                **extra_kwargs,
             )
             for k in effective_keys[1:]
         ]
@@ -374,12 +381,14 @@ def get_chat_model(
     temperature: float = 0.0,
     fallback_models: Optional[List[str]] = None,
     enable_fallback: bool = True,
+    reasoning_effort: Optional[str] = None,
 ) -> BaseChatModel:
     """
     Instantiate or return a cached warm ChatModel based on provider priority.
     Cache automatically invalidates on API key changes or circuit-breaker transitions.
     """
     selected_provider = (provider or settings.MODEL_PROVIDER).lower().strip()
+    norm_effort = (reasoning_effort or "").strip() or None
     with _PROVIDER_OUTAGE_LOCK:
         health_epoch = _PROVIDER_HEALTH_EPOCH
     cache_key = (
@@ -388,6 +397,7 @@ def get_chat_model(
         float(temperature),
         tuple(fallback_models) if fallback_models else (),
         bool(enable_fallback),
+        norm_effort,
         settings.OPENAI_MODEL,
         settings.GEMINI_MODEL,
         settings.OPENROUTER_MODEL,
@@ -406,6 +416,7 @@ def get_chat_model(
         temperature=temperature,
         fallback_models=fallback_models,
         enable_fallback=enable_fallback,
+        reasoning_effort=norm_effort,
     )
     with _CHAT_MODEL_CACHE_LOCK:
         if len(_CHAT_MODEL_CACHE) >= _CHAT_MODEL_CACHE_MAX_SIZE:
@@ -414,14 +425,38 @@ def get_chat_model(
     return model
 
 
+def get_router_chat_model(
+    temperature: float = 0.0,
+    enable_fallback: bool = True,
+) -> BaseChatModel:
+    """Return warm ChatModel configured for NLU routing, defaulting to get_chat_model()."""
+    router_provider = (settings.NLU_ROUTER_PROVIDER or "").strip() or None
+    router_model = (settings.NLU_ROUTER_MODEL or "").strip() or None
+    router_effort = (settings.NLU_ROUTER_REASONING_EFFORT or "").strip() or None
+    if router_provider or router_model or router_effort:
+        return get_chat_model(
+            provider=router_provider,
+            model_name=router_model,
+            temperature=temperature,
+            enable_fallback=enable_fallback,
+            reasoning_effort=router_effort,
+        )
+    return get_chat_model(temperature=temperature, enable_fallback=enable_fallback)
+
+
 def _build_chat_model_uncached(
     selected_provider: str,
     model_name: Optional[str] = None,
     temperature: float = 0.0,
     fallback_models: Optional[List[str]] = None,
     enable_fallback: bool = True,
+    reasoning_effort: Optional[str] = None,
 ) -> BaseChatModel:
     """Internal builder for get_chat_model without warm cache lookup."""
+    effort_kwargs: Dict[str, Any] = {}
+    if reasoning_effort and str(reasoning_effort).strip():
+        effort_kwargs["reasoning_effort"] = str(reasoning_effort).strip()
+
     if selected_provider == "openrouter":
         api_key = settings.OPENROUTER_API_KEY
         if not api_key:
@@ -455,6 +490,7 @@ def _build_chat_model_uncached(
             },
             extra_body=extra_body if extra_body else None,
             provider_name="openrouter",
+            **effort_kwargs,
         )
 
     elif selected_provider == "gemini":
@@ -472,6 +508,7 @@ def _build_chat_model_uncached(
             model_name=model_name,
             temperature=temperature,
             enable_key_fallback=enable_fallback,
+            reasoning_effort=reasoning_effort,
         )
 
         if enable_fallback and settings.OPENROUTER_API_KEY:
@@ -518,6 +555,7 @@ def _build_chat_model_uncached(
             temperature=temperature,
             request_timeout=settings.REQUEST_TIMEOUT_SEC,
             provider_name="openai",
+            **effort_kwargs,
         )
 
         if enable_fallback:

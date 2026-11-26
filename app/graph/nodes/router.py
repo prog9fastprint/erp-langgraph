@@ -1503,7 +1503,17 @@ def _prepare_router_context(
         model_resolved = True
         if not is_test_env:
             try:
-                cached_model = get_chat_model()
+                router_provider = (settings.NLU_ROUTER_PROVIDER or "").strip() or None
+                router_model = (settings.NLU_ROUTER_MODEL or "").strip() or None
+                router_effort = (settings.NLU_ROUTER_REASONING_EFFORT or "").strip() or None
+                if router_provider or router_model or router_effort:
+                    cached_model = get_chat_model(
+                        provider=router_provider,
+                        model_name=router_model,
+                        reasoning_effort=router_effort,
+                    )
+                else:
+                    cached_model = get_chat_model()
             except Exception as exc:
                 logger.debug("Lazy router LLM initialization failed: %s", exc)
                 cached_model = None

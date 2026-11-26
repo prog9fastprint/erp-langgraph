@@ -745,6 +745,68 @@ class TestClarificationSynthesizerAndRouting(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["needs_clarification"])
         self.assertEqual(len(result["suggested_followups"]), 2)
 
+    async def test_fast_deterministic_skips_tabular_llm_but_keeps_analytical_and_rag(self):
+        """SYNTHESIZER_FAST_DETERMINISTIC bypasses LLM for tabular reports while keeping LLM for analytical & RAG queries."""
+        from unittest.mock import AsyncMock, MagicMock, patch
+        from app.core.config import settings
+        from app.graph.nodes.synthesizer import asynthesizer_node
+
+        mock_llm = MagicMock()
+        mock_resp = MagicMock()
+        mock_resp.content = "Analisis singkat dari LLM."
+        mock_resp.response_metadata = {}
+        mock_llm.ainvoke = AsyncMock(return_value=mock_resp)
+
+        # 1. Non-analytical tabular report -> skips LLM
+        st_tab = create_initial_state(user_query="cek laba rugi")
+        st_tab["detected_domain"] = "accounting"
+        st_tab["detected_tool"] = "get_profit_and_loss"
+        st_tab["query_mode"] = "live_erp"
+        st_tab["verification_status"] = "VALID"
+        st_tab["tool_result"] = {
+            "date_from": "2026-11-01",
+            "date_to": "2026-11-26",
+            "summary": {
+                "total_revenue": 10000000.0,
+                "cogs": 4000000.0,
+                "gross_profit": 6000000.0,
+                "gross_margin_percent": 60.0,
+                "operating_expenses": 2000000.0,
+                "operating_profit": 4000000.0,
+                "other_net": 0.0,
+                "net_profit": 4000000.0,
+            },
+        }
+        with patch.object(settings, "SYNTHESIZER_FAST_DETERMINISTIC", True), \
+             patch("app.graph.nodes.synthesizer.adispatch_custom_event", new_callable=AsyncMock) as mock_dispatch:
+            res_tab = await asynthesizer_node(st_tab, llm=mock_llm)
+
+        mock_llm.ainvoke.assert_not_awaited()
+        mock_dispatch.assert_awaited_once()
+        self.assertIn("Rp 4.000.000,00", res_tab["final_answer"])
+        self.assertTrue(len(res_tab["suggested_followups"]) > 0)
+
+        # 2. Analytical query -> still invokes LLM
+        st_ana = dict(st_tab)
+        st_ana["user_query"] = "kenapa laba bersih turun?"
+        with patch.object(settings, "SYNTHESIZER_FAST_DETERMINISTIC", True), \
+             patch("app.graph.nodes.synthesizer.adispatch_custom_event", new_callable=AsyncMock):
+            res_ana = await asynthesizer_node(st_ana, llm=mock_llm)
+        self.assertEqual(mock_llm.ainvoke.await_count, 1)
+        self.assertEqual(res_ana["final_answer"], "Analisis singkat dari LLM.")
+
+        # 3. Vector RAG query -> still invokes LLM
+        st_rag = create_initial_state(user_query="bagaimana SOP retur barang?")
+        st_rag["detected_domain"] = "knowledge"
+        st_rag["query_mode"] = "vector_rag"
+        st_rag["verification_status"] = "VALID"
+        st_rag["rag_context"] = [{"title": "SOP Retur", "content": "Retur maksimal 7 hari."}]
+        st_rag["rag_sources"] = ["SOP Retur"]
+        with patch.object(settings, "SYNTHESIZER_FAST_DETERMINISTIC", True), \
+             patch("app.graph.nodes.synthesizer.adispatch_custom_event", new_callable=AsyncMock):
+            await asynthesizer_node(st_rag, llm=mock_llm)
+        self.assertEqual(mock_llm.ainvoke.await_count, 2)
+
 
 if __name__ == "__main__":
     unittest.main()

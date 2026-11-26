@@ -1520,6 +1520,43 @@ class TestMultiToolExtractorNode(unittest.TestCase):
         self.assertTrue(e_out.get("is_multi_company"))
         self.assertEqual(len(e_out.get("company_ids") or []), 16)
 
+    def test_tier1_fast_path_skips_llm_for_default_pnl_balance_sheet_and_kilat(self):
+        """Tier-1 deterministic extraction skips LLM calls for default P&L, Balance Sheet, and Kilat diagnostics."""
+        anchor = date(2026, 11, 26)
+        mock_llm = MagicMock()
+
+        # 1. Default P&L without dates ("cek laba rugi")
+        st_pnl = create_initial_state("cek laba rugi", company_id=3)
+        st_pnl["detected_domain"] = "accounting"
+        st_pnl["detected_tool"] = "get_profit_and_loss"
+        st_pnl["active_tools"] = [{"tool": "get_profit_and_loss", "domain": "accounting", "sub_query": "cek laba rugi", "params": {}}]
+        res_pnl = extractor_node(st_pnl, llm=mock_llm, ref_date=anchor)
+        self.assertEqual(res_pnl["extracted_params"].get("include_breakdown"), False)
+        self.assertEqual(res_pnl["extracted_params"].get("company_id"), 3)
+
+        # 2. Default Balance Sheet without dates ("cek neraca")
+        st_bs = create_initial_state("cek neraca", company_id=3)
+        st_bs["detected_domain"] = "accounting"
+        st_bs["detected_tool"] = "get_balance_sheet"
+        st_bs["active_tools"] = [{"tool": "get_balance_sheet", "domain": "accounting", "sub_query": "cek neraca", "params": {}}]
+        res_bs = extractor_node(st_bs, llm=mock_llm, ref_date=anchor)
+        self.assertEqual(res_bs["extracted_params"].get("include_breakdown"), False)
+
+        # 3. Kilat order diagnostics with "blm" slang ("pesanan kilat nyangkut blm update invoice")
+        st_kilat = create_initial_state("pesanan kilat nyangkut blm update invoice", company_id=3)
+        st_kilat["detected_domain"] = "marketplace"
+        st_kilat["detected_tool"] = "get_kilat_order_diagnostics"
+        st_kilat["active_tools"] = [{
+            "tool": "get_kilat_order_diagnostics",
+            "domain": "marketplace",
+            "sub_query": "pesanan kilat nyangkut blm update invoice",
+            "params": {},
+        }]
+        res_kilat = extractor_node(st_kilat, llm=mock_llm, ref_date=anchor)
+        self.assertEqual(res_kilat["extracted_params"].get("issue_type"), "unupdated_invoice")
+
+        mock_llm.with_structured_output.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

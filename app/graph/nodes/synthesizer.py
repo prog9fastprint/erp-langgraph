@@ -14,6 +14,7 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from app.core.branches import COMPANY_NAME_MAP
+from app.core.config import settings
 from app.core.context import (
     get_current_erp_date,
     is_analytical_thinking_query,
@@ -2072,7 +2073,8 @@ def _build_synthesis_plan(
     model: Optional[BaseChatModel],
 ) -> Tuple[bool, bool, bool, bool, Optional[str]]:
     """Determine synthesis mode (verbatim, polish, or analytical) and resolve prompt if LLM runs."""
-    is_contextual_analysis = state.get("query_mode") == "contextual_analysis"
+    query_mode = state.get("query_mode")
+    is_contextual_analysis = query_mode == "contextual_analysis"
     is_large_deterministic = _should_keep_verbatim_deterministic(
         deterministic_answer, user_query, state, is_multi_q
     )
@@ -2081,7 +2083,17 @@ def _build_synthesis_plan(
         and is_analytical_thinking_query(str(user_query or ""))
         and not is_large_deterministic
     )
-    should_llm_synthesize = model is not None and (is_contextual_analysis or status == "VALID")
+    is_rag_synthesis = query_mode in ("vector_rag", "hybrid")
+    skip_tabular_llm = (
+        bool(getattr(settings, "SYNTHESIZER_FAST_DETERMINISTIC", False))
+        and not is_analytical
+        and not is_rag_synthesis
+    )
+    should_llm_synthesize = (
+        model is not None
+        and not skip_tabular_llm
+        and (is_contextual_analysis or status == "VALID")
+    )
     should_polish = should_llm_synthesize and (not is_large_deterministic or is_analytical)
 
     if not should_llm_synthesize:

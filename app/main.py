@@ -25,7 +25,12 @@ from app.graph.workflow import (
 )
 from app.schemas.chat import ChatRequest, ChatResponse
 from app.services.django_client import aclose_shared_django_client
-from app.services.llm import afetch_free_models_catalog, get_default_model_name
+from app.services.llm import (
+    afetch_free_models_catalog,
+    get_chat_model,
+    get_default_model_name,
+    get_router_chat_model,
+)
 from app.services.vector_service import vector_service
 
 _LOG_LEVEL_NAME = (settings.LOG_LEVEL or "info").strip().upper()
@@ -59,6 +64,18 @@ async def lifespan(app: FastAPI):
                 prewarm_task.add_done_callback(_on_background_task_done)
 
             is_test_env = "unittest" in sys.modules or os.environ.get("FASTPRINT_TEST_ENV") == "true" or settings.APP_ENV == "test"
+            if not is_test_env:
+                try:
+                    get_chat_model()
+                    get_router_chat_model()
+                except Exception as llm_warm_err:
+                    logger.debug("Startup LLM client pre-warm skipped: %s", llm_warm_err)
+
+                try:
+                    vector_service._get_genai_client()
+                except Exception as emb_warm_err:
+                    logger.debug("Startup Gemini embedding client pre-warm skipped: %s", emb_warm_err)
+
             if not is_test_env and settings.VECTOR_DB_URL:
                 init_vec_task = loop.create_task(vector_service.initialize_table())
                 _BACKGROUND_TASKS.add(init_vec_task)

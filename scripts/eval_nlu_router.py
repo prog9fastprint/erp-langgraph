@@ -46,7 +46,7 @@ from app.graph.nodes.router_semantic import (  # noqa: E402
     check_hard_guardrails,
 )
 from app.graph.state import create_initial_state  # noqa: E402
-from app.services.llm import get_chat_model  # noqa: E402
+from app.services.llm import get_router_chat_model  # noqa: E402
 
 DEFAULT_DATASET_PATH = REPO_ROOT / "tests" / "fixtures" / "nlu_golden_cases.json"
 
@@ -201,7 +201,7 @@ async def evaluate_golden_cases(
     """Run repeatable evaluation over golden cases in 'offline' or 'live' mode."""
     live_model = llm
     if mode == "live" and live_model is None:
-        live_model = get_chat_model()
+        live_model = get_router_chat_model()
 
     effective_concurrency = max(1, int(concurrency)) if mode == "live" else 1
     sem = asyncio.Semaphore(effective_concurrency)

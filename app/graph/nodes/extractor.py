@@ -233,6 +233,11 @@ def _extract_single_tool_params(
             rel_date_from, rel_date_to = resolve_relative_dates(user_query, today)
 
     extracted_dict: Optional[Dict[str, Any]] = None
+    has_unresolved_temporal = (
+        supports_dates
+        and has_temporal_expression(sub_query)
+        and not (rel_date_from or rel_date_to)
+    )
 
     # 0. Fast-Path Deterministic Extraction (Tier 1)
     if tool_name == "get_stock_level" and retry_count == 0:
@@ -249,16 +254,39 @@ def _extract_single_tool_params(
         extracted_dict = _fallback_extract_price_history(sub_query, today, state.get("messages"))
     elif tool_name == "get_profit_and_loss" and retry_count == 0:
         fast_params = _fallback_extract_profit_and_loss(sub_query, today, state.get("messages"))
-        if fast_params.get("date_from") or fast_params.get("date_to") or fast_params.get("include_breakdown"):
+        if (
+            fast_params.get("date_from")
+            or fast_params.get("date_to")
+            or fast_params.get("include_breakdown")
+            or not has_temporal_expression(sub_query)
+        ):
             extracted_dict = dict(fast_params)
     elif tool_name == "get_balance_sheet" and retry_count == 0:
         fast_params = _fallback_extract_balance_sheet(sub_query, today, state.get("messages"))
-        if fast_params.get("as_of_date") or fast_params.get("include_breakdown"):
+        if (
+            fast_params.get("as_of_date")
+            or fast_params.get("include_breakdown")
+            or not has_temporal_expression(sub_query)
+        ):
+            extracted_dict = dict(fast_params)
+    elif tool_name == "get_bank_reconciliation_summary" and retry_count == 0 and not has_unresolved_temporal:
+        fast_params = _fallback_extract_bank_reconciliation(sub_query, today)
+        has_unmatched_bank_name = bool(
+            re.search(
+                r"\bbank\s+(?!bulan|tahun|minggu|hari|kemarin|ini|lalu|di|pada|cabang|pusat|semua|seluruh|perusahaan|yang|yg|belum|sudah|recon|koran|erp)[a-z]",
+                strip_company_scope_keywords(sub_query),
+                re.IGNORECASE,
+            )
+        )
+        if fast_params.get("bank_name") or not has_unmatched_bank_name:
             extracted_dict = dict(fast_params)
     elif tool_name == "get_top_selling_products" and retry_count == 0:
         fast_params = _fallback_extract_top_selling_products(sub_query, today)
         if fast_params:
             extracted_dict = dict(fast_params)
+    elif tool_name == "get_sales_summary" and retry_count == 0 and not has_unresolved_temporal:
+        if _extract_sales_channel(sub_query) is None:
+            extracted_dict = _fallback_extract_sales_summary(sub_query, today)
     elif tool_name == "get_contacts" and retry_count == 0:
         fast_params = _fallback_extract_contacts(sub_query, today, state.get("messages"), state=state)
         if fast_params:
@@ -273,6 +301,16 @@ def _extract_single_tool_params(
             or fast_params.get("_inherited_dates")
         ):
             extracted_dict = dict(fast_params)
+    elif tool_name == "get_kilat_order_diagnostics" and retry_count == 0 and not has_unresolved_temporal:
+        extracted_dict = _fallback_extract_kilat_diagnostics(sub_query, today)
+    elif tool_name == "get_account_health" and retry_count == 0 and not has_unresolved_temporal:
+        extracted_dict = _fallback_extract_account_health(sub_query, today)
+    elif tool_name == "get_fee_and_escrow_anomalies" and retry_count == 0 and not has_unresolved_temporal:
+        extracted_dict = _fallback_extract_fee_anomalies(sub_query, today)
+    elif tool_name == "get_deduction_and_settlement_summary" and retry_count == 0 and not has_unresolved_temporal:
+        extracted_dict = _fallback_extract_deduction_summary(sub_query, today)
+    elif tool_name == "get_cashflow_and_balance_summary" and retry_count == 0 and not has_unresolved_temporal:
+        extracted_dict = _fallback_extract_cashflow_balance(sub_query, today)
 
     # 1. LLM Structured Output Attempt (resolve model lazily only after Tier-1 fast path misses)
     active_model = model

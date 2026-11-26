@@ -185,6 +185,35 @@ class TestLLMClientFactory(unittest.TestCase):
             reset_provider_health()
             clear_chat_model_cache()
 
+    def test_get_router_chat_model_honors_dedicated_router_overrides(self):
+        """get_router_chat_model defaults to primary model and honors NLU_ROUTER_* overrides."""
+        from app.services.llm import clear_chat_model_cache, get_router_chat_model, reset_provider_health
+
+        clear_chat_model_cache()
+        reset_provider_health()
+        try:
+            with patch.object(settings, "MODEL_PROVIDER", "openai"), \
+                 patch.object(settings, "OPENAI_API_KEY", "router-key-1"), \
+                 patch.object(settings, "NLU_ROUTER_PROVIDER", None), \
+                 patch.object(settings, "NLU_ROUTER_MODEL", None), \
+                 patch.object(settings, "NLU_ROUTER_REASONING_EFFORT", None):
+                base_m = get_chat_model(enable_fallback=False)
+                router_m = get_router_chat_model(enable_fallback=False)
+                self.assertIs(base_m, router_m)
+
+            with patch.object(settings, "MODEL_PROVIDER", "openai"), \
+                 patch.object(settings, "OPENAI_API_KEY", "router-key-1"), \
+                 patch.object(settings, "GOOGLE_AI_API_KEY", "gemini-router-key"), \
+                 patch.object(settings, "NLU_ROUTER_PROVIDER", "gemini"), \
+                 patch.object(settings, "NLU_ROUTER_MODEL", "gemini-2.5-flash-lite"), \
+                 patch.object(settings, "NLU_ROUTER_REASONING_EFFORT", "none"):
+                fast_m = get_router_chat_model(enable_fallback=False)
+                self.assertEqual(fast_m.model_name, "gemini-2.5-flash-lite")
+                self.assertEqual(getattr(fast_m, "reasoning_effort", None), "none")
+        finally:
+            reset_provider_health()
+            clear_chat_model_cache()
+
 
 if __name__ == "__main__":
     unittest.main()

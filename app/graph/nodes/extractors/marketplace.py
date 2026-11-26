@@ -147,7 +147,7 @@ def _fallback_extract_kilat_diagnostics(query: str, today: date) -> Dict[str, An
     if acc_id is not None:
         params["account_id"] = acc_id
 
-    if re.search(r"\b(belum\s+update|unupdated|invoice_updated)\b", cleaned):
+    if re.search(r"\b((?:belum|blm)\s+update|unupdated|invoice_updated)\b", cleaned):
         params["issue_type"] = "unupdated_invoice"
     elif re.search(r"\b(duplikat|duplicate|collision|bentrok)\b", cleaned):
         params["issue_type"] = "duplicate_collision"

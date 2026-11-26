@@ -119,6 +119,24 @@ class Settings(BaseSettings):
         default=True,
         validation_alias="NLU_SHADOW_LOG_MISMATCH_ONLY",
     )
+    NLU_ROUTER_PROVIDER: Optional[str] = Field(
+        default=None,
+        validation_alias="NLU_ROUTER_PROVIDER",
+    )
+    NLU_ROUTER_MODEL: Optional[str] = Field(
+        default=None,
+        validation_alias="NLU_ROUTER_MODEL",
+    )
+    NLU_ROUTER_REASONING_EFFORT: Optional[str] = Field(
+        default=None,
+        validation_alias="NLU_ROUTER_REASONING_EFFORT",
+    )
+
+    # 8. Synthesizer Latency Optimization
+    SYNTHESIZER_FAST_DETERMINISTIC: bool = Field(
+        default=False,
+        validation_alias="SYNTHESIZER_FAST_DETERMINISTIC",
+    )
 
     @field_validator("NLU_ROUTER_MODE", mode="before")
     @classmethod
