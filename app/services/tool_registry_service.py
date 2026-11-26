@@ -206,7 +206,7 @@ CORE_TOOL_DEFINITIONS: List[Dict[str, Any]] = [
         "domain": "inventory",
         "description": "Informasi detail master produk, spesifikasi teknis barang, kategori, satuan ukuran (UoM), harga jual, dan status aktif produk.",
         "schema_cls": ProductInfoFilterSchema,
-        "keywords": ["detail produk", "spesifikasi barang", "harga produk", "uom", "master produk"],
+        "keywords": ["detail produk", "spesifikasi barang", "harga produk", "harga", "uom", "master produk"],
         "sample_queries": [
             "berapa harga jual kertas stiker vinyl A4",
             "cek detail master produk dan SKU tinta DTF putih",
@@ -267,9 +267,9 @@ CORE_TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     {
         "tool_name": "get_low_stock_alerts",
         "domain": "inventory",
-        "description": "Peringatan dini barang menipis atau habis, daftar produk dengan stok di bawah batas minimum (reorder point), dan rekomendasi pemesanan kembali.",
+        "description": "Peringatan dini barang menipis atau habis, daftar produk dengan stok paling sedikit atau di bawah batas minimum (reorder point), dan rekomendasi pemesanan kembali.",
         "schema_cls": LowStockAlertsFilterSchema,
-        "keywords": ["stok menipis", "stok kritis", "low stock", "habis", "reorder point"],
+        "keywords": ["stok menipis", "stok kritis", "stok tersedikit", "tersedikit", "low stock", "habis", "reorder point"],
         "sample_queries": [
             "barang apa saja yang stoknya menipis di cabang Surabaya",
             "cek alert low stock di bawah batas minimum reorder point",
@@ -345,7 +345,7 @@ CORE_TOOL_DEFINITIONS: List[Dict[str, Any]] = [
         "domain": "inventory",
         "description": "Analisis kecepatan perputaran stok (fast-moving vs slow-moving/dead stock), days of supply, dan rekomendasi restock berdasarkan laju penjualan dan lead time.",
         "schema_cls": InventoryVelocityForecastFilterSchema,
-        "keywords": ["fast moving", "slow moving", "dead stock", "forecast stok", "restock", "rekomendasi order", "perputaran stok"],
+        "keywords": ["fast moving", "fastmoving", "slow moving", "lowmoving", "dead stock", "forecast stok", "forecasting", "restock", "rekomendasi order", "perputaran stok"],
         "sample_queries": [
             "produk apa yang masuk dead stock atau slow moving 90 hari terakhir",
             "cek analisis fast moving dan rekomendasi restock bulan ini",
@@ -375,9 +375,9 @@ CORE_TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     {
         "tool_name": "get_top_selling_products",
         "domain": "sales",
-        "description": "Laporan produk paling laris (Best Selling / Top Products), rangking volume penjualan produk, dan nilai total omzet penjualan per cabang.",
+        "description": "Laporan produk paling laris (Best Selling / Top Products), rangking volume penjualan produk terbanyak, dan nilai total omzet penjualan produk per cabang.",
         "schema_cls": TopSellingProductsFilterSchema,
-        "keywords": ["terlaris", "top selling", "best seller", "omzet produk", "penjualan tertinggi"],
+        "keywords": ["terlaris", "top selling", "best seller", "omzet produk", "penjualan tertinggi", "penjualan terbanyak", "penjualan"],
         "sample_queries": [
             "10 produk paling laris bulan ini di Mainstore",
             "cek top selling products berdasarkan omzet minggu lalu",
@@ -455,9 +455,9 @@ CORE_TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     {
         "tool_name": "get_account_health",
         "domain": "marketplace",
-        "description": "Pengecekan kesehatan akun toko marketplace, masa berlaku token OAuth (expired/expiring soon tanpa membocorkan secret), status moderasi toko, kelengkapan konfigurasi AccountOrder dan AccountProperties, serta log error fetch order Celery di Shopee, TikTok Shop, Tokopedia, dan Lazada.",
+        "description": "Pengecekan kesehatan akun toko marketplace, masa berlaku token OAuth (expired/expiring soon tanpa membocorkan secret), status moderasi toko, kelengkapan konfigurasi AccountOrder dan AccountProperties, serta log error fetch atau penarikan order marketplace yang gagal di Celery di Shopee, TikTok Shop, Tokopedia, dan Lazada.",
         "schema_cls": AccountHealthFilterSchema,
-        "keywords": ["kesehatan akun", "account health", "token expired", "token marketplace", "gagal fetch order", "toko marketplace", "oauth marketplace"],
+        "keywords": ["kesehatan akun", "account health", "token expired", "token marketplace", "gagal fetch order", "penarikan marketplace", "toko marketplace", "oauth marketplace"],
         "sample_queries": [
             "cek kesehatan akun toko Shopee dan TikTok yang tokennya mau expired",
             "kenapa akun Tokopedia gagal fetch order di Celery",
@@ -585,7 +585,7 @@ CORE_TOOL_DEFINITIONS: List[Dict[str, Any]] = [
         "domain": "marketplace",
         "description": "Rekapitulasi pendapatan kotor (gross), potongan biaya marketplace per kategori kanonik (Komisi Platform, Biaya Layanan, Ongkir, Voucher Penjual, Pajak), pendapatan bersih (nett), settlement belum ter-posting ke jurnal, dan validasi aritmatika.",
         "schema_cls": DeductionAndSettlementSummaryFilterSchema,
-        "keywords": ["potongan fee", "rekap deduction", "komisi marketplace", "settlement belum posting", "unposted journal", "revenue history"],
+        "keywords": ["potongan fee", "potongan marketplace", "rekap deduction", "komisi marketplace", "settlement belum posting", "unposted journal", "revenue history"],
         "sample_queries": [
             "rekap potongan komisi, biaya layanan, dan voucher Shopee bulan ini",
             "cek settlement marketplace yang belum ter-posting ke jurnal",
@@ -687,6 +687,17 @@ def _extract_query_tokens(query: str) -> List[str]:
         if tok not in seen:
             seen.add(tok)
             tokens.append(tok)
+        # Add light Indonesian affix-stripped root forms (e.g. stocknya -> stock, contactnya -> contact, dimapping -> mapping)
+        if tok.endswith("nya") and len(tok) >= 6:
+            stem = tok[:-3]
+            if stem not in FALLBACK_STOP_WORDS and stem not in seen:
+                seen.add(stem)
+                tokens.append(stem)
+        if tok.startswith("di") and len(tok) >= 7:
+            stem = tok[2:]
+            if stem not in FALLBACK_STOP_WORDS and stem not in seen:
+                seen.add(stem)
+                tokens.append(stem)
     return tokens
 
 

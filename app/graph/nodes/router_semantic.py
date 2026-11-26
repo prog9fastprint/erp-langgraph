@@ -54,6 +54,9 @@ _ERP_WRITE_PATTERNS = [
     r"\b(?:buat(?:kan)?|tambah(?:kan)?|bikin(?:kan)?|input|posting|approve|setujui|hapus|delete|batalkan|cancel|ubah|edit|koreksi)\s+"
     r"(?:jurnal|voucher|faktur|invoice|tagihan|sales\s+order|so\b|transfer|surat\s+jalan|stok\s+opname|stock\s+adjustment|scrap)\b",
     r"\b(?:lakukan|eksekusi|jalankan)\s+(?:stock\s+opname|penyesuaian\s+stok|transfer\s+stok|posting\s+jurnal|push\s+stok|update\s+harga)\b",
+    r"\b(?:update|push|sinkron(?:kan)?|ubah|edit|naik(?:kan)?|turun(?:kan)?)\s+"
+    r"(?:data\s+)?(?:stok|stock|harga|price)\s+(?:[\w\-]+\s+){0,3}?(?:ke|di)\s+"
+    r"(?:shopee|tiktok(?:\s*shop)?|tokopedia|lazada|marketplace)\b",
 ]
 
 _DIAGNOSTIC_READ_INTENT_RE = re.compile(
