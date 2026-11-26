@@ -88,9 +88,14 @@ from app.graph.nodes.router_patterns import (
     OUT_OF_SCOPE_PATTERNS,
     RETRY_PATTERNS,
     _CASUAL_NON_ERP_INTERROGATIVE_RE,
+    _FOLLOWUP_ELLIPTICAL_PREFIX_RE,
+    _STANDALONE_NON_FOLLOWUP_INTERROGATIVE_RE,
     _match_any,
     _find_first_match,
+    is_allowed_general_query,
+    is_general_help_inquiry,
     is_meta_question,
+    is_pure_greeting,
 )
 
 logger = logging.getLogger("router_node")
@@ -126,11 +131,15 @@ class RouterDecision(BaseModel):
     """Structured output schema for LLM router fallback."""
     domain: Literal["accounting", "inventory", "sales", "marketplace", "knowledge", "general", "out_of_scope"] = Field(
         ...,
-        description="Target ERP module domain: 'accounting', 'inventory', 'sales', 'marketplace', 'knowledge' (SOPs, specs, policies), 'general' (greetings/help), or 'out_of_scope' (unrelated queries outside ERP)."
+        description=(
+            "Target ERP module domain: 'accounting', 'inventory', 'sales', 'marketplace', "
+            "'knowledge' (SOPs, specs, policies), 'general' (STRICTLY ONLY pure greetings, thanks, bot capability/help, or session meta-questions), "
+            "or 'out_of_scope' (ANY non-ERP topic such as trivia, weather, recipes, coding, chitchat, unsupported modules like HR/payroll, or write requests)."
+        ),
     )
     query_mode: Literal["live_erp", "vector_rag", "hybrid", "general", "out_of_scope", "contextual_analysis"] = Field(
         "live_erp",
-        description="Execution mode: 'vector_rag' for SOP/policies/specs, 'live_erp' for real-time transactions/stock, 'hybrid' for combined questions, 'contextual_analysis' for follow-up analytical questions on prior report data, 'general', or 'out_of_scope'."
+        description="Execution mode: 'vector_rag' for SOP/policies/specs, 'live_erp' for real-time transactions/stock, 'hybrid' for combined questions, 'contextual_analysis' for follow-up analytical questions on prior report data, 'general' (greetings/help only), or 'out_of_scope' (anything outside ERP capabilities).",
     )
     tool: Optional[str] = Field(
         None,
@@ -157,11 +166,15 @@ class MultiRouterDecision(BaseModel):
     """Structured output schema for LLM router supporting multi-intent planning."""
     domain: Literal["accounting", "inventory", "sales", "marketplace", "knowledge", "general", "out_of_scope"] = Field(
         ...,
-        description="Primary target ERP module domain: 'accounting', 'inventory', 'sales', 'marketplace', 'knowledge', 'general', or 'out_of_scope'."
+        description=(
+            "Primary target ERP module domain: 'accounting', 'inventory', 'sales', 'marketplace', "
+            "'knowledge' (SOPs/specs/policies), 'general' (STRICTLY ONLY pure greetings, thanks, bot capability/help, or session meta-questions), "
+            "or 'out_of_scope' (ANY non-ERP topic such as general knowledge, trivia, recipes, weather, coding, chitchat, unsupported modules, or write operations)."
+        ),
     )
     query_mode: Literal["live_erp", "vector_rag", "hybrid", "general", "out_of_scope", "contextual_analysis"] = Field(
         "live_erp",
-        description="Execution mode: 'vector_rag', 'live_erp', 'hybrid', 'contextual_analysis', 'general', or 'out_of_scope'."
+        description="Execution mode: 'vector_rag', 'live_erp', 'hybrid', 'contextual_analysis', 'general' (greetings/help only), or 'out_of_scope' (anything outside ERP capabilities).",
     )
     tool: Optional[str] = Field(
         None,
@@ -292,7 +305,7 @@ def classify_query_rule_based(query: str) -> Optional[Dict[str, Any]]:
     has_vendor = any(re.search(rf"\b{re.escape(term)}(nya)?\b", cleaned) for term in VENDOR_TERMS)
     has_purchase_invoice = any(kw in cleaned for kw in PURCHASE_INVOICE_TERMS)
     is_rag = _match_any(KNOWLEDGE_RAG_PATTERNS, cleaned)
-    is_greeting_or_general = _match_any(GREETING_PATTERNS, cleaned) or _match_any(GENERAL_INQUIRY_PATTERNS, cleaned)
+    is_greeting_or_general = is_pure_greeting(cleaned) or is_general_help_inquiry(cleaned)
 
     # 0. Session Meta-Questions (period / company scope / latest ERP date)
     if is_meta_question(cleaned):
@@ -854,6 +867,30 @@ def _resolve_clause_company_scope(
     return active_cid, [active_cid], False
 
 
+def _enforce_general_vs_out_of_scope(
+    query: str,
+    detected_domain: Optional[str],
+    query_mode: Optional[str],
+    has_active_tools: bool = False,
+) -> Tuple[str, str]:
+    """
+    Post-LLM deterministic guardrail: coerce LLM 'general' decisions to 'out_of_scope'
+    unless the query is strictly a pure greeting, bot help/capability inquiry, session meta-question,
+    or customer billing guardrail.
+    """
+    domain = detected_domain or "out_of_scope"
+    mode = query_mode or ("out_of_scope" if domain == "out_of_scope" else "live_erp")
+    if has_active_tools:
+        return domain, mode
+    if domain == "out_of_scope" or mode == "out_of_scope":
+        return "out_of_scope", "out_of_scope"
+    if domain == "general" or mode == "general":
+        if is_allowed_general_query(query):
+            return "general", "general"
+        return "out_of_scope", "out_of_scope"
+    return domain, mode
+
+
 def _classify_non_tool_category(clause: str, domain: Optional[str]) -> str:
     """Categorize a non-tool clause for per-clause synthesis and guardrail notices."""
     cleaned = (clause or "").lower()
@@ -866,7 +903,9 @@ def _classify_non_tool_category(clause: str, domain: Optional[str]) -> str:
     has_purch = any(kw in cleaned for kw in PURCHASE_INVOICE_TERMS)
     if (has_cust or any(t in cleaned for t in ("tagihan", "faktur", "invoice", "bill", "piutang", "kuitansi", "bon"))) and not has_vend and not has_purch:
         return "customer_billing"
-    return "general"
+    if is_pure_greeting(cleaned) or is_general_help_inquiry(cleaned) or is_meta_question(cleaned):
+        return "general"
+    return "out_of_scope"
 
 
 def _invoke_llm_clause_router(
@@ -880,7 +919,10 @@ def _invoke_llm_clause_router(
             "You are a Supervisor Agent and Multi-Domain Tool Router for FastPrint ERP.\n"
             "Classify this single user question into target module domain ('accounting', 'inventory', 'sales', 'marketplace', 'knowledge', 'general', 'out_of_scope') "
             "and query_mode ('live_erp', 'vector_rag', 'hybrid', 'general', 'out_of_scope').\n"
-            "Populate planned_tools when live ERP data is needed, or rag_query when SOP/specs/policy knowledge is needed."
+            "Populate planned_tools when live ERP data is needed, or rag_query when SOP/specs/policy knowledge is needed.\n"
+            "STRICT BOUNDARY:\n"
+            "- Use 'general' ONLY for pure greetings (halo, selamat pagi), thanks (terima kasih), bot capability/help (/scope, bisa bantu apa), or session meta-questions.\n"
+            "- Use 'out_of_scope' for ANY topic unrelated to FastPrint ERP (general knowledge, trivia, recipes, weather, coding, chitchat, unsupported modules like HR/payroll) or write requests."
         )
         raw_history = (state.get("messages") or [])[:-1]
         history_msgs = trim_conversation_messages(raw_history, max_messages=settings.MAX_WINDOW_MESSAGES)
@@ -890,8 +932,8 @@ def _invoke_llm_clause_router(
             *history_msgs,
             HumanMessage(content=clause),
         ])
-        detected_domain = getattr(decision, "domain", "general")
-        query_mode = getattr(decision, "query_mode", "live_erp")
+        detected_domain = getattr(decision, "domain", "out_of_scope")
+        query_mode = getattr(decision, "query_mode", "out_of_scope")
         detected_tool = getattr(decision, "tool", None)
         rag_query = getattr(decision, "rag_query", None)
         raw_planned = getattr(decision, "planned_tools", None) or []
@@ -921,6 +963,13 @@ def _invoke_llm_clause_router(
                 "params": {},
                 "status": "pending",
             })
+
+        detected_domain, query_mode = _enforce_general_vs_out_of_scope(
+            clause,
+            detected_domain,
+            query_mode,
+            has_active_tools=bool(active_tools),
+        )
 
         return {
             "detected_domain": active_tools[0]["domain"] if active_tools else detected_domain,
@@ -1014,8 +1063,8 @@ def _assemble_decomposed_route(
         if c_res is None:
             c_low = clause.lower().strip()
             if (
-                _match_any(GREETING_PATTERNS, c_low)
-                or _match_any(GENERAL_INQUIRY_PATTERNS, c_low)
+                is_pure_greeting(c_low)
+                or is_general_help_inquiry(c_low)
                 or is_meta_question(c_low)
             ):
                 non_tool_questions.append({
@@ -1107,11 +1156,13 @@ def _assemble_decomposed_route(
                 p_copy["is_multi_company"] = c_is_mc
                 collected_plans.append(p_copy)
         elif c_mode not in ("vector_rag",):
+            nt_cat = _classify_non_tool_category(clause, c_domain)
+            nt_domain = "out_of_scope" if nt_cat in ("out_of_scope", "marketplace_write") else (c_domain or "general")
             non_tool_questions.append({
                 "question_index": q_idx,
                 "question_text": clause,
-                "category": _classify_non_tool_category(clause, c_domain),
-                "domain": c_domain or "general",
+                "category": nt_cat,
+                "domain": nt_domain,
             })
 
     # Smart merge: merge adjacent/same-scope non-anaphoric get_stock_level clauses into 1 batch call
@@ -1509,8 +1560,19 @@ def _router_single_and_llm_steps(
                 or _match_any(SALES_ORDERS_PATTERNS, clean_uq)
                 or any(term in clean_uq for term in ("contact", "kontak", "quotation", "penawaran"))
             )
-            is_short_followup = len(clean_uq.split()) <= 7 and not has_sales_entity_shift and not is_casual_oos and (
-                is_branch_mention or is_all_scope_followup or is_followup_retry or is_location_interrogative
+            is_non_erp_or_general_turn = (
+                is_casual_oos
+                or is_pure_greeting(clean_uq)
+                or is_general_help_inquiry(clean_uq)
+                or is_meta_question(clean_uq)
+                or _match_any(OUT_OF_SCOPE_PATTERNS, clean_uq)
+                or _match_any(MARKETPLACE_WRITE_PATTERNS, clean_uq)
+            )
+            is_short_followup = (
+                len(clean_uq.split()) <= 7
+                and not has_sales_entity_shift
+                and not is_non_erp_or_general_turn
+                and (is_branch_mention or is_all_scope_followup or is_followup_retry or is_location_interrogative)
             )
 
             if is_short_followup:
@@ -1551,19 +1613,37 @@ def _router_single_and_llm_steps(
                 except Exception as exc:
                     logger.warning(f"Error resolving conversational follow-up: {exc}")
 
-            # Heuristic Short Follow-Up: If query <= 6 words with no new domain intent,
-            # and prior ERP query exists, treat as conversational follow-up to prior domain
+            # Heuristic Short Follow-Up: Require an explicit follow-up cue (branch/scope, temporal filter,
+            # anaphoric/elliptical continuation, or short bare non-interrogative entity refinement) so
+            # short Turn-2 off-topic questions are never hijacked by the prior ERP tool.
             has_new_domain_intent = (
                 any(term in clean_uq for term in CUSTOMER_TERMS)
                 or any(term in clean_uq for term in VENDOR_TERMS)
                 or has_sales_entity_shift
-                or _match_any(GREETING_PATTERNS, clean_uq)
-                or _match_any(OUT_OF_SCOPE_PATTERNS, clean_uq)
+                or is_non_erp_or_general_turn
                 or _match_any(ACCOUNTING_BALANCE_PATTERNS, clean_uq)
                 or _match_any(ACCOUNTING_JOURNAL_PATTERNS, clean_uq)
                 or _match_any(KNOWLEDGE_RAG_PATTERNS, clean_uq)
             )
-            if len(clean_uq.split()) <= 6 and not has_new_domain_intent and not is_casual_oos and not is_meta_question(clean_uq):
+            uq_words = clean_uq.split()
+            has_temporal_followup = resolve_relative_dates(clean_uq) != (None, None)
+            has_anaphoric_or_elliptical_cue = (
+                has_anaphoric_reference(clean_uq)
+                or bool(_FOLLOWUP_ELLIPTICAL_PREFIX_RE.search(clean_uq))
+            )
+            is_bare_entity_refinement = (
+                1 <= len(uq_words) <= 4
+                and not user_query.strip().endswith("?")
+                and not _STANDALONE_NON_FOLLOWUP_INTERROGATIVE_RE.search(clean_uq)
+            )
+            has_followup_cue = (
+                is_branch_mention
+                or is_all_scope_followup
+                or has_temporal_followup
+                or has_anaphoric_or_elliptical_cue
+                or is_bare_entity_refinement
+            )
+            if len(uq_words) <= 6 and has_followup_cue and not has_new_domain_intent:
                 try:
                     prior_result = classify_query_rule_based(prior_q)
                     if prior_result is not None and prior_result.get("detected_domain") in ("accounting", "inventory", "sales", "marketplace"):
@@ -1616,8 +1696,8 @@ def _router_single_and_llm_steps(
                 "2. 'live_erp': Numerical / real-time operational inquiries about stock on hand, cash balances, journal ledger, vendor bills/invoices, sales orders/revenue, or marketplace operations/diagnostics.\n"
                 "3. 'hybrid': Combined queries asking about both SOP/specs rules AND live ERP numbers/stock. Plan live ERP tool(s) in planned_tools and set rag_query.\n"
                 "4. 'contextual_analysis': Analytical or 'why' follow-up questions about detailed ERP report data already shown in conversation history when no new branch/period/tool is requested. Set domain to the prior ERP domain ('accounting', 'inventory', 'sales', 'marketplace'), tool=null, planned_tools=[].\n"
-                "5. 'general': Pure greetings, polite chitchat, or asking about bot capabilities. tool=null, planned_tools=[].\n"
-                "6. 'out_of_scope': Inquiries unrelated to FastPrint ERP data or write/mutation requests (e.g., pushing stock/price to Shopee/TikTok or merging Kilat orders). tool=null, planned_tools=[].\n\n"
+                "5. 'general': STRICTLY ONLY pure greetings (halo, selamat pagi), thanks (terima kasih), asking about this bot's ERP capabilities/help (/scope, bisa bantu apa), or session meta-questions. NEVER use 'general' for general knowledge, trivia, recipes, weather, coding, casual chitchat, or unsupported modules. tool=null, planned_tools=[].\n"
+                "6. 'out_of_scope': ANY inquiry unrelated to FastPrint ERP data (general knowledge, trivia, recipes, weather, coding, entertainment, politics, personal advice), unsupported ERP modules (e.g., HR/payroll/leave), or write/mutation requests (e.g., pushing stock/price to Shopee/TikTok or merging Kilat orders). tool=null, planned_tools=[].\n\n"
                 "CONTEXT AWARENESS:\n"
                 "Evaluate user query in context of conversational history.\n"
                 "If user asks to retry or follow up, infer intended domain and target ERP tools from history.\n\n"
@@ -1667,8 +1747,8 @@ def _router_single_and_llm_steps(
             ]
             decision = structured_model.invoke(messages)
 
-            detected_domain = getattr(decision, "domain", "general")
-            query_mode = getattr(decision, "query_mode", "live_erp")
+            detected_domain = getattr(decision, "domain", "out_of_scope")
+            query_mode = getattr(decision, "query_mode", "out_of_scope")
             detected_tool = getattr(decision, "tool", None)
             rag_query = getattr(decision, "rag_query", None)
             raw_planned_tools = getattr(decision, "planned_tools", None) or []
@@ -1701,6 +1781,13 @@ def _router_single_and_llm_steps(
                     "params": {},
                     "status": "pending",
                 })
+
+            detected_domain, query_mode = _enforce_general_vs_out_of_scope(
+                user_query,
+                detected_domain,
+                query_mode,
+                has_active_tools=bool(active_tools),
+            )
 
             if active_tools:
                 primary = active_tools[0]
@@ -1874,8 +1961,8 @@ def _try_route_contextual_analysis(
         return None
     if (
         _match_any(OUT_OF_SCOPE_PATTERNS, clean_uq)
-        or _match_any(GREETING_PATTERNS, clean_uq)
-        or _match_any(GENERAL_INQUIRY_PATTERNS, clean_uq)
+        or is_pure_greeting(clean_uq)
+        or is_general_help_inquiry(clean_uq)
         or _match_any(MARKETPLACE_WRITE_PATTERNS, clean_uq)
     ):
         return None

@@ -37,7 +37,11 @@ from app.graph.nodes.formatters import (
     _resolve_period_bounds,
     _resolve_product_display_price,
 )
-from app.graph.nodes.router_patterns import is_meta_question
+from app.graph.nodes.router_patterns import (
+    is_general_help_inquiry,
+    is_meta_question,
+    is_pure_greeting,
+)
 from app.graph.state import AgentState
 from app.services.llm import get_chat_model
 
@@ -213,8 +217,9 @@ def _format_non_tool_item_notice(
         )
     if cat == "out_of_scope":
         return (
-            "### Pertanyaan di Luar Cakupan Operasional ERP\n\n"
-            "Pertanyaan tersebut berada di luar cakupan operasional dan data FastPrint ERP (Akuntansi, Inventaris, Penjualan, Marketplace, dan SOP Internal)."
+            "### Permintaan di Luar Cakupan (Out of Scope)\n\n"
+            "Maaf, pertanyaan ini berada di luar cakupan dan kemampuan Asisten AI FastPrint ERP. "
+            "Asisten ini hanya melayani data operasional FastPrint ERP (Akuntansi, Inventaris, Penjualan, Marketplace read-only, dan SOP Internal)."
         )
     return (
         "Saya dapat membantu memeriksa data Akuntansi, Inventaris/Stok Gudang, Penjualan, "
@@ -607,15 +612,14 @@ def format_deterministic_answer(state: AgentState) -> str:
             )
         return (
             "### Permintaan di Luar Cakupan (Out of Scope)\n\n"
-            "Permintaan ini berada di luar cakupan operasional Asisten AI FastPrint ERP.\n\n"
-            "Sistem ini dikhususkan untuk melayani penelusuran data operasional dan pembukuan internal perusahaan:\n"
-            "- **Tagihan Vendor / Pemasok** (Hutang usaha & status verifikasi faktur)\n"
-            "- **Saldo Akun Buku Kas & Neraca** (Accounting Balance & Kas Kecil)\n"
-            "- **Entri Jurnal Umum** (General Journal Entries)\n"
-            "- **Stok Barang & Master Produk** (Inventory & Kuantitas Gudang)\n"
-            "- **Penjualan & Marketplace** (Sales Order, Kesehatan Akun, Sinkronisasi Stok/Harga, Potongan Fee, Cashflow)\n"
-            "- **Pengetahuan & SOP Perusahaan** (SOP Retur, Kebijakan, dan Spesifikasi Teknis)\n\n"
-            "Silakan sampaikan pertanyaan spesifik Anda seputar data dan modul operasional di atas."
+            "Maaf, permintaan ini berada di luar cakupan dan kemampuan Asisten AI FastPrint ERP.\n\n"
+            "Asisten ini hanya dapat membantu penelusuran data operasional dan pembukuan internal FastPrint ERP:\n"
+            "- **Akuntansi & Keuangan** (Laba Rugi, Neraca, Buku Besar, Rekonsiliasi Bank, Saldo Kas/Bank, Jurnal Umum, Tagihan Vendor)\n"
+            "- **Inventaris & Gudang** (Stok Fisik, Kartu Stok, Mutasi Transfer, Alert Stok Menipis, Stock Opname, Scrap, Master Produk & Gudang)\n"
+            "- **Penjualan (Sales)** (Sales Order, Quotation, Omzet/Summary, Produk Terlaris, Kontak Pelanggan)\n"
+            "- **Marketplace (Read-Only)** (Kesehatan Akun, SLA Order, Pesanan Kilat, Mapping SKU, Simulasi & Log Stok/Harga, Perbandingan Harga, Anomali & Rekap Fee, Cashflow, Kompetitor)\n"
+            "- **Pengetahuan & SOP Perusahaan** (SOP Retur, Kebijakan, dan Spesifikasi Teknis Produk)\n\n"
+            "Silakan ajukan pertanyaan yang berkaitan dengan modul operasional di atas."
         )
 
     query_mode = state.get("query_mode")
@@ -2141,7 +2145,10 @@ async def asynthesizer_node(
 
     general_nt_items = [
         nt for nt in non_tool_questions
-        if isinstance(nt, dict) and (nt.get("category") or "general") == "general" and nt.get("question_text")
+        if isinstance(nt, dict)
+        and (nt.get("category") or "general") == "general"
+        and nt.get("question_text")
+        and (is_pure_greeting(nt["question_text"]) or is_general_help_inquiry(nt["question_text"]))
     ]
     if model is not None and general_nt_items:
         llm_general_answers: Dict[int, str] = {}
@@ -2150,7 +2157,13 @@ async def asynthesizer_node(
                 g_resp = await model.ainvoke(
                     [
                         SystemMessage(content="Anda adalah Asisten AI FastPrint ERP yang ringkas, jelas, dan bebas AI slop."),
-                        HumanMessage(content=f"Jawab pertanyaan umum/sapaan berikut dalam Bahasa Indonesia secara singkat (1-3 kalimat):\n{nt['question_text']}"),
+                        HumanMessage(
+                            content=(
+                                "Balas sapaan atau jelaskan secara singkat kemampuan Asisten AI FastPrint ERP "
+                                "(1-3 kalimat, Bahasa Indonesia). Jangan menjawab topik di luar FastPrint ERP:\n"
+                                f"{nt['question_text']}"
+                            )
+                        ),
                     ],
                     config={"tags": ["internal_no_stream"]},
                 )
@@ -2261,7 +2274,10 @@ def synthesizer_node(
 
     general_nt_items = [
         nt for nt in non_tool_questions
-        if isinstance(nt, dict) and (nt.get("category") or "general") == "general" and nt.get("question_text")
+        if isinstance(nt, dict)
+        and (nt.get("category") or "general") == "general"
+        and nt.get("question_text")
+        and (is_pure_greeting(nt["question_text"]) or is_general_help_inquiry(nt["question_text"]))
     ]
     if model is not None and general_nt_items:
         llm_general_answers: Dict[int, str] = {}
@@ -2269,7 +2285,13 @@ def synthesizer_node(
             try:
                 g_resp = model.invoke([
                     SystemMessage(content="Anda adalah Asisten AI FastPrint ERP yang ringkas, jelas, dan bebas AI slop."),
-                    HumanMessage(content=f"Jawab pertanyaan umum/sapaan berikut dalam Bahasa Indonesia secara singkat (1-3 kalimat):\n{nt['question_text']}"),
+                    HumanMessage(
+                        content=(
+                            "Balas sapaan atau jelaskan secara singkat kemampuan Asisten AI FastPrint ERP "
+                            "(1-3 kalimat, Bahasa Indonesia). Jangan menjawab topik di luar FastPrint ERP:\n"
+                            f"{nt['question_text']}"
+                        )
+                    ),
                 ])
                 g_content = getattr(g_resp, "content", None)
                 if g_content and isinstance(g_content, str) and g_content.strip():

@@ -723,7 +723,7 @@ class ToolRegistryService:
             keywords = tool.get("keywords", [])
 
             for kw in keywords:
-                if kw in cleaned_query:
+                if re.search(rf"(?<!\w){re.escape(kw)}(?!\w)", cleaned_query):
                     score += 3.0
 
             for token in tokens:

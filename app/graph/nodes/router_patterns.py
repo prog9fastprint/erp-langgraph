@@ -2,7 +2,7 @@
 Regex intent patterns and disambiguation term tables for FastPrint ERP Router.
 """
 import re
-from typing import Optional
+from typing import Optional, Tuple
 
 
 # Disambiguation term sets
@@ -318,8 +318,36 @@ GREETING_PATTERNS = [
 ]
 
 GENERAL_INQUIRY_PATTERNS = [
-    r"^(bisa\s+(?:bantu\s+apa|apa\s+aja|melakukan\s+apa)|kamu\s+(?:siapa|bisa\s+apa(?:\s+aja)?)|anda\s+bisa\s+apa(?:\s+aja)?|fitur\s+apa(?:\s+aja)?|menu|help|bantuan|siapa\s+kamu|apa\s+yang\s+bisa\s+(?:kamu|anda)\s+(?:lakukan|bantu))\b",
+    r"^(?:bisa\s+(?:(?:bantu|membantu)\s+apa(?:\s+(?:aja|saja))?|apa\s+(?:aja|saja)|melakukan\s+apa(?:\s+(?:aja|saja))?)"
+    r"|kamu\s+(?:siapa|bisa\s+(?:(?:bantu|membantu)\s+)?apa(?:\s+(?:aja|saja))?)"
+    r"|anda\s+(?:siapa|bisa\s+(?:(?:bantu|membantu)\s+)?apa(?:\s+(?:aja|saja))?)"
+    r"|(?:fitur|kemampuan)\s+(?:apa\s+(?:aja|saja)|kamu|anda|bot|asisten)"
+    r"|apa\s+(?:aja|saja)\s+(?:fitur|kemampuan)(?:\s+(?:kamu|anda|bot|asisten))?"
+    r"|siapa\s+(?:kamu|anda)"
+    r"|apa\s+yang\s+bisa\s+(?:kamu|anda)\s+(?:lakukan|bantu|kerjakan))\b",
+    r"^(?:menu|help|bantuan|/scope)(?:\s+(?:erp|ai|bot|asisten|fitur|utama))?$",
 ]
+
+_GREETING_LEAD_RE = re.compile(
+    r"^(?:"
+    r"halo+|hai+|hi+|hey+|hei+|helo+|hello+"
+    r"|selamat\s+(?:pagi|siang|sore|malam|petang)"
+    r"|apa\s+kabar|how\s+are\s+you"
+    r"|assalamu\s*['’]?alaikum(?:\s+warahmatullahi\s+wabarakatuh)?"
+    r"|sampurasun|kulonuwun"
+    r"|ping|p\b|tes|test|testing"
+    r"|terima\s*kasih|makasih|thanks|thank\s*you|matur\s*nuwun"
+    r")(?:\b|(?=[!?,.;:\s]|$))",
+    re.IGNORECASE,
+)
+
+_GREETING_FILLER_TOKENS = {
+    "min", "admin", "bot", "ai", "asisten", "assistant", "fastprint",
+    "bro", "kak", "kakak", "mas", "mbak", "mba", "pak", "bapak", "bu", "ibu",
+    "gan", "bos", "boss", "semua", "semuanya", "guys",
+    "banyak", "banget", "sekali", "ya", "yah", "yaa", "dong", "deh", "nih", "nya",
+    "halo", "hai", "hi", "hey", "hei", "helo", "hello", "tes", "test", "123",
+}
 
 _META_QUESTION_RE = re.compile(
     r"^(?:(?:jadi|terus|lalu|nah|oh\s+ya)\s+)?(?:"
@@ -339,15 +367,94 @@ _CASUAL_NON_ERP_INTERROGATIVE_RE = re.compile(
     re.IGNORECASE,
 )
 
+_FOLLOWUP_ELLIPTICAL_PREFIX_RE = re.compile(
+    r"(?:^(?:kalau|kalo|bagaimana\s+dengan|gimana\s+(?:dengan|kalau|kalo)|yang|yg|untuk|utk|buat|sama|plus|sekalian|(?:coba|cek)\s+(?:yang|yg)|jabarkan|rincikan|uraikan|breakdown|tampilkan\s+(?:semua|detail|rincian|lengkap|dalam))\b"
+    r"|\b(?:datanya|detailnya|rinciannya|hasilnya|laporannya|dalam\s+(?:tabel|table))\b)",
+    re.IGNORECASE,
+)
+
+_STANDALONE_NON_FOLLOWUP_INTERROGATIVE_RE = re.compile(
+    r"\b(?:apa|apakah|siapa|kapan|mengapa|kenapa|bagaimana|gimana|berapa|jelaskan|buatkan|ceritakan|resep|artinya|definisi|cara|tips|rekomendasi|terjemahkan|translate|cuaca|presiden|gaji|cuti|absensi|payroll|bitcoin|crypto)\b",
+    re.IGNORECASE,
+)
+
+
+def _strip_leading_greeting_and_fillers(text: str) -> Tuple[bool, str]:
+    """Strip a leading greeting phrase and polite addressee fillers; return (had_greeting, remainder)."""
+    cleaned = (text or "").strip().strip("?!.,;:'\" ")
+    if not cleaned:
+        return False, ""
+    m = _GREETING_LEAD_RE.match(cleaned)
+    if not m:
+        return False, cleaned
+    rem = cleaned[m.end():].lstrip(" ,!?.:;-'\"")
+    while rem:
+        m_repeat = _GREETING_LEAD_RE.match(rem)
+        if m_repeat:
+            rem = rem[m_repeat.end():].lstrip(" ,!?.:;-'\"")
+            continue
+        m_tok = re.match(r"^([a-z0-9']+)(?:[\s,!?.:;'\"\-]+(.*))?$", rem, re.IGNORECASE)
+        if m_tok and m_tok.group(1).lower() in _GREETING_FILLER_TOKENS:
+            rem = (m_tok.group(2) or "").lstrip(" ,!?.:;-'\"")
+            continue
+        break
+    return True, rem.strip("?!.,;:'\" ")
+
+
+def is_pure_greeting(text: str) -> bool:
+    """Return True only when the query is a standalone greeting/thanks/ping with no trailing off-topic question."""
+    had_greeting, remainder = _strip_leading_greeting_and_fillers(text)
+    return had_greeting and not remainder
+
+
+def is_general_help_inquiry(text: str) -> bool:
+    """Return True when the query asks about bot identity/capabilities/help (with optional greeting prefix)."""
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return False
+    _, remainder = _strip_leading_greeting_and_fillers(cleaned)
+    target = remainder or cleaned.strip("?!.,;:'\" ")
+    target_norm = re.sub(r"[?!.,;:'\"]+$", "", target).strip()
+    return _match_any(GENERAL_INQUIRY_PATTERNS, target_norm)
+
+
+def is_customer_billing_guardrail_query(text: str) -> bool:
+    """Return True when the query targets unsupported customer billing/AR (preserved as general guardrail)."""
+    cleaned = (text or "").lower().strip()
+    if not cleaned:
+        return False
+    has_vendor = any(re.search(rf"\b{re.escape(term)}(nya)?\b", cleaned) for term in VENDOR_TERMS)
+    has_purchase_invoice = any(kw in cleaned for kw in PURCHASE_INVOICE_TERMS)
+    if has_vendor or has_purchase_invoice:
+        return False
+    has_customer = any(term in cleaned for term in CUSTOMER_TERMS)
+    billing_kws = ("tagihan", "faktur", "invoice", "bill", "piutang", "kuitansi", "bon")
+    has_billing = any(kw in cleaned for kw in billing_kws)
+    return has_billing or (has_customer and any(kw in cleaned for kw in CUSTOMER_BILLING_TERMS))
+
 
 def is_meta_question(text: str) -> bool:
     """Return True if user asks about active session period, company scope, or latest ERP date."""
     cleaned = re.sub(r"[?!.,;:'\"]+$", "", (text or "").strip())
     return bool(_META_QUESTION_RE.match(cleaned))
 
+
+def is_allowed_general_query(text: str) -> bool:
+    """Return True strictly for greetings, thanks, bot help/capabilities, session meta, or customer billing guardrail."""
+    return (
+        is_pure_greeting(text)
+        or is_general_help_inquiry(text)
+        or is_meta_question(text)
+        or is_customer_billing_guardrail_query(text)
+    )
+
+
 OUT_OF_SCOPE_PATTERNS = [
     r"\b(system\s*design|arsitektur\s*(sistem)?|source\s*code|prompt\s*(kamu|anda)|system\s*prompt)\b",
-    r"\b(buatkan\s+(puisi|cerita|kode|script)|ceritakan\s+(lelucon|dongeng)|siapa\s+presiden|ramalan\s+cuaca)\b",
+    r"\b(buatkan\s+(puisi|cerita|kode|script|esai|artikel|lagu|pantun)|ceritakan\s+(lelucon|dongeng|jokes?)|siapa\s+presiden|ramalan\s+cuaca|cuaca)\b",
+    r"\b(resep\s+(?:masak(?:an)?|makanan|minuman|kue|nasi|ayam|soto|bakso|mie)|cara\s+masak)\b",
+    r"\b(?:harga|kurs)\s+(?:bitcoin|btc|eth|ethereum|crypto|kripto|emas\s+antam|dolar|usd)\b",
+    r"\b(?:slip\s+gaji|payroll|cuti\s+(?:karyawan|pegawai|tahunan)|absensi\s+(?:karyawan|pegawai)|lembur\s+(?:karyawan|pegawai))\b",
 ]
 
 RETRY_PATTERNS = [
