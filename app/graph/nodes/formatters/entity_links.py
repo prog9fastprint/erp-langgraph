@@ -1088,6 +1088,7 @@ def _links_get_competitor_insights(data: Dict[str, Any], company_id: Optional[in
 _TOOL_LINK_EXTRACTORS: Dict[str, Callable[[Dict[str, Any], Optional[int]], List[Dict[str, Any]]]] = {
     # Accounting
     "get_journal_entries": _links_get_journal_entries,
+    "fetch_vendor_invoices": _links_get_journal_entries,
     "get_vendor_bills": _links_get_vendor_bills,
     "get_account_balance": _links_get_account_balance,
     "get_general_ledger": _links_get_general_ledger,
@@ -1164,10 +1165,22 @@ def _dedupe_entity_links(candidates: Iterable[Dict[str, Any]]) -> List[Dict[str,
     return deduped
 
 
+def _resolve_tool_name_from_key(raw_key: Any, fallback_tool: Optional[str]) -> Optional[str]:
+    """Resolve canonical tool name from a multi_tool_results key (e.g. 'get_stock_level_0')."""
+    if isinstance(raw_key, str) and raw_key.strip():
+        candidate = raw_key.strip()
+        if candidate in _TOOL_LINK_EXTRACTORS:
+            return candidate
+        stripped = re.sub(r"_\d+$", "", candidate)
+        if stripped in _TOOL_LINK_EXTRACTORS:
+            return stripped
+    return fallback_tool
+
+
 def build_entity_links(state: Mapping[str, Any]) -> List[Dict[str, Any]]:
     """
     Collect and deduplicate clickable ERP entity redirect links across single-tool,
-    multi-tool, and multi-company execution state.
+    multi-tool, active_tools, and multi-company execution state.
     """
     if not isinstance(state, Mapping):
         return []
@@ -1188,8 +1201,50 @@ def build_entity_links(state: Mapping[str, Any]) -> List[Dict[str, Any]]:
     detected_tool = state.get("detected_tool")
     collected: List[Dict[str, Any]] = []
 
+    active_tools = state.get("active_tools")
+    if isinstance(active_tools, list):
+        for plan in active_tools:
+            if not isinstance(plan, Mapping):
+                continue
+            p_tool = plan.get("tool") or plan.get("detected_tool") or detected_tool
+            p_cid = _positive_int(plan.get("company_id")) or default_company_id
+            p_mc = plan.get("multi_company_results")
+            if isinstance(p_mc, Mapping) and p_mc:
+                for mc_cid, mc_res in p_mc.items():
+                    if mc_res is not None:
+                        collected.extend(
+                            build_entity_links_for_tool(
+                                p_tool,
+                                mc_res,
+                                company_id=_positive_int(mc_cid) or p_cid,
+                            )
+                        )
+            p_res = plan.get("result") or plan.get("tool_result") or plan.get("tool_raw_result")
+            if p_res is not None:
+                collected.extend(build_entity_links_for_tool(p_tool, p_res, company_id=p_cid))
+
     multi_company = state.get("multi_company_results")
-    if isinstance(multi_company, list) and multi_company:
+    if isinstance(multi_company, Mapping) and multi_company:
+        for cid_key, branch in multi_company.items():
+            if branch is None:
+                continue
+            b_cid = _positive_int(cid_key) or default_company_id
+            if isinstance(branch, Mapping) and any(
+                k in branch for k in ("tool_raw_result", "raw_result", "tool_result", "result")
+            ):
+                b_tool = branch.get("detected_tool") or branch.get("tool_name") or branch.get("tool") or detected_tool
+                b_payload = (
+                    branch.get("tool_raw_result")
+                    or branch.get("raw_result")
+                    or branch.get("tool_result")
+                    or branch.get("result")
+                )
+            else:
+                b_tool = detected_tool
+                b_payload = branch
+            if b_payload is not None:
+                collected.extend(build_entity_links_for_tool(b_tool, b_payload, company_id=b_cid))
+    elif isinstance(multi_company, list) and multi_company:
         for branch in multi_company:
             if not isinstance(branch, Mapping):
                 continue
@@ -1202,6 +1257,7 @@ def build_entity_links(state: Mapping[str, Any]) -> List[Dict[str, Any]]:
             b_payload = (
                 branch.get("tool_raw_result")
                 or branch.get("raw_result")
+                or branch.get("tool_result")
                 or branch.get("result")
                 or branch.get("data")
                 or branch
@@ -1210,7 +1266,15 @@ def build_entity_links(state: Mapping[str, Any]) -> List[Dict[str, Any]]:
             collected.extend(build_entity_links_for_tool(b_tool, b_payload, company_id=b_cid))
 
     multi_tool = state.get("multi_tool_results")
-    if isinstance(multi_tool, list) and multi_tool:
+    if isinstance(multi_tool, Mapping) and multi_tool:
+        for t_key, t_val in multi_tool.items():
+            if t_val is None:
+                continue
+            resolved_tool = _resolve_tool_name_from_key(t_key, detected_tool)
+            collected.extend(
+                build_entity_links_for_tool(resolved_tool, t_val, company_id=default_company_id)
+            )
+    elif isinstance(multi_tool, list) and multi_tool:
         for item in multi_tool:
             if not isinstance(item, Mapping):
                 continue
@@ -1223,6 +1287,7 @@ def build_entity_links(state: Mapping[str, Any]) -> List[Dict[str, Any]]:
             t_payload = (
                 item.get("tool_raw_result")
                 or item.get("raw_result")
+                or item.get("tool_result")
                 or item.get("result")
                 or item.get("data")
                 or item
@@ -1230,10 +1295,11 @@ def build_entity_links(state: Mapping[str, Any]) -> List[Dict[str, Any]]:
             t_cid = _positive_int(item.get("company_id")) or default_company_id
             collected.extend(build_entity_links_for_tool(t_tool, t_payload, company_id=t_cid))
 
-    raw_result = state.get("tool_raw_result")
-    if raw_result is not None and detected_tool:
-        collected.extend(
-            build_entity_links_for_tool(detected_tool, raw_result, company_id=default_company_id)
-        )
+    for state_key in ("tool_raw_result", "tool_result"):
+        payload = state.get(state_key)
+        if payload is not None and detected_tool:
+            collected.extend(
+                build_entity_links_for_tool(detected_tool, payload, company_id=default_company_id)
+            )
 
     return _dedupe_entity_links(collected)

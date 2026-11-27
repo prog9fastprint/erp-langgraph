@@ -333,21 +333,27 @@ class TestStateOrchestrationAndApiEntityLinks(unittest.IsolatedAsyncioTestCase):
         st["detected_domain"] = "inventory"
         st["detected_tool"] = "get_product_info"
         st["verification_status"] = "VALID"
-        st["multi_company_results"] = [
-            {
-                "company_id": 1,
-                "detected_tool": "get_product_info",
-                "raw_result": {"products": [{"id": 10, "code": "SKU-10"}]},
-            },
-            {
-                "company_id": 2,
-                "detected_tool": "get_product_info",
-                "raw_result": {"products": [{"id": 11, "code": "SKU-11"}, {"id": 10, "code": "SKU-10"}]},
-            },
-        ]
+        st["multi_company_results"] = {
+            1: {"products": [{"id": 10, "code": "SKU-10"}]},
+            2: {"products": [{"id": 11, "code": "SKU-11"}, {"id": 10, "code": "SKU-10"}]},
+        }
+        st["multi_tool_results"] = {
+            "get_account_balance_0": {"accounts": [{"account_id": 5, "account_code": "1101.001"}]},
+            "fetch_vendor_invoices": {"entries": [{"id": 77, "number": "BILL/77", "type_vendor_bill": "Purchase Order"}]},
+        }
+        st["tool_result"] = {"products": [{"id": 12, "code": "SKU-12"}]}
         links = build_entity_links(st)
         urls = {item["url"] for item in links}
-        self.assertEqual(urls, {"/inventory/product-variants/10/edit/", "/inventory/product-variants/11/edit/"})
+        self.assertEqual(
+            urls,
+            {
+                "/inventory/product-variants/10/edit/",
+                "/inventory/product-variants/11/edit/",
+                "/inventory/product-variants/12/edit/",
+                "/accounting/chart_of_accounts/edit/5",
+                "/accounting/vendors/bill/edit/77",
+            },
+        )
 
     async def test_synthesizer_emits_entity_links_with_clean_markdown(self):
         from app.core.config import settings
