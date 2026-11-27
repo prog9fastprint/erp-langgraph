@@ -214,18 +214,23 @@ def create_workflow_graph(
 default_workflow_graph = create_workflow_graph()
 
 
+MAX_HYDRATED_HISTORY_MESSAGES = 30
+
+
 def _hydrate_messages_from_history(
     history: Optional[List[Any]],
     user_query: str,
 ) -> Optional[List[BaseMessage]]:
     """
     Build LangChain message list from serialized history payload if available.
-    Ensures recent conversational context is preserved when RAM checkpointer is empty.
+    Ensures recent conversational context is preserved when RAM checkpointer is empty,
+    bounded to the latest MAX_HYDRATED_HISTORY_MESSAGES entries.
     """
     if not history:
         return None
+    recent_history = history[-MAX_HYDRATED_HISTORY_MESSAGES:]
     hydrated: List[BaseMessage] = []
-    for item in history:
+    for item in recent_history:
         role = getattr(item, "role", None) or (item.get("role") if isinstance(item, dict) else "")
         content = getattr(item, "content", None) or (item.get("content") if isinstance(item, dict) else "")
         if not content or not isinstance(content, str) or not content.strip():
@@ -363,6 +368,7 @@ def _resolve_effective_company_scope(
     company_id_explicit: Optional[bool],
     checkpoint_values: Optional[Dict[str, Any]],
     prior_history_messages: Optional[List[BaseMessage]] = None,
+    authorized_company_ids: Optional[List[int]] = None,
 ) -> Tuple[int, List[int], bool, Optional[int], Literal["text", "payload", "default"]]:
     """
     Resolve effective primary company_id, target company_ids list, multi-company flag,
@@ -396,8 +402,10 @@ def _resolve_effective_company_scope(
     # 2. Text contains 'semua cabang' or explicit branch mention(s)
     text_cids, is_all = resolve_all_branch_company_ids(user_query)
     if is_all:
-        primary = company_id if (company_id and company_id in text_cids) else (text_cids[0] if text_cids else settings.DEFAULT_COMPANY_ID)
-        return int(primary), text_cids, True, effective_payload_cid, "text"
+        auth_cids = list(dict.fromkeys(int(c) for c in (authorized_company_ids or []) if c))
+        eff_cids = auth_cids if auth_cids else text_cids
+        primary = company_id if (company_id and company_id in eff_cids) else (eff_cids[0] if eff_cids else settings.DEFAULT_COMPANY_ID)
+        return int(primary), eff_cids, len(eff_cids) > 1, effective_payload_cid, "text"
     if len(text_cids) > 1:
         primary = company_id if (company_id and company_id in text_cids) else text_cids[0]
         return int(primary), text_cids, True, effective_payload_cid, "text"
@@ -561,6 +569,7 @@ async def _prepare_workflow_execution(
         company_id_explicit=company_id_explicit,
         checkpoint_values=checkpoint_values,
         prior_history_messages=prior_history_msgs,
+        authorized_company_ids=authorized_company_ids,
     )
 
     initial_state = create_initial_state(

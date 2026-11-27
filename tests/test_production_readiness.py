@@ -256,7 +256,7 @@ class TestD2ApiAuthenticationPolicy(unittest.TestCase):
 
     @patch("app.main.arun_workflow", new_callable=AsyncMock)
     def test_service_key_enforcement_when_enabled(self, mock_workflow):
-        """When REQUIRE_SERVICE_KEY=True, X-Internal-Service-Key must match ERP_API_TOKEN."""
+        """When REQUIRE_SERVICE_KEY=True, X-Internal-Service-Key must match dedicated INTERNAL_SERVICE_KEY (no ERP_API_TOKEN fallback)."""
         mock_workflow.return_value = {
             "final_answer": "OK",
             "detected_domain": "general",
@@ -265,7 +265,7 @@ class TestD2ApiAuthenticationPolicy(unittest.TestCase):
         }
 
         with patch.object(settings, "REQUIRE_SERVICE_KEY", True), \
-             patch.object(settings, "ERP_API_TOKEN", "internal-secret-123"):
+             patch.object(settings, "INTERNAL_SERVICE_KEY", "internal-secret-123"):
             resp_missing = self.client.post("/api/v1/chat", json={"query": "Halo"})
             self.assertEqual(resp_missing.status_code, 403)
 
@@ -282,6 +282,17 @@ class TestD2ApiAuthenticationPolicy(unittest.TestCase):
                 headers={"X-Internal-Service-Key": "internal-secret-123"},
             )
             self.assertEqual(resp_ok.status_code, 200)
+
+        # Fail-closed: ERP_API_TOKEN is never accepted as inbound X-Internal-Service-Key
+        with patch.object(settings, "REQUIRE_SERVICE_KEY", True), \
+             patch.object(settings, "INTERNAL_SERVICE_KEY", None), \
+             patch.object(settings, "ERP_API_TOKEN", "legacy-erp-token"):
+            resp_fallback = self.client.post(
+                "/api/v1/chat",
+                json={"query": "Halo"},
+                headers={"X-Internal-Service-Key": "legacy-erp-token"},
+            )
+            self.assertEqual(resp_fallback.status_code, 403)
 
 
 class TestD2DjangoClientUserTokenGuard(unittest.IsolatedAsyncioTestCase):

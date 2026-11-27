@@ -17,6 +17,7 @@ from fastapi import FastAPI, Header, HTTPException, Request, status
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from app.core.config import settings
+from app.core.rate_limit import build_rate_limit_key, chat_rate_limiter
 from app.graph.workflow import (
     arun_workflow,
     astream_workflow_events,
@@ -203,22 +204,20 @@ def _resolve_and_validate_auth(
 ) -> Tuple[Optional[str], bool]:
     """
     Resolve user JWT from body user_token or Authorization Bearer header,
-    enforce X-Internal-Service-Key trust, and reject missing user tokens
-    in production/staging or when REQUIRE_USER_TOKEN is enabled.
+    enforce dedicated INTERNAL_SERVICE_KEY trust (no ERP_API_TOKEN fallback),
+    and reject missing user tokens in production/staging or when REQUIRE_USER_TOKEN is enabled.
     """
-    dedicated_key = (settings.INTERNAL_SERVICE_KEY or "").strip()
-    fallback_key = (settings.ERP_API_TOKEN or "").strip()
-    if settings.REQUIRE_SERVICE_KEY and not dedicated_key and fallback_key:
-        logger.warning(
-            "REQUIRE_SERVICE_KEY is using ERP_API_TOKEN fallback; configure INTERNAL_SERVICE_KEY instead."
-        )
-    expected_key = dedicated_key or fallback_key
+    expected_key = (settings.INTERNAL_SERVICE_KEY or "").strip()
     provided_key = (x_internal_service_key or "").strip()
     service_key_verified = bool(
         expected_key and provided_key and hmac.compare_digest(provided_key, expected_key)
     )
 
     if settings.REQUIRE_SERVICE_KEY and not service_key_verified:
+        if not expected_key:
+            logger.error(
+                "REQUIRE_SERVICE_KEY is enabled but INTERNAL_SERVICE_KEY is not configured; denying request."
+            )
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Forbidden: invalid or missing X-Internal-Service-Key.",
@@ -228,17 +227,46 @@ def _resolve_and_validate_auth(
     header_token = _extract_bearer_token(authorization)
     effective_token = body_token or header_token
 
-    is_strict_mode = (
-        settings.APP_ENV.strip().lower() in ("production", "staging")
-        or bool(settings.REQUIRE_USER_TOKEN)
-    )
-    if is_strict_mode and not effective_token:
+    if settings.is_strict_user_token_required() and not effective_token:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Authentication required: valid user_token or Authorization Bearer header must be provided.",
         )
 
     return effective_token, service_key_verified
+
+
+def _enforce_chat_rate_limit(
+    request: Request,
+    payload: ChatRequest,
+    effective_token: Optional[str],
+    service_key_verified: bool,
+) -> None:
+    """Enforce per-user/token/IP sliding-window rate limit on chat endpoints."""
+    if not settings.RATE_LIMIT_ENABLED:
+        return
+
+    client_host = request.client.host if request.client else None
+    forwarded_for = request.headers.get("X-Forwarded-For")
+    bucket_key = build_rate_limit_key(
+        user_id=payload.user_id,
+        effective_token=effective_token,
+        client_host=client_host,
+        forwarded_for=forwarded_for,
+        service_key_verified=service_key_verified,
+        trust_proxy_headers=bool(settings.TRUST_PROXY_HEADERS),
+    )
+    allowed, retry_after = chat_rate_limiter.check(
+        key=bucket_key,
+        limit=settings.RATE_LIMIT_MAX_REQUESTS,
+        window_seconds=settings.RATE_LIMIT_WINDOW_SECONDS,
+    )
+    if not allowed:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Rate limit exceeded. Please retry later.",
+            headers={"Retry-After": str(retry_after)},
+        )
 
 
 def _build_workflow_kwargs(
@@ -257,7 +285,13 @@ def _build_workflow_kwargs(
     if payload.company_ids is not None:
         kwargs["company_ids"] = payload.company_ids
     if payload.authorized_company_ids is not None:
-        kwargs["authorized_company_ids"] = payload.authorized_company_ids
+        if service_key_verified:
+            kwargs["authorized_company_ids"] = payload.authorized_company_ids
+        else:
+            logger.warning(
+                "Stripping unverified client-supplied authorized_company_ids without verified X-Internal-Service-Key."
+            )
+            kwargs["authorized_company_ids"] = []
     if payload.history is not None:
         kwargs["history"] = payload.history
     if payload.auth_token is not None:
@@ -317,6 +351,7 @@ def _build_chat_response(final_state: Dict[str, Any], started_at: float) -> Chat
     tags=["Chat"],
 )
 async def chat_endpoint(
+    request: Request,
     payload: ChatRequest,
     authorization: Annotated[Optional[str], Header()] = None,
     x_internal_service_key: Annotated[Optional[str], Header(alias="X-Internal-Service-Key")] = None,
@@ -329,6 +364,12 @@ async def chat_endpoint(
             payload=payload,
             authorization=authorization,
             x_internal_service_key=x_internal_service_key,
+        )
+        _enforce_chat_rate_limit(
+            request=request,
+            payload=payload,
+            effective_token=effective_token,
+            service_key_verified=service_key_verified,
         )
         started_at = time.perf_counter()
         workflow_kwargs = _build_workflow_kwargs(
@@ -360,6 +401,7 @@ async def chat_endpoint(
     tags=["Chat"],
 )
 async def chat_stream_endpoint(
+    request: Request,
     payload: ChatRequest,
     authorization: Annotated[Optional[str], Header()] = None,
     x_internal_service_key: Annotated[Optional[str], Header(alias="X-Internal-Service-Key")] = None,
@@ -378,6 +420,12 @@ async def chat_stream_endpoint(
         payload=payload,
         authorization=authorization,
         x_internal_service_key=x_internal_service_key,
+    )
+    _enforce_chat_rate_limit(
+        request=request,
+        payload=payload,
+        effective_token=effective_token,
+        service_key_verified=service_key_verified,
     )
     workflow_kwargs = _build_workflow_kwargs(
         payload,

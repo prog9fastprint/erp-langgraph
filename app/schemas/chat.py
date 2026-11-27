@@ -6,14 +6,24 @@ from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
+MAX_QUERY_LENGTH = 4_000
+MAX_HISTORY_ITEMS = 100
+MAX_HISTORY_ITEM_CONTENT_LENGTH = 50_000
+MAX_THREAD_ID_LENGTH = 128
+MAX_USER_ID_LENGTH = 128
+MAX_COMPANY_IDS_COUNT = 50
+MAX_USER_ROLES_COUNT = 100
+MAX_TOKEN_LENGTH = 8_192
+
+
 class ChatMessageHistoryItem(BaseModel):
     """
     Representation of an individual conversation message for stateless session recovery.
     """
     model_config = ConfigDict(extra="ignore")
 
-    role: str = Field(..., description="Role of the sender: 'user' or 'assistant'")
-    content: str = Field(..., description="Text content of the message")
+    role: str = Field(..., min_length=1, max_length=32, description="Role of the sender: 'user' or 'assistant'")
+    content: str = Field(..., max_length=MAX_HISTORY_ITEM_CONTENT_LENGTH, description="Text content of the message")
 
 
 class ChatRequest(BaseModel):
@@ -22,21 +32,31 @@ class ChatRequest(BaseModel):
     """
     model_config = ConfigDict(extra="ignore")
 
-    query: str = Field(..., min_length=1, description="Natural language query from user")
+    query: str = Field(..., min_length=1, max_length=MAX_QUERY_LENGTH, description="Natural language query from user")
     company_id: Optional[int] = Field(default=1, description="Target ERP company ID (defaults to 1)")
-    company_ids: Optional[List[int]] = Field(default=None, description="Optional list of target company IDs for multi-company inquiries")
+    company_ids: Optional[List[int]] = Field(
+        default=None,
+        max_length=MAX_COMPANY_IDS_COUNT,
+        description="Optional list of target company IDs for multi-company inquiries",
+    )
     authorized_company_ids: Optional[List[int]] = Field(
         default=None,
+        max_length=MAX_COMPANY_IDS_COUNT,
         description="Optional list of authorized company IDs selected in ERP session for HQ/cross-branch probing",
     )
-    user_token: Optional[str] = Field(default=None, description="Optional JWT authentication token")
-    auth_token: Optional[str] = Field(default=None, description="Optional JWT authentication token (alias for user_token)")
-    user_id: Optional[str] = Field(default=None, description="Optional authenticated user ID")
-    user_roles: Optional[List[str]] = Field(default=None, description="Optional list of user roles or permission codes (e.g. ['accounting.viewer'])")
-    thread_id: Optional[str] = Field(default=None, description="Session thread ID for conversational memory")
+    user_token: Optional[str] = Field(default=None, max_length=MAX_TOKEN_LENGTH, description="Optional JWT authentication token")
+    auth_token: Optional[str] = Field(default=None, max_length=MAX_TOKEN_LENGTH, description="Optional JWT authentication token (alias for user_token)")
+    user_id: Optional[str] = Field(default=None, max_length=MAX_USER_ID_LENGTH, description="Optional authenticated user ID")
+    user_roles: Optional[List[str]] = Field(
+        default=None,
+        max_length=MAX_USER_ROLES_COUNT,
+        description="Optional list of user roles or permission codes (e.g. ['accounting.viewer'])",
+    )
+    thread_id: Optional[str] = Field(default=None, max_length=MAX_THREAD_ID_LENGTH, description="Session thread ID for conversational memory")
     history: Optional[List[ChatMessageHistoryItem]] = Field(
         default=None,
-        description="Optional list of recent conversation messages for stateless memory recovery"
+        max_length=MAX_HISTORY_ITEMS,
+        description="Optional list of recent conversation messages for stateless memory recovery",
     )
 
     @field_validator("query")

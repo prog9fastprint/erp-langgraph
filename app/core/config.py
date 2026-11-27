@@ -8,6 +8,15 @@ from pydantic import Field, AliasChoices, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+def _is_test_runtime() -> bool:
+    """Return True when running inside unit tests so local .env secrets never leak."""
+    return (
+        "unittest" in sys.modules
+        or os.environ.get("FASTPRINT_TEST_ENV") == "true"
+        or os.environ.get("APP_ENV", "").strip().lower() == "test"
+    )
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -27,6 +36,20 @@ class Settings(BaseSettings):
     INTERNAL_SERVICE_KEY: Optional[str] = Field(default=None, validation_alias="INTERNAL_SERVICE_KEY")
     MAX_CHECKPOINT_THREADS: int = Field(default=500, validation_alias="MAX_CHECKPOINT_THREADS")
     SSE_HEARTBEAT_SECONDS: float = Field(default=15.0, validation_alias="SSE_HEARTBEAT_SECONDS")
+    RATE_LIMIT_ENABLED: bool = Field(
+        default_factory=lambda: not _is_test_runtime(),
+        validation_alias="RATE_LIMIT_ENABLED",
+    )
+    RATE_LIMIT_MAX_REQUESTS: int = Field(default=30, ge=1, validation_alias="RATE_LIMIT_MAX_REQUESTS")
+    RATE_LIMIT_WINDOW_SECONDS: int = Field(default=60, ge=1, validation_alias="RATE_LIMIT_WINDOW_SECONDS")
+    TRUST_PROXY_HEADERS: bool = Field(default=False, validation_alias="TRUST_PROXY_HEADERS")
+
+    def is_strict_user_token_required(self) -> bool:
+        """Return True when end-user JWT must be enforced (production/staging or REQUIRE_USER_TOKEN=True)."""
+        return (
+            bool(self.REQUIRE_USER_TOKEN)
+            or self.APP_ENV.strip().lower() in ("production", "staging")
+        )
 
     # 1. ERP Backend Connection
     ERP_BASE_URL: str = Field(
@@ -167,15 +190,6 @@ class Settings(BaseSettings):
             cleaned = value.strip()
             return cleaned or None
         return value
-
-
-def _is_test_runtime() -> bool:
-    """Return True when running inside unit tests so local .env secrets never leak."""
-    return (
-        "unittest" in sys.modules
-        or os.environ.get("FASTPRINT_TEST_ENV") == "true"
-        or os.environ.get("APP_ENV", "").strip().lower() == "test"
-    )
 
 
 settings = Settings(_env_file=None if _is_test_runtime() else ".env")

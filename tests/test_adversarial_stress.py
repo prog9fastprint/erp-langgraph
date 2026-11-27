@@ -119,7 +119,7 @@ class TestApiChatAdversarial(unittest.IsolatedAsyncioTestCase):
 
     @patch("app.main.arun_workflow", new_callable=AsyncMock)
     async def test_extreme_payloads_huge_query(self, mock_workflow):
-        """Stress test: 100,000 character query payload executes safely without crash."""
+        """Stress test: 100,000+ character query payload is rejected cleanly with 422 (prompt-flooding guard)."""
         mock_workflow.return_value = {
             "final_answer": "Large query handled",
             "detected_domain": "general",
@@ -128,8 +128,14 @@ class TestApiChatAdversarial(unittest.IsolatedAsyncioTestCase):
 
         huge_query = "Halo FastPrint " * 7000  # ~105,000 characters
         resp = await self.client.post("/api/v1/chat", json={"query": huge_query})
-        self.assertEqual(resp.status_code, 200)
-        self.assertEqual(resp.json()["final_answer"], "Large query handled")
+        self.assertEqual(resp.status_code, 422)
+        mock_workflow.assert_not_awaited()
+
+        # Max-boundary query (4,000 characters) still executes safely
+        max_valid_query = "a" * 4000
+        resp_ok = await self.client.post("/api/v1/chat", json={"query": max_valid_query})
+        self.assertEqual(resp_ok.status_code, 200)
+        self.assertEqual(resp_ok.json()["final_answer"], "Large query handled")
         mock_workflow.assert_awaited_once()
 
     @patch("app.main.arun_workflow", new_callable=AsyncMock)

@@ -902,9 +902,9 @@ def _compute_company_scope(
     )
 
     if is_all or (is_branch_ranking and explicit_single is None and not multi_cids) or is_hq_expand:
-        auth_cids = [int(c) for c in (state.get("authorized_company_ids") or []) if c]
-        eff_cids = auth_cids if (is_hq_expand and len(auth_cids) > 1) else list(COMPANY_NAME_MAP.keys())
-        return eff_cids[0], eff_cids, True
+        auth_cids = list(dict.fromkeys(int(c) for c in (state.get("authorized_company_ids") or []) if c))
+        eff_cids = auth_cids if auth_cids else list(COMPANY_NAME_MAP.keys())
+        return eff_cids[0], eff_cids, len(eff_cids) > 1
     if len(multi_cids) > 1:
         return multi_cids[0], multi_cids, True
     if explicit_single is not None or len(multi_cids) == 1:
