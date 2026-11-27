@@ -115,6 +115,7 @@ class AgentState(TypedDict, total=False):
     suggested_followups: Optional[List[Dict[str, str]]]
     active_model: Optional[str]
     table_query_meta: Optional[Dict[str, Any]]
+    entity_links: Optional[List[Dict[str, Any]]]
 
     # 7. Context Management & Long-Term Memory
     conversation_summary: Optional[str]
@@ -206,6 +207,7 @@ def create_initial_state(
         "final_answer": None,
         "error_message": None,
         "table_query_meta": None,
+        "entity_links": [],
         "conversation_summary": None,
         "query_mode": "live_erp",
         "rag_query": None,

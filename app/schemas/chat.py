@@ -94,6 +94,10 @@ class ChatResponse(BaseModel):
         default=None,
         description="Optional paginated tool query metadata for remote full-table inspection and export"
     )
+    entity_links: list[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="Validated internal ERP redirect metadata matching presented entity labels"
+    )
     needs_clarification: bool = Field(
         default=False,
         description="True when the orchestrator asks a conservative disambiguation question with clickable chips"

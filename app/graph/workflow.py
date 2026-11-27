@@ -22,7 +22,6 @@ from langgraph.graph import StateGraph, START, END
 
 from app.core.branches import (
     resolve_all_branch_company_ids,
-    resolve_branch_company_id,
     resolve_sticky_branch_from_history,
 )
 from app.core.config import settings

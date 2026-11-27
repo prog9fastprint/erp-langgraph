@@ -4,6 +4,7 @@ Domain-organized Markdown presentation formatters for FastPrint ERP tools.
 from typing import Any, Callable, Dict, Optional
 
 from app.graph.nodes.formatters.accounting import ACCOUNTING_FORMATTERS
+from app.graph.nodes.formatters.entity_links import build_entity_links
 from app.graph.nodes.formatters.common import (
     _EVALUATIVE_QUERY_RE,
     _append_pagination_footer,
@@ -85,4 +86,5 @@ __all__ = [
     "_append_pagination_footer",
     "_format_single_tool_presentation",
     "_format_multi_company_presentation",
+    "build_entity_links",
 ]

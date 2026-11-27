@@ -303,6 +303,7 @@ def _build_chat_response(final_state: Dict[str, Any], started_at: float) -> Chat
         execution_time_ms=execution_time_ms,
         model_used=model_used,
         table_query_meta=final_state.get("table_query_meta"),
+        entity_links=final_state.get("entity_links") or [],
         needs_clarification=needs_clarification,
         query_mode=query_mode,
     )

@@ -2100,11 +2100,14 @@ def _finalize_synthesis_output(
     resolved_followups = _finalize_followups(resolved_followups, user_query, state)
     resolved_final_text = _apply_retry_header(final_text, retry_header)
 
+    from app.graph.nodes.formatters.entity_links import build_entity_links
+
     out_dict: Dict[str, Any] = {
         "final_answer": resolved_final_text,
         "deterministic_answer": deterministic_answer,
         "suggested_followups": resolved_followups,
         "table_query_meta": _build_table_query_meta(state),
+        "entity_links": build_entity_links(state),
         "messages": [AIMessage(content=resolved_final_text)],
     }
     if actual_model:
@@ -2240,6 +2243,7 @@ def _build_clarification_synthesis_output(state: AgentState) -> Optional[Dict[st
         "needs_clarification": True,
         "query_mode": "clarification",
         "table_query_meta": None,
+        "entity_links": [],
         "messages": [AIMessage(content=question)],
     }
     if state.get("active_model"):
