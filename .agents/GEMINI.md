@@ -15,10 +15,11 @@ This document serves as the canonical operational specification and codebase gui
 - **Settings & Validation**: Pydantic v2 (`pydantic-settings`, `BaseModel`)
 - **HTTP Clients**:
   - `app/services/django_client.py`: `DjangoCoreClient` — Asynchronous HTTP client (`httpx.AsyncClient`) communicating with ERP Django (`/ai/tools/`).
-  - `app/services/erp_client.py`: `ERPClient` — Synchronous HTTP client (`httpx.Client`).
 - **LLM Engine**:
-  - `app/services/llm.py`: Multi-provider factory supporting OpenRouter and OpenAI.
-  - Implements dynamic free-tier model discovery and automatic fallback failover when primary models are unavailable or rate-limited.
+  - `app/services/llm.py`: Multi-provider factory supporting OpenAI, Google Gemini (multi-key), and OpenRouter.
+  - Implements circuit-breaker failover and dynamic free-tier OpenRouter fallback when primary models are unavailable or rate-limited.
+- **Canonical Architecture Reference**:
+  - See `docs/ARCHITECTURE_MAP.md` for the complete 4-zone codebase map, 7-node StateGraph trace, `AgentState` map, and document index.
 
 ---
 
@@ -35,7 +36,7 @@ Always activate the project virtual environment before executing commands:
 ### Running Tests
 The test suite utilizes the standard Python `unittest` framework. **Do not execute `pytest` unless installed.**
 ```powershell
-# Run the complete test suite (145 tests)
+# Run the complete test suite (~850 tests)
 .\.venv\Scripts\python.exe -m unittest discover tests
 
 # Run a specific test module
@@ -58,51 +59,42 @@ uvicorn app.main:app --host 0.0.0.0 --port 8002 --reload
 
 ## 3. LangGraph StateGraph Architecture
 
-The system executes a deterministic 5-node StateGraph pipeline with conditional routing and adaptive retry loops:
+The system executes a 7-node StateGraph pipeline with conditional routing, RAG integration, and adaptive retry loops. For exact function line numbers and end-to-end request traces, read `docs/ARCHITECTURE_MAP.md`.
 
 ```mermaid
 graph TD
-    START([START]) --> Router[router_node]
-    Router -->|accounting / inventory| Extractor[extractor_node]
-    Router -->|general / out_of_scope| Synthesizer[synthesizer_node]
+    START([START]) --> Summarizer[summarizer_node]
+    Summarizer --> Router[arouter_node]
+    Router -->|live_erp / hybrid| Extractor[extractor_node]
+    Router -->|vector_rag| RagNode[rag_node]
+    Router -->|general / out_of_scope / clarification / contextual_analysis| Synthesizer[asynthesizer_node]
     Extractor --> ToolNode[tool_node]
-    ToolNode --> Verifier[verifier_node]
+    ToolNode -->|hybrid| RagNode
+    ToolNode -->|live_erp| Verifier[verifier_node]
+    RagNode -->|hybrid| Verifier
+    RagNode -->|vector_rag| Synthesizer
     Verifier -->|RETRY < 2| Extractor
     Verifier -->|VALID / EMPTY / ERROR| Synthesizer
     Synthesizer --> END([END])
 ```
 
 ### State Model (`AgentState` in `app/graph/state.py`)
-`AgentState` is a `TypedDict` containing:
-- `messages`: List of chat messages (`SystemMessage`, `HumanMessage`, `AIMessage`).
-- `company_id`: Scoped ERP company ID (integer, default `1`).
-- `detected_domain`: Domain classified by router (`accounting`, `inventory`, `general`, `out_of_scope`).
-- `detected_tool`: Specific ERP tool name or `None`.
-- `extracted_filters`: Validated Pydantic parameter dict for the tool.
-- `tool_raw_result`: Raw payload envelope returned from Django Core (`ToolEnvelopeResponse`).
-- `calculations`: Server-side calculated summary metrics preserved for the synthesizer.
-- `verification_status`: Status enum (`PENDING`, `VALID`, `EMPTY`, `RETRY`, `ERROR`).
-- `retry_count`: Integer counter tracking verification retry attempts (max `2`).
-- `retry_instruction`: Feedback string directing `extractor_node` to broaden filters.
+`AgentState` is a `TypedDict` tracking:
+- `messages`, `user_query`, `user_token`, `user_roles`, `conversation_summary`: Conversational memory and auth context.
+- `company_id`, `company_ids`, `authorized_company_ids`, `is_multi_company`: Multi-company scoping across 17 FastPrint branches.
+- `query_mode`, `detected_domain`, `detected_tool`, `active_tools`, `rag_queries`, `sub_questions`: Routing mode (`live_erp`, `vector_rag`, `hybrid`, `general`, `out_of_scope`, `contextual_analysis`, `clarification`) and tool execution plans.
+- `extracted_params`, `tool_result`, `multi_tool_results`, `multi_company_results`, `prior_tool_result`: Validated parameters, raw ERP results, and prior-turn snapshots.
+- `verification_status`, `retry_count`, `retry_instruction`: Status (`VALID`, `EMPTY`, `RETRY`, `ERROR`, `CLARIFICATION`) and retry tracking (max `2`).
+- `final_answer`, `suggested_followups`, `table_query_meta`, `entity_links`, `needs_clarification`: UI presentation and SSE output fields.
 
 ### Pipeline Nodes (`app/graph/nodes/`)
-1. **`router_node` (`router.py`)**:
-   - Classifies query intent into domains (`accounting`, `inventory`, `general`, `out_of_scope`).
-   - Applies negative guardrails: greetings and non-ERP questions route directly to `synthesizer`.
-2. **`extractor_node` (`extractor.py`)**:
-   - Extracts entity IDs, names, and temporal date filters into ISO 8601 (`YYYY-MM-DD`).
-   - Validates parameters against tool schemas in `app/schemas/tools.py`.
-   - Incorporates `retry_instruction` during retry cycles to broaden date ranges or relax constraints.
-3. **`tool_node` (`tool_node.py`)**:
-   - Dispatches async requests via `DjangoCoreClient` to `POST /ai/tools/<domain>/<tool_name>/`.
-   - Captures calculation envelopes without loss and catches `DjangoCoreClientError` cleanly.
-4. **`verifier_node` (`verifier.py`)**:
-   - Evaluates record count and data validity.
-   - If 0 records are found and `retry_count < 2`, increments `retry_count` and cycles back to `extractor_node`.
-   - Once `retry_count >= 2`, proceeds to `synthesizer` with status `EMPTY`.
-5. **`synthesizer_node` (`synthesizer.py`)**:
-   - Synthesizes user-facing Markdown with structured tables, IDR currency formatting (`Rp`), and reference codes.
-   - Provides polite error recovery explanations when access is denied or records are missing.
+1. **`summarizer_node` (`summarizer.py`)**: Summarizes and trims long conversation histories beyond `SUMMARIZATION_THRESHOLD_MESSAGES`.
+2. **`arouter_node` (`router.py` / `router_semantic.py`)**: Classifies intent across `accounting`, `inventory`, `sales`, `marketplace`, `knowledge`, `general`, `out_of_scope`, and `clarification` (supports `NLU_ROUTER_MODE`: `legacy_regex`, `semantic_llm`, `shadow`).
+3. **`extractor_node` (`extractor.py` + `extractors/`)**: 3-tier entity/date parameter extraction validated against `app/schemas/tools.py`, with retry filter relaxation.
+4. **`tool_node` (`tool_node.py`)**: Dispatches concurrent single/multi-tool and multi-company requests via `DjangoCoreClient` to `POST /ai/tools/<domain>/<tool_name>/`.
+5. **`rag_node` (`rag_node.py`)**: Semantic SOP/knowledge retrieval via PostgreSQL PGVector (`VectorService`) with Django fallback.
+6. **`verifier_node` (`verifier.py`)**: Evaluates record count via `resolve_tool_record_count()`. Retries back to `extractor_node` up to 2 times when 0 records are found, otherwise routes to `synthesizer`.
+7. **`asynthesizer_node` (`synthesizer.py` + `formatters/`)**: Builds deterministic Markdown tables, IDR formatting, `entity_links`, `table_query_meta`, analytical follow-ups, and clarification fast-path responses.
 
 ---
 
@@ -144,9 +136,8 @@ When modifying or adding features to this repository:
 2. **Type Annotations & Validation**:
    - Use explicit Python type hints (`typing.Optional`, `typing.Dict`, `typing.List`, `typing.Any`).
    - Validate external inputs through Pydantic models in `app/schemas/tools.py`.
-3. **Async / Sync Client Separation**:
+3. **Async ERP Client Usage**:
    - StateGraph pipeline nodes are asynchronous and use `DjangoCoreClient` (`app/services/django_client.py`).
-   - Use `ERPClient` (`app/services/erp_client.py`) only when synchronous execution is explicitly required.
 4. **Preserve Documentation & Comments**:
    - Do not remove existing docstrings, module headers, or `TASK-X.X` reference tags.
 5. **Code Intelligence with CodeGraph**:

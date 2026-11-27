@@ -6,6 +6,8 @@ Service orchestrator berbasis FastAPI dan LangGraph untuk integrasi agen AI deng
 
 ## Arsitektur Sistem
 
+> **Peta Arsitektur & Trace Lengkap:** Baca [docs/ARCHITECTURE_MAP.md](docs/ARCHITECTURE_MAP.md) untuk pemetaan 44 file `app/`, 5 trace request end-to-end dengan nomor baris eksak, peta `AgentState`, dan indeks dokumen arsip.
+
 Pipeline pemrosesan kueri dibangun di atas compiled `StateGraph` LangGraph yang terdiri dari 7 node deterministik, percabangan kondisional, dan loop verifikasi adaptif.
 
 ```mermaid
@@ -92,7 +94,7 @@ graph TD
 
 ## Modul & Tool Native FastPrint ERP
 
-Service ini terhubung dengan layer `/ai/tools/` pada Django Core FastPrint ERP dan mencakup 22 tool operasional serta 1 modul pencarian dokumen RAG:
+Service ini terhubung dengan layer `/ai/tools/` pada Django Core FastPrint ERP dan mencakup **36 tool operasional read-only** di 4 domain (`accounting` 8, `inventory` 12, `sales` 5, `marketplace` 11 — definisi kanonik di `app/schemas/tools.py` & `app/services/tool_registry_service.py`) serta 1 modul pencarian dokumen RAG:
 
 ### 1. Accounting
 
