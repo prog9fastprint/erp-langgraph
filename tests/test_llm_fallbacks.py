@@ -227,5 +227,205 @@ class TestAutoFallbackModelFactory(unittest.TestCase):
             self.assertFalse(hasattr(model, "fallbacks"))
 
 
+class TestUnsupportedTemperatureSelfHealing(unittest.IsolatedAsyncioTestCase):
+    """Test suite for CircuitBreakerChatOpenAI reactive 400 temperature self-healing."""
+
+    @staticmethod
+    def _make_temp_400_error() -> Exception:
+        err = Exception(
+            "Error code: 400 - Unsupported value: 'temperature' does not support 0.0 with this model."
+        )
+        err.status_code = 400
+        return err
+
+    @staticmethod
+    def _make_other_400_error() -> Exception:
+        err = Exception("Error code: 400 - Invalid schema definition.")
+        err.status_code = 400
+        return err
+
+    def test_invoke_self_heals_unsupported_temperature_without_fallback(self):
+        """Sync invoke retries once without temperature and caches concrete models without calling fallback."""
+        from langchain_core.messages import AIMessage, HumanMessage
+        from app.services.llm import (
+            clear_chat_model_cache,
+            clear_unsupported_temperature_cache,
+            is_provider_unhealthy,
+            reset_provider_health,
+        )
+
+        clear_chat_model_cache()
+        clear_unsupported_temperature_cache()
+        reset_provider_health()
+        observed_payloads = []
+        try:
+            with patch.object(settings, "OPENAI_API_KEY", "mock-openai-key"), \
+                 patch.object(settings, "OPENROUTER_API_KEY", "mock-or-key"), \
+                 patch.object(settings, "GOOGLE_AI_API_KEY", None), \
+                 patch.object(settings, "GOOGLE_AI_API_KEY_2", None), \
+                 patch.object(settings, "GOOGLE_AI_API_KEY_3", None):
+                model_with_fb = get_chat_model(
+                    provider="openai",
+                    model_name="chat-latest",
+                    temperature=0.0,
+                    enable_fallback=True,
+                )
+                primary = model_with_fb.runnable
+
+                def _fake_invoke(bound_self, messages, *args, **kwargs):
+                    payload = bound_self._get_request_payload(messages)
+                    observed_payloads.append((bound_self.provider_name, dict(payload)))
+                    if "temperature" in payload:
+                        raise self._make_temp_400_error()
+                    return AIMessage(content="ok-healed")
+
+                with patch("langchain_openai.ChatOpenAI.invoke", autospec=True, side_effect=_fake_invoke):
+                    res1 = model_with_fb.invoke([HumanMessage(content="ping")])
+                    res2 = model_with_fb.invoke([HumanMessage(content="ping-2")])
+
+                self.assertEqual(res1.content, "ok-healed")
+                self.assertEqual(res2.content, "ok-healed")
+                self.assertEqual(len(observed_payloads), 3)
+                self.assertEqual(observed_payloads[0][0], "openai")
+                self.assertIn("temperature", observed_payloads[0][1])
+                self.assertEqual(observed_payloads[1][0], "openai")
+                self.assertNotIn("temperature", observed_payloads[1][1])
+                self.assertEqual(observed_payloads[2][0], "openai")
+                self.assertNotIn("temperature", observed_payloads[2][1])
+                self.assertFalse(is_provider_unhealthy("openai"))
+                self.assertNotIn("temperature", primary._get_request_payload([HumanMessage(content="check")]))
+        finally:
+            reset_provider_health()
+            clear_unsupported_temperature_cache()
+            clear_chat_model_cache()
+
+    async def test_ainvoke_and_astream_self_heal_and_meta_router_not_cached(self):
+        """Async ainvoke/astream retry once without temperature; openrouter/free avoids permanent cache."""
+        from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage
+        from app.services.llm import (
+            _is_cached_unsupported_temperature,
+            clear_chat_model_cache,
+            clear_unsupported_temperature_cache,
+            reset_provider_health,
+        )
+
+        clear_chat_model_cache()
+        clear_unsupported_temperature_cache()
+        reset_provider_health()
+        try:
+            with patch.object(settings, "OPENAI_API_KEY", "mock-openai-key"), \
+                 patch.object(settings, "OPENROUTER_API_KEY", "mock-or-key"):
+                or_meta = get_chat_model(
+                    provider="openrouter",
+                    model_name="openrouter/free",
+                    temperature=0.0,
+                    enable_fallback=False,
+                )
+                seen_ainvoke = []
+
+                async def _fake_ainvoke(bound_self, messages, *args, **kwargs):
+                    payload = bound_self._get_request_payload(messages)
+                    seen_ainvoke.append("temperature" in payload)
+                    if "temperature" in payload:
+                        raise self._make_temp_400_error()
+                    return AIMessage(content="ok-async")
+
+                with patch("langchain_openai.ChatOpenAI.ainvoke", autospec=True, side_effect=_fake_ainvoke):
+                    res = await or_meta.ainvoke([HumanMessage(content="hi")])
+
+                self.assertEqual(res.content, "ok-async")
+                self.assertEqual(seen_ainvoke, [True, False])
+                self.assertFalse(_is_cached_unsupported_temperature("openrouter", "openrouter/free"))
+
+                oa_model = get_chat_model(
+                    provider="openai",
+                    model_name="chat-latest-stream",
+                    temperature=0.0,
+                    enable_fallback=False,
+                )
+                seen_stream = []
+
+                async def _fake_astream(bound_self, messages, *args, **kwargs):
+                    payload = bound_self._get_request_payload(messages)
+                    seen_stream.append("temperature" in payload)
+                    if "temperature" in payload:
+                        raise self._make_temp_400_error()
+                    yield AIMessageChunk(content="chunk-1")
+
+                with patch("langchain_openai.ChatOpenAI.astream", autospec=True, side_effect=_fake_astream):
+                    chunks = [c.content async for c in oa_model.astream([HumanMessage(content="hi")])]
+
+                self.assertEqual(chunks, ["chunk-1"])
+                self.assertEqual(seen_stream, [True, False])
+                self.assertTrue(_is_cached_unsupported_temperature("openai", "chat-latest-stream"))
+        finally:
+            reset_provider_health()
+            clear_unsupported_temperature_cache()
+            clear_chat_model_cache()
+
+    async def test_mid_stream_400_does_not_retry_and_other_400_logs_and_falls_back(self):
+        """Mid-stream errors never retry; non-temperature 400 logs warning, keeps breaker healthy, and uses fallback."""
+        from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage
+        from app.services.llm import (
+            clear_chat_model_cache,
+            clear_unsupported_temperature_cache,
+            is_provider_unhealthy,
+            reset_provider_health,
+        )
+
+        clear_chat_model_cache()
+        clear_unsupported_temperature_cache()
+        reset_provider_health()
+        try:
+            with patch.object(settings, "OPENAI_API_KEY", "mock-openai-key"), \
+                 patch.object(settings, "OPENROUTER_API_KEY", "mock-or-key"), \
+                 patch.object(settings, "GOOGLE_AI_API_KEY", None), \
+                 patch.object(settings, "GOOGLE_AI_API_KEY_2", None), \
+                 patch.object(settings, "GOOGLE_AI_API_KEY_3", None):
+                oa_only = get_chat_model(
+                    provider="openai",
+                    model_name="chat-latest-midstream",
+                    temperature=0.0,
+                    enable_fallback=False,
+                )
+                stream_calls = 0
+
+                async def _mid_stream_fail(bound_self, messages, *args, **kwargs):
+                    nonlocal stream_calls
+                    stream_calls += 1
+                    yield AIMessageChunk(content="partial")
+                    raise self._make_temp_400_error()
+
+                with patch("langchain_openai.ChatOpenAI.astream", autospec=True, side_effect=_mid_stream_fail):
+                    with self.assertRaises(Exception):
+                        async for _ in oa_only.astream([HumanMessage(content="hi")]):
+                            pass
+                self.assertEqual(stream_calls, 1)
+
+                oa_with_fb = get_chat_model(
+                    provider="openai",
+                    model_name="gpt-4o-mini",
+                    temperature=0.0,
+                    enable_fallback=True,
+                )
+
+                def _other_400_then_or(bound_self, messages, *args, **kwargs):
+                    if bound_self.provider_name == "openai":
+                        raise self._make_other_400_error()
+                    return AIMessage(content="from-openrouter-fallback")
+
+                with patch("langchain_openai.ChatOpenAI.invoke", autospec=True, side_effect=_other_400_then_or), \
+                     self.assertLogs("llm_factory", level="WARNING") as logs:
+                    fb_res = oa_with_fb.invoke([HumanMessage(content="hi")])
+
+                self.assertEqual(fb_res.content, "from-openrouter-fallback")
+                self.assertFalse(is_provider_unhealthy("openai"))
+                self.assertTrue(any("HTTP 400 error" in msg for msg in logs.output))
+        finally:
+            reset_provider_health()
+            clear_unsupported_temperature_cache()
+            clear_chat_model_cache()
+
+
 if __name__ == "__main__":
     unittest.main()

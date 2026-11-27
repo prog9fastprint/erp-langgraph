@@ -52,6 +52,14 @@ class Settings(BaseSettings):
     # OpenAI Configuration (Priority 1)
     OPENAI_API_KEY: Optional[str] = None
     OPENAI_MODEL: str = "gpt-4o-mini"
+    OPENAI_TEMPERATURE: Optional[float] = Field(
+        default=None,
+        validation_alias="OPENAI_TEMPERATURE",
+    )
+    OPENAI_REASONING_EFFORT: Optional[str] = Field(
+        default=None,
+        validation_alias="OPENAI_REASONING_EFFORT",
+    )
 
     # Google Gemini Configuration (Priority 2)
     GOOGLE_AI_API_KEY: Optional[str] = Field(
@@ -143,6 +151,21 @@ class Settings(BaseSettings):
     def _normalize_nlu_router_mode(cls, value):
         if isinstance(value, str):
             return value.strip().lower()
+        return value
+
+    @field_validator("OPENAI_TEMPERATURE", mode="before")
+    @classmethod
+    def _normalize_optional_float(cls, value):
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
+
+    @field_validator("OPENAI_REASONING_EFFORT", "NLU_ROUTER_REASONING_EFFORT", mode="before")
+    @classmethod
+    def _normalize_optional_effort(cls, value):
+        if isinstance(value, str):
+            cleaned = value.strip()
+            return cleaned or None
         return value
 
 

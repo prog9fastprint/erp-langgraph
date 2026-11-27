@@ -2,11 +2,13 @@
 LLM Model Factory supporting OpenRouter (with free model catalog & auto-fallback) and OpenAI.
 """
 import asyncio
+import contextvars
 import hashlib
 import logging
+import re
 import threading
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 import httpx
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_openai import ChatOpenAI
@@ -44,6 +46,54 @@ _PROVIDER_HEALTH_EPOCH: int = 0
 _CHAT_MODEL_CACHE_LOCK = threading.Lock()
 _CHAT_MODEL_CACHE: Dict[Tuple[Any, ...], BaseChatModel] = {}
 _CHAT_MODEL_CACHE_MAX_SIZE: int = 16
+
+# Negative cache & one-shot retry state for models that reject 'temperature' at runtime
+_UNSUPPORTED_TEMP_LOCK = threading.Lock()
+_UNSUPPORTED_TEMP_MODELS: Set[Tuple[str, str]] = set()
+_FORCE_OMIT_TEMP_CTX: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "_force_omit_temp_ctx",
+    default=False,
+)
+_META_ROUTER_MODELS = frozenset({"openrouter/free"})
+
+
+def clear_unsupported_temperature_cache() -> None:
+    """Clear runtime cache of models known to reject the 'temperature' parameter."""
+    with _UNSUPPORTED_TEMP_LOCK:
+        _UNSUPPORTED_TEMP_MODELS.clear()
+
+
+def _is_cached_unsupported_temperature(provider_name: str, model_name: Optional[str]) -> bool:
+    """Return True if (provider_name, model_name) has previously rejected 'temperature'."""
+    norm_model = str(model_name or "").strip()
+    if not norm_model:
+        return False
+    with _UNSUPPORTED_TEMP_LOCK:
+        return (provider_name.lower().strip(), norm_model) in _UNSUPPORTED_TEMP_MODELS
+
+
+def _is_400_bad_request(exc: Exception) -> bool:
+    """Detect HTTP 400 / BadRequestError responses across OpenAI-compatible SDKs."""
+    if getattr(exc, "status_code", None) == 400:
+        return True
+    err_str = str(exc).lower()
+    return (
+        "error code: 400" in err_str
+        or "badrequesterror" in type(exc).__name__.lower()
+        or "invalid_request_error" in err_str
+    )
+
+
+def _is_unsupported_temperature_error(exc: Exception) -> bool:
+    """Return True when an HTTP 400 error specifically rejects the 'temperature' parameter."""
+    if not _is_400_bad_request(exc):
+        return False
+    err_str = str(exc).lower()
+    return "temperature" in err_str and (
+        "unsupported" in err_str
+        or "does not support" in err_str
+        or "not supported" in err_str
+    )
 
 
 def clear_chat_model_cache() -> None:
@@ -90,8 +140,39 @@ def reset_provider_health(provider: Optional[str] = None) -> None:
 
 
 class CircuitBreakerChatOpenAI(ChatOpenAI):
-    """ChatOpenAI wrapper that flags a provider/key as unhealthy upon auth/quota failures."""
+    """ChatOpenAI wrapper that flags auth/quota outages and self-heals temperature rejections."""
     provider_name: str = "openai"
+
+    def _should_omit_temperature(self) -> bool:
+        if _FORCE_OMIT_TEMP_CTX.get():
+            return True
+        return _is_cached_unsupported_temperature(self.provider_name, self.model_name)
+
+    def _get_request_payload(
+        self,
+        input_: Any,
+        *,
+        stop: Optional[List[str]] = None,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        payload = super()._get_request_payload(input_, stop=stop, **kwargs)
+        if self._should_omit_temperature():
+            payload.pop("temperature", None)
+        return payload
+
+    def _record_unsupported_temperature(self, exc: Exception) -> bool:
+        if not _is_unsupported_temperature_error(exc):
+            return False
+        norm_model = str(self.model_name or "").strip()
+        if norm_model and norm_model.lower() not in _META_ROUTER_MODELS:
+            with _UNSUPPORTED_TEMP_LOCK:
+                _UNSUPPORTED_TEMP_MODELS.add((self.provider_name.lower().strip(), norm_model))
+        logger.warning(
+            "Model '%s' on provider '%s' rejected 'temperature'; retrying once without temperature.",
+            norm_model or "unknown",
+            self.provider_name,
+        )
+        return True
 
     def _handle_failure(self, exc: Exception) -> None:
         err_str = str(exc).lower()
@@ -109,11 +190,27 @@ class CircuitBreakerChatOpenAI(ChatOpenAI):
             logger.warning(
                 f"Provider/key failure detected for '{self.provider_name}'. Marked unhealthy for 15m: {exc}"
             )
+        elif _is_400_bad_request(exc):
+            logger.warning(
+                "HTTP 400 error on provider '%s' (model '%s'): %s",
+                self.provider_name,
+                self.model_name,
+                exc,
+            )
 
     def invoke(self, *args, **kwargs):
         try:
             return super().invoke(*args, **kwargs)
         except Exception as exc:
+            if self._record_unsupported_temperature(exc):
+                token = _FORCE_OMIT_TEMP_CTX.set(True)
+                try:
+                    return super().invoke(*args, **kwargs)
+                except Exception as retry_exc:
+                    self._handle_failure(retry_exc)
+                    raise
+                finally:
+                    _FORCE_OMIT_TEMP_CTX.reset(token)
             self._handle_failure(exc)
             raise
 
@@ -121,21 +218,59 @@ class CircuitBreakerChatOpenAI(ChatOpenAI):
         try:
             return await super().ainvoke(*args, **kwargs)
         except Exception as exc:
+            if self._record_unsupported_temperature(exc):
+                token = _FORCE_OMIT_TEMP_CTX.set(True)
+                try:
+                    return await super().ainvoke(*args, **kwargs)
+                except Exception as retry_exc:
+                    self._handle_failure(retry_exc)
+                    raise
+                finally:
+                    _FORCE_OMIT_TEMP_CTX.reset(token)
             self._handle_failure(exc)
             raise
 
     def stream(self, *args, **kwargs):
+        yielded = False
         try:
-            yield from super().stream(*args, **kwargs)
+            for chunk in super().stream(*args, **kwargs):
+                yielded = True
+                yield chunk
+            return
         except Exception as exc:
+            if not yielded and self._record_unsupported_temperature(exc):
+                token = _FORCE_OMIT_TEMP_CTX.set(True)
+                try:
+                    for chunk in super().stream(*args, **kwargs):
+                        yield chunk
+                    return
+                except Exception as retry_exc:
+                    self._handle_failure(retry_exc)
+                    raise
+                finally:
+                    _FORCE_OMIT_TEMP_CTX.reset(token)
             self._handle_failure(exc)
             raise
 
     async def astream(self, *args, **kwargs):
+        yielded = False
         try:
             async for chunk in super().astream(*args, **kwargs):
+                yielded = True
                 yield chunk
+            return
         except Exception as exc:
+            if not yielded and self._record_unsupported_temperature(exc):
+                token = _FORCE_OMIT_TEMP_CTX.set(True)
+                try:
+                    async for chunk in super().astream(*args, **kwargs):
+                        yield chunk
+                    return
+                except Exception as retry_exc:
+                    self._handle_failure(retry_exc)
+                    raise
+                finally:
+                    _FORCE_OMIT_TEMP_CTX.reset(token)
             self._handle_failure(exc)
             raise
 
@@ -375,10 +510,42 @@ def _build_gemini_model(
     return primary_model
 
 
+# OpenAI model families that enforce default sampling and reject temperature=0.0
+_OPENAI_OMIT_TEMPERATURE_MODEL_RE = re.compile(
+    r"^(?:openai/)?(?:o\d+(?:$|[-.])|gpt-(?:[5-9]|\d{2,})(?:$|[-.]))",
+    re.IGNORECASE,
+)
+
+
+def _is_openai_reasoning_model(model_name: Optional[str]) -> bool:
+    """Return True if model_name matches OpenAI o-series or GPT-5+ reasoning families."""
+    return bool(model_name and _OPENAI_OMIT_TEMPERATURE_MODEL_RE.match(model_name.strip()))
+
+
+def _resolve_openai_temperature(
+    model_name: Optional[str],
+    temperature: Optional[float],
+    provider_name: str = "openai",
+    explicit_override: Optional[float] = None,
+) -> Optional[float]:
+    """Resolve effective temperature, omitting it for reasoning or cached-unsupported models."""
+    if _is_cached_unsupported_temperature(provider_name, model_name):
+        return None
+    check_reasoning = provider_name == "openai" or (
+        provider_name == "openrouter"
+        and bool(model_name and model_name.strip().lower().startswith("openai/"))
+    )
+    if check_reasoning and _is_openai_reasoning_model(model_name):
+        return None
+    if explicit_override is not None:
+        return explicit_override
+    return temperature
+
+
 def get_chat_model(
     provider: Optional[str] = None,
     model_name: Optional[str] = None,
-    temperature: float = 0.0,
+    temperature: Optional[float] = 0.0,
     fallback_models: Optional[List[str]] = None,
     enable_fallback: bool = True,
     reasoning_effort: Optional[str] = None,
@@ -394,11 +561,13 @@ def get_chat_model(
     cache_key = (
         selected_provider,
         model_name,
-        float(temperature),
+        float(temperature) if temperature is not None else None,
         tuple(fallback_models) if fallback_models else (),
         bool(enable_fallback),
         norm_effort,
         settings.OPENAI_MODEL,
+        settings.OPENAI_TEMPERATURE,
+        settings.OPENAI_REASONING_EFFORT,
         settings.GEMINI_MODEL,
         settings.OPENROUTER_MODEL,
         settings.REQUEST_TIMEOUT_SEC,
@@ -426,7 +595,7 @@ def get_chat_model(
 
 
 def get_router_chat_model(
-    temperature: float = 0.0,
+    temperature: Optional[float] = 0.0,
     enable_fallback: bool = True,
 ) -> BaseChatModel:
     """Return warm ChatModel configured for NLU routing, defaulting to get_chat_model()."""
@@ -447,7 +616,7 @@ def get_router_chat_model(
 def _build_chat_model_uncached(
     selected_provider: str,
     model_name: Optional[str] = None,
-    temperature: float = 0.0,
+    temperature: Optional[float] = 0.0,
     fallback_models: Optional[List[str]] = None,
     enable_fallback: bool = True,
     reasoning_effort: Optional[str] = None,
@@ -463,6 +632,11 @@ def _build_chat_model_uncached(
             raise ValueError("OPENROUTER_API_KEY environment variable is required when MODEL_PROVIDER=openrouter")
 
         target_model = model_name or settings.OPENROUTER_MODEL
+        openrouter_temperature = _resolve_openai_temperature(
+            target_model,
+            temperature,
+            provider_name="openrouter",
+        )
 
         # Configure model fallback array for high-availability
         extra_body: Dict[str, Any] = {}
@@ -482,7 +656,7 @@ def _build_chat_model_uncached(
             model=target_model,
             api_key=api_key,
             base_url="https://openrouter.ai/api/v1",
-            temperature=temperature,
+            temperature=openrouter_temperature,
             request_timeout=settings.REQUEST_TIMEOUT_SEC,
             default_headers={
                 "HTTP-Referer": "https://fastprint.co.id",
@@ -549,13 +723,28 @@ def _build_chat_model_uncached(
             raise ValueError("OPENAI_API_KEY environment variable is required when MODEL_PROVIDER=openai")
 
         target_model = model_name or settings.OPENAI_MODEL
+        effective_temperature = _resolve_openai_temperature(
+            target_model,
+            temperature,
+            provider_name="openai",
+            explicit_override=settings.OPENAI_TEMPERATURE,
+        )
+        openai_effort_kwargs: Dict[str, Any] = {}
+        effective_openai_effort = (
+            (reasoning_effort or "").strip()
+            or (settings.OPENAI_REASONING_EFFORT or "").strip()
+            or None
+        )
+        if effective_openai_effort and _is_openai_reasoning_model(target_model):
+            openai_effort_kwargs["reasoning_effort"] = effective_openai_effort
+
         primary_model = CircuitBreakerChatOpenAI(
             model=target_model,
             api_key=api_key,
-            temperature=temperature,
+            temperature=effective_temperature,
             request_timeout=settings.REQUEST_TIMEOUT_SEC,
             provider_name="openai",
-            **effort_kwargs,
+            **openai_effort_kwargs,
         )
 
         if enable_fallback:

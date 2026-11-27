@@ -87,6 +87,45 @@ class TestCentralizedConfig(unittest.TestCase):
             with self.assertRaises(ValidationError):
                 Settings(_env_file=None)
 
+    def test_openai_sampling_and_reasoning_settings_normalization(self):
+        """OPENAI_TEMPERATURE and OPENAI_REASONING_EFFORT default to None and normalize blank strings."""
+        clean_env = {
+            k: v
+            for k, v in os.environ.items()
+            if k not in ("OPENAI_TEMPERATURE", "OPENAI_REASONING_EFFORT", "NLU_ROUTER_REASONING_EFFORT")
+        }
+        with patch.dict(os.environ, clean_env, clear=True):
+            cfg_default = Settings(_env_file=None)
+            self.assertIsNone(cfg_default.OPENAI_TEMPERATURE)
+            self.assertIsNone(cfg_default.OPENAI_REASONING_EFFORT)
+            self.assertIsNone(cfg_default.NLU_ROUTER_REASONING_EFFORT)
+
+        with patch.dict(
+            os.environ,
+            {
+                "OPENAI_TEMPERATURE": "   ",
+                "OPENAI_REASONING_EFFORT": "  ",
+                "NLU_ROUTER_REASONING_EFFORT": " ",
+            },
+            clear=False,
+        ):
+            cfg_blank = Settings(_env_file=None)
+            self.assertIsNone(cfg_blank.OPENAI_TEMPERATURE)
+            self.assertIsNone(cfg_blank.OPENAI_REASONING_EFFORT)
+            self.assertIsNone(cfg_blank.NLU_ROUTER_REASONING_EFFORT)
+
+        with patch.dict(
+            os.environ,
+            {
+                "OPENAI_TEMPERATURE": "0.25",
+                "OPENAI_REASONING_EFFORT": " low ",
+            },
+            clear=False,
+        ):
+            cfg_set = Settings(_env_file=None)
+            self.assertAlmostEqual(cfg_set.OPENAI_TEMPERATURE, 0.25)
+            self.assertEqual(cfg_set.OPENAI_REASONING_EFFORT, "low")
+
 
 class TestLLMClientFactory(unittest.TestCase):
     """Test suite for LLM factory (OpenRouter & OpenAI) capabilities."""
@@ -212,6 +251,119 @@ class TestLLMClientFactory(unittest.TestCase):
                 self.assertEqual(getattr(fast_m, "reasoning_effort", None), "none")
         finally:
             reset_provider_health()
+            clear_chat_model_cache()
+
+    def test_openai_omits_temperature_for_reasoning_and_gpt5_plus_models(self):
+        """GPT-5+, GPT-6+, future o*/gpt-7+ models, and OpenRouter openai/* reasoning IDs omit temperature=0.0."""
+        from app.services.llm import (
+            clear_chat_model_cache,
+            clear_unsupported_temperature_cache,
+            reset_provider_health,
+        )
+
+        clear_chat_model_cache()
+        clear_unsupported_temperature_cache()
+        reset_provider_health()
+        try:
+            with patch.object(settings, "OPENAI_API_KEY", "mock-openai-key"), \
+                 patch.object(settings, "OPENROUTER_API_KEY", "mock-or-key"), \
+                 patch.object(settings, "OPENAI_TEMPERATURE", None):
+                for legacy_model in ("gpt-4o-mini", "gpt-4.1-mini", "gpt-4.1"):
+                    m = get_chat_model(
+                        provider="openai",
+                        model_name=legacy_model,
+                        temperature=0.0,
+                        enable_fallback=False,
+                    )
+                    self.assertEqual(m.temperature, 0.0)
+                    self.assertEqual(m._default_params.get("temperature"), 0.0)
+
+                for reasoning_model in ("gpt-6-luna", "gpt-5-nano", "gpt-5.4-mini", "gpt-7", "o3", "o4-mini"):
+                    m = get_chat_model(
+                        provider="openai",
+                        model_name=reasoning_model,
+                        temperature=0.0,
+                        enable_fallback=False,
+                    )
+                    self.assertIsNone(m.temperature)
+                    self.assertNotIn("temperature", m._default_params)
+                    self.assertIsNotNone(m.with_structured_output(DummyOutputSchema))
+
+                or_reasoning = get_chat_model(
+                    provider="openrouter",
+                    model_name="openai/gpt-6-luna",
+                    temperature=0.0,
+                    enable_fallback=False,
+                )
+                self.assertIsNone(or_reasoning.temperature)
+                self.assertNotIn("temperature", or_reasoning._default_params)
+
+                or_standard = get_chat_model(
+                    provider="openrouter",
+                    model_name="meta-llama/llama-3.3-70b-instruct:free",
+                    temperature=0.0,
+                    enable_fallback=False,
+                )
+                self.assertEqual(or_standard.temperature, 0.0)
+        finally:
+            reset_provider_health()
+            clear_unsupported_temperature_cache()
+            clear_chat_model_cache()
+
+    def test_openai_reasoning_effort_gating_and_cache_invalidation(self):
+        """OPENAI_REASONING_EFFORT applies only to OpenAI reasoning models and invalidates warm cache."""
+        from app.services.llm import (
+            clear_chat_model_cache,
+            clear_unsupported_temperature_cache,
+            get_router_chat_model,
+            reset_provider_health,
+        )
+
+        clear_chat_model_cache()
+        clear_unsupported_temperature_cache()
+        reset_provider_health()
+        try:
+            with patch.object(settings, "MODEL_PROVIDER", "openai"), \
+                 patch.object(settings, "OPENAI_API_KEY", "mock-openai-key"), \
+                 patch.object(settings, "GOOGLE_AI_API_KEY", "mock-gemini-key"), \
+                 patch.object(settings, "OPENAI_TEMPERATURE", None), \
+                 patch.object(settings, "OPENAI_REASONING_EFFORT", "low"), \
+                 patch.object(settings, "NLU_ROUTER_PROVIDER", None), \
+                 patch.object(settings, "NLU_ROUTER_MODEL", None), \
+                 patch.object(settings, "NLU_ROUTER_REASONING_EFFORT", None):
+                legacy_m = get_chat_model(provider="openai", model_name="gpt-4o-mini", enable_fallback=False)
+                self.assertIsNone(getattr(legacy_m, "reasoning_effort", None))
+
+                luna_low = get_chat_model(provider="openai", model_name="gpt-6-luna", enable_fallback=False)
+                self.assertEqual(getattr(luna_low, "reasoning_effort", None), "low")
+
+                o3_low = get_chat_model(provider="openai", model_name="o3", enable_fallback=False)
+                self.assertEqual(getattr(o3_low, "reasoning_effort", None), "low")
+
+                with patch.object(settings, "OPENAI_REASONING_EFFORT", "medium"):
+                    luna_med = get_chat_model(provider="openai", model_name="gpt-6-luna", enable_fallback=False)
+                    self.assertIsNot(luna_low, luna_med)
+                    self.assertEqual(getattr(luna_med, "reasoning_effort", None), "medium")
+
+                with patch.object(settings, "OPENAI_TEMPERATURE", 0.3):
+                    legacy_override = get_chat_model(provider="openai", model_name="gpt-4o-mini", enable_fallback=False)
+                    self.assertIsNot(legacy_m, legacy_override)
+                    self.assertAlmostEqual(legacy_override.temperature, 0.3)
+
+                with patch.object(settings, "NLU_ROUTER_MODEL", "gpt-6-luna"), \
+                     patch.object(settings, "NLU_ROUTER_REASONING_EFFORT", "none"):
+                    router_luna = get_router_chat_model(enable_fallback=False)
+                    self.assertEqual(getattr(router_luna, "reasoning_effort", None), "none")
+
+                with patch.object(settings, "NLU_ROUTER_PROVIDER", "gemini"), \
+                     patch.object(settings, "NLU_ROUTER_MODEL", "gemini-2.5-flash-lite"), \
+                     patch.object(settings, "NLU_ROUTER_REASONING_EFFORT", None):
+                    router_gem = get_router_chat_model(enable_fallback=False)
+                    self.assertEqual(router_gem.model_name, "gemini-2.5-flash-lite")
+                    self.assertIsNone(getattr(router_gem, "reasoning_effort", None))
+        finally:
+            reset_provider_health()
+            clear_unsupported_temperature_cache()
             clear_chat_model_cache()
 
 
