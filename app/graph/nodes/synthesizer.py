@@ -1134,17 +1134,43 @@ def generate_deterministic_followups(state: AgentState) -> List[Dict[str, str]]:
             })
         # Bank recon
         elif "bank" in tool or "recon" in tool:
-            j_name = params.get("journal_name") or "Bank Utama"
-            suggestions.append({
-                "label": f"Buku Besar {str(j_name)[:15]}",
-                "query": f"Tampilkan mutasi buku besar untuk {j_name} bulan ini",
-                "icon": "fa-book-open",
-            })
-            suggestions.append({
-                "label": "Posisi Neraca Keuangan",
-                "query": "Cek laporan neraca keuangan dan verifikasi persamaan aset vs liabilitas + ekuitas",
-                "icon": "fa-scale-balanced",
-            })
+            if tool == "reconcile_bank_statement":
+                res = state.get("tool_result") or {}
+                erp_accs = res.get("erp_accounts_used") or []
+                primary_code = (
+                    erp_accs[0].get("account_code")
+                    if erp_accs and isinstance(erp_accs[0], dict)
+                    else None
+                )
+                if not params.get("include_cross_check"):
+                    suggestions.append({
+                        "label": "Cek Salah Kamar",
+                        "query": "Cek mutasi yang diduga salah kamar di rekening bank lain dari berkas rekening koran ini",
+                        "icon": "fa-magnifying-glass",
+                    })
+                if primary_code:
+                    suggestions.append({
+                        "label": f"Buku Besar {str(primary_code)[:15]}",
+                        "query": f"Tampilkan mutasi buku besar akun {primary_code} bulan ini",
+                        "icon": "fa-book-open",
+                    })
+                suggestions.append({
+                    "label": "Posisi Neraca Keuangan",
+                    "query": "Cek laporan neraca keuangan dan verifikasi persamaan aset vs liabilitas + ekuitas",
+                    "icon": "fa-scale-balanced",
+                })
+            else:
+                j_name = params.get("journal_name") or "Bank Utama"
+                suggestions.append({
+                    "label": f"Buku Besar {str(j_name)[:15]}",
+                    "query": f"Tampilkan mutasi buku besar untuk {j_name} bulan ini",
+                    "icon": "fa-book-open",
+                })
+                suggestions.append({
+                    "label": "Posisi Neraca Keuangan",
+                    "query": "Cek laporan neraca keuangan dan verifikasi persamaan aset vs liabilitas + ekuitas",
+                    "icon": "fa-scale-balanced",
+                })
         # Profit and loss
         elif "profit" in tool:
             suggestions.append({
@@ -1462,6 +1488,8 @@ def _should_keep_verbatim_deterministic(
         return True
     if is_analytical_thinking_query(user_query):
         return False
+    if state.get("detected_tool") == "reconcile_bank_statement" and "\n|" in deterministic_answer:
+        return True
     if state.get("is_multi_company", False) or is_multi_q or len(deterministic_answer) > 1500:
         return True
     if "\n|" not in deterministic_answer:
@@ -2216,11 +2244,78 @@ def _sanitize_clarification_options(
     return cleaned
 
 
+def _build_pdf_inspect_clarification_output(state: AgentState) -> Optional[Dict[str, Any]]:
+    """
+    When reconcile_bank_statement ran in 'inspect' mode (user uploaded PDF without clear instructions),
+    convert the inspection payload directly into a proactive CLARIFICATION turn with clickable chips.
+    """
+    if state.get("detected_tool") != "reconcile_bank_statement":
+        return None
+    if state.get("verification_status") == "ERROR":
+        return None
+    res = state.get("tool_result")
+    if not isinstance(res, dict) or res.get("mode") != "inspect":
+        return None
+
+    meta = res.get("statement_meta") or {}
+    checksum = res.get("checksum_gate") or {}
+    det = res.get("account_detection") or {}
+
+    bank_code = meta.get("bank_code") or "Bank"
+    acc_no = meta.get("account_number") or "-"
+    acc_holder = meta.get("account_holder") or "-"
+    period = meta.get("statement_period") or "-"
+    cr_count = meta.get("cr_count", 0)
+    db_count = meta.get("db_count", 0)
+    saldo_awal = _format_rupiah(meta.get("saldo_awal", 0.0))
+    saldo_akhir = _format_rupiah(meta.get("saldo_akhir", 0.0))
+    checksum_str = "PASS (Valid 100%)" if checksum.get("passed") else "FAIL (Ada selisih pembacaan baris)"
+
+    codes = det.get("candidate_account_codes") or []
+    codes_str = ", ".join(f"`{c}`" for c in codes) if codes else "Belum terdeteksi otomatis"
+    shared_note = (
+        " *(rekening bersama lintas cabang)*"
+        if det.get("is_shared_multi_branch")
+        else ""
+    )
+
+    question = (
+        f"### Berkas Rekening Koran Terdeteksi: {bank_code} `{acc_no}`\n\n"
+        f"- **Pemilik Rekening**: {acc_holder}\n"
+        f"- **Periode**: {period}\n"
+        f"- **Mutasi Terbaca**: {cr_count} uang masuk (CR) & {db_count} uang keluar (DB)\n"
+        f"- **Saldo Awal / Akhir**: {saldo_awal} &rarr; **{saldo_akhir}**\n"
+        f"- **Golden Checksum Gate**: **{checksum_str}**\n"
+        f"- **Akun GL ERP Terkait**: {codes_str}{shared_note}\n\n"
+        f"Apa yang ingin saya lakukan dengan berkas rekening koran ini?"
+    )
+
+    chips = _sanitize_clarification_options(res.get("suggested_clarifications"), max_items=4)
+    out_dict: Dict[str, Any] = {
+        "final_answer": question,
+        "deterministic_answer": question,
+        "suggested_followups": chips,
+        "verification_status": "CLARIFICATION",
+        "needs_clarification": True,
+        "query_mode": "clarification",
+        "table_query_meta": None,
+        "entity_links": [],
+        "messages": [AIMessage(content=question)],
+    }
+    if state.get("active_model"):
+        out_dict["active_model"] = state["active_model"]
+    return out_dict
+
+
 def _build_clarification_synthesis_output(state: AgentState) -> Optional[Dict[str, Any]]:
     """
     Fast-path synthesis output for conservative disambiguation (query_mode='clarification').
     Produces final_answer + sanitized suggested_followups chips without invoking an extra LLM call.
     """
+    pdf_inspect_out = _build_pdf_inspect_clarification_output(state)
+    if pdf_inspect_out is not None:
+        return pdf_inspect_out
+
     if state.get("query_mode") != "clarification" and not state.get("needs_clarification"):
         return None
 

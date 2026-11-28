@@ -169,6 +169,22 @@ class Settings(BaseSettings):
         validation_alias="SYNTHESIZER_FAST_DETERMINISTIC",
     )
 
+    # 9. Multi-System Plugin Connectors (Odoo, HRIS Talenta, Generic REST)
+    DEFAULT_CONNECTOR: str = Field(default="fastprint", validation_alias="DEFAULT_CONNECTOR")
+    CONNECTORS_CONFIG_PATH: Optional[str] = Field(default=None, validation_alias="CONNECTORS_CONFIG_PATH")
+
+    # Odoo ERP Configuration
+    ODOO_URL: Optional[str] = Field(default=None, validation_alias="ODOO_URL")
+    ODOO_DB: Optional[str] = Field(default=None, validation_alias="ODOO_DB")
+    ODOO_USERNAME: Optional[str] = Field(default=None, validation_alias="ODOO_USERNAME")
+    ODOO_API_KEY: Optional[str] = Field(default=None, validation_alias="ODOO_API_KEY")
+
+    # Mekari Talenta HRIS Configuration
+    TALENTA_API_URL: str = Field(default="https://api.mekari.com/v2/talenta", validation_alias="TALENTA_API_URL")
+    TALENTA_API_KEY: Optional[str] = Field(default=None, validation_alias="TALENTA_API_KEY")
+    TALENTA_CLIENT_ID: Optional[str] = Field(default=None, validation_alias="TALENTA_CLIENT_ID")
+    TALENTA_CLIENT_SECRET: Optional[str] = Field(default=None, validation_alias="TALENTA_CLIENT_SECRET")
+
     @field_validator("NLU_ROUTER_MODE", mode="before")
     @classmethod
     def _normalize_nlu_router_mode(cls, value):

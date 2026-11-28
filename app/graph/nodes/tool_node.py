@@ -653,6 +653,21 @@ async def _execute_single_tool(
 
     handler = dispatch_map.get(tool_name)
     if not handler:
+        # Check external plugin connectors in ConnectorRegistry (Odoo, Talenta HRIS, Generic REST)
+        from app.connectors.registry import get_connector_registry
+        conn_registry = get_connector_registry()
+        connector = conn_registry.resolve_connector_for_tool(tool_name)
+        if connector and connector.name != "fastprint":
+            ctx = {
+                "user_token": user_token,
+                "company_id": target_company_id,
+            }
+            res, err = await conn_registry.execute_tool(
+                tool_name=tool_name,
+                params=clean_params,
+                context=ctx,
+            )
+            return res, err
         return None, f"Tool '{tool_name}' not registered in dispatch map"
 
     # Pre-resolve matching branch accounts for broad GL category queries (e.g. 'buku besar akun kas/bank')
@@ -740,7 +755,9 @@ async def _execute_tool_multi_company(
             "get_sales_summary",
             "get_inventory_velocity_forecast",
             "get_price_history",
+            "reconcile_bank_statement",
         )
+        or (tool_name == "get_bank_reconciliation_summary" and bool(params_copy.get("consolidate_branches")))
     )
     if supports_native_mc:
         primary_cid = target_company_ids[0]

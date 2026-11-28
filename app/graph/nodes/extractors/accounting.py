@@ -363,6 +363,96 @@ def _fallback_extract_bank_reconciliation(query: str, ref_date: Optional[date] =
         params["date_from"] = date_from
     if date_to:
         params["date_to"] = date_to
+    if re.search(
+        r"\b(?:semua\s+cabang|seluruh\s+cabang|konsolidasi|gabung\s+cabang|lintas\s+cabang)\b",
+        cleaned,
+        re.IGNORECASE,
+    ):
+        params["consolidate_branches"] = True
+    return params
+
+
+_EXPLICIT_RECON_ACTION_RE = re.compile(
+    r"\b(?:rekonsiliasi|rekon|audit|bandingkan|selisih|pengeluaran|uang\s+masuk|mutasi|"
+    r"belum\s+(?:dijurnal|dicatat|cocok)|ringkasan\s+(?:cr|db|total|mutasi)|"
+    r"salah\s+kamar|cross[\s\-]?check|semua\s+cabang|cabang\s+aktif|khusus\s+(?:untuk\s+)?(?:company|cabang)|"
+    r"rekomendasi\s+penyesuaian|checksum)\b",
+    re.IGNORECASE,
+)
+
+
+def _find_latest_pdf_attachment(
+    state: Optional[Dict[str, Any]],
+    query: str = "",
+) -> Optional[Dict[str, Any]]:
+    """Return the matching or newest PDF attachment from current turn attachments or thread history."""
+    if not isinstance(state, dict):
+        return None
+    pdfs: List[Dict[str, Any]] = []
+    for bucket_key in ("attachments", "thread_attachments"):
+        items = state.get(bucket_key) or []
+        for att in reversed(items):
+            if not isinstance(att, dict):
+                continue
+            fname = str(att.get("filename") or "").lower()
+            fpath = str(att.get("file_path") or "").lower()
+            ext = str(att.get("ext") or "").lower()
+            if ext == ".pdf" or fname.endswith(".pdf") or fpath.endswith(".pdf"):
+                pdfs.append(att)
+    if not pdfs:
+        return None
+    q_low = (query or "").lower()
+    if q_low:
+        for att in pdfs:
+            fname = str(att.get("filename") or "").strip().lower()
+            if fname and fname in q_low:
+                return att
+    return pdfs[0]
+
+
+def _fallback_extract_reconcile_bank_statement(
+    query: str,
+    state: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Extract parameters for accounting.reconcile_bank_statement from PDF attachments and query text.
+    Defaults to mode='inspect' when user uploads a PDF without clear instructions so LangGraph
+    can inspect metadata/checksum and ask proactive clarifying questions.
+    """
+    params: Dict[str, Any] = {}
+    cleaned = (query or "").strip()
+    q_low = cleaned.lower()
+
+    pdf_att = _find_latest_pdf_attachment(state, query=cleaned)
+    if pdf_att:
+        if pdf_att.get("file_path"):
+            params["pdf_path"] = str(pdf_att["file_path"])
+        if pdf_att.get("attachment_id"):
+            params["attachment_id"] = str(pdf_att["attachment_id"])
+
+    is_attachment_placeholder = bool(re.match(r"^\[Berkas Dilampirkan:", cleaned, re.IGNORECASE))
+    has_explicit_action = bool(_EXPLICIT_RECON_ACTION_RE.search(q_low))
+
+    if is_attachment_placeholder or not has_explicit_action:
+        params["mode"] = "inspect"
+    else:
+        params["mode"] = "reconcile"
+
+    if re.search(
+        r"\b(?:khusus\s+(?:untuk\s+)?(?:company|cabang|pt)|cabang\s+aktif\s+saja|company\s+ini\s+saja|hanya\s+(?:untuk\s+)?(?:company|cabang))\b",
+        q_low,
+    ):
+        params["consolidate_branches"] = False
+    else:
+        params["consolidate_branches"] = True
+
+    if re.search(r"\b(?:salah\s+kamar|cross[\s\-]?check|rekening\s+lain)\b", q_low):
+        params["include_cross_check"] = True
+
+    acc_codes = re.findall(r"\b(112[0-9A-Za-z\-]{1,10})\b", cleaned)
+    if acc_codes:
+        params["account_codes"] = list(dict.fromkeys(acc_codes))
+
     return params
 
 

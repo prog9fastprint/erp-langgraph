@@ -527,6 +527,8 @@ async def _prepare_workflow_execution(
     user_id: Optional[str] = None,
     user_roles: Optional[List[str]] = None,
     authorized_company_ids: Optional[List[int]] = None,
+    attachments: Optional[List[Dict[str, Any]]] = None,
+    thread_attachments: Optional[List[Dict[str, Any]]] = None,
     **kwargs: Any,
 ) -> Tuple[Any, Dict[str, Any], AgentState, bool, str]:
     """
@@ -572,6 +574,21 @@ async def _prepare_workflow_execution(
         authorized_company_ids=authorized_company_ids,
     )
 
+    merged_thread_attachments: List[Dict[str, Any]] = []
+    seen_att_paths: set[str] = set()
+    for att_list in (
+        (checkpoint_values.get("thread_attachments") if checkpoint_values else None) or [],
+        (checkpoint_values.get("attachments") if checkpoint_values else None) or [],
+        thread_attachments or [],
+    ):
+        for att in att_list:
+            if not isinstance(att, dict):
+                continue
+            fp = str(att.get("file_path") or "").strip()
+            if fp and fp not in seen_att_paths:
+                seen_att_paths.add(fp)
+                merged_thread_attachments.append(att)
+
     initial_state = create_initial_state(
         user_query=user_query,
         user_token=user_token,
@@ -585,6 +602,8 @@ async def _prepare_workflow_execution(
         company_scope_source=effective_company_scope_source,
         is_multi_company=is_multi_company,
         messages=hydrated_messages,
+        attachments=attachments or [],
+        thread_attachments=merged_thread_attachments,
     )
     if checkpoint_values:
         prev_q_mode = checkpoint_values.get("query_mode")

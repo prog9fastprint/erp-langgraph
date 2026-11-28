@@ -20,6 +20,7 @@ from app.schemas.tools import (
     BalanceSheetFilterSchema,
     VendorBillsFilterSchema,
     BankReconciliationFilterSchema,
+    ReconcileBankStatementFilterSchema,
     StockLevelFilterSchema,
     ProductInfoFilterSchema,
     LocationsFilterSchema,
@@ -182,6 +183,22 @@ CORE_TOOL_DEFINITIONS: List[Dict[str, Any]] = [
             "lihat mutasi bank belum terekonsiliasi minggu ini",
         ],
         "negative_hints": "Bukan untuk sekadar cek saldo akhir akun kas/bank COA (gunakan get_account_balance) atau settlement dana dompet marketplace (gunakan get_cashflow_and_balance_summary).",
+        "required_permission": "accounting.view_bank",
+        "is_write": False,
+    },
+    {
+        "tool_name": "reconcile_bank_statement",
+        "domain": "accounting",
+        "description": "Inspeksi dan audit rekonsiliasi lengkap file PDF rekening koran bank (BCA / Bank Mandiri) terhadap General Ledger ERP multi-cabang, lengkap dengan Golden Checksum Gate dan diagnosis akar masalah selisih (MDR QRIS, tarikan cek tunai, pajak NTPN, biaya buku cek, salah kamar).",
+        "schema_cls": ReconcileBankStatementFilterSchema,
+        "keywords": ["rekening koran pdf", "audit rekening koran", "rekonsiliasi pdf", "lampiran pdf", "mutasi bank pdf"],
+        "sample_queries": [
+            "periksa dan rekonsiliasi file PDF rekening koran bank ini",
+            "cek mutasi PDF rekening koran yang belum dijurnal di ERP",
+            "audit selisih rekening koran BCA atau Mandiri dari lampiran PDF",
+            "identifikasi pengeluaran bank di PDF rekening koran yang belum dicatat",
+        ],
+        "negative_hints": "Gunakan tool ini bila ada lampiran file PDF rekening koran. Bila hanya menanyakan ringkasan rekonsiliasi database tanpa file PDF, gunakan get_bank_reconciliation_summary.",
         "required_permission": "accounting.view_bank",
         "is_write": False,
     },
@@ -1499,6 +1516,35 @@ class ToolRegistryService:
     def get_tool_by_name(self, tool_name: str) -> Optional[Dict[str, Any]]:
         """Retrieve tool metadata by tool_name from in-memory catalog."""
         return self._in_memory_catalog.get(tool_name)
+
+    def register_dynamic_tool(self, tool_def: Dict[str, Any]) -> None:
+        """
+        Dynamically register a tool metadata card into the in-memory catalog
+        and global TOOL_DOMAIN_MAP at runtime (for plugin connectors like Odoo and Talenta).
+        """
+        tool_name = tool_def.get("tool_name")
+        if not tool_name:
+            return
+        schema_cls = tool_def.get("schema_cls")
+        params_schema = (
+            schema_cls.model_json_schema()
+            if schema_cls and hasattr(schema_cls, "model_json_schema")
+            else tool_def.get("params_schema", {})
+        )
+        self._in_memory_catalog[tool_name] = {
+            "tool_name": tool_name,
+            "domain": tool_def.get("domain", "general"),
+            "description": tool_def.get("description", ""),
+            "params_schema": params_schema,
+            "required_permission": tool_def.get("required_permission"),
+            "is_write": bool(tool_def.get("is_write", False)),
+            "keywords": [k.lower() for k in tool_def.get("keywords", [])],
+            "sample_queries": [str(q).strip() for q in tool_def.get("sample_queries", []) if str(q).strip()],
+            "negative_hints": str(tool_def.get("negative_hints") or "").strip(),
+            "search_text": build_tool_search_text(tool_def),
+        }
+        from app.schemas.tools import register_tool_domain
+        register_tool_domain(tool_name, tool_def.get("domain", "general"))
 
 
 # Global singleton instance

@@ -137,6 +137,10 @@ class AgentState(TypedDict, total=False):
     clarification_question: Optional[str]
     clarification_options: Optional[List[Dict[str, str]]]
 
+    # 11. File Attachments (Current Turn & Thread History)
+    attachments: Optional[List[Dict[str, Any]]]
+    thread_attachments: Optional[List[Dict[str, Any]]]
+
 
 def create_initial_state(
     user_query: str,
@@ -153,6 +157,8 @@ def create_initial_state(
     user_roles: Optional[List[str]] = None,
     payload_company_id: Optional[int] = None,
     company_scope_source: Optional[Literal["text", "payload", "default"]] = None,
+    attachments: Optional[List[Dict[str, Any]]] = None,
+    thread_attachments: Optional[List[Dict[str, Any]]] = None,
 ) -> AgentState:
     """
     Construct a clean initial AgentState dictionary with standard defaults.
@@ -220,6 +226,8 @@ def create_initial_state(
         "needs_clarification": False,
         "clarification_question": None,
         "clarification_options": [],
+        "attachments": list(attachments) if attachments else [],
+        "thread_attachments": list(thread_attachments) if thread_attachments else [],
         # Multi-tool orchestration state extensions
         "is_multi_tool": is_multi_tool if is_multi_tool is not None else False,
         "active_model": active_model or get_default_model_name(),

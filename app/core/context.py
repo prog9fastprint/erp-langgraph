@@ -7,7 +7,16 @@ from datetime import date, datetime, timedelta, timezone, tzinfo
 import re
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 from zoneinfo import ZoneInfo
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
+try:
+    from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
+except ImportError:
+    class BaseMessage:  # type: ignore
+        content: str = ""
+        type: str = ""
+    class AIMessage(BaseMessage):  # type: ignore
+        pass
+    class HumanMessage(BaseMessage):  # type: ignore
+        pass
 
 from app.core.config import settings
 
@@ -138,6 +147,12 @@ _PAGINATED_COLLECTION_KEYS: Set[str] = {
     "cancel_reason_summary",
     "error_breakdown_by_type",
     "error_breakdown_by_company",
+    "erp_accounts_used",
+    "unmatched_bank_inflows",
+    "unmatched_bank_outflows",
+    "unmatched_erp_entries",
+    "cross_account_suspects",
+    "recommended_adjustments",
 }
 
 _TOTAL_FOUND_COLLECTION_KEYS: Set[str] = {"locations", "alerts"}
@@ -247,6 +262,9 @@ def sanitize_erp_payload(
                     "competitors", "unassigned_company_errors", "log_entry_candidates", "quotation_note_candidates",
                     "fast_moving", "slow_moving", "restock_recommendations", "by_branch", "monthly_breakdown",
                     "cancel_reason_summary", "error_breakdown_by_type", "error_breakdown_by_company",
+                    "erp_accounts_used", "suggested_clarifications", "unmatched_bank_inflows",
+                    "unmatched_bank_outflows", "unmatched_erp_entries", "cross_account_suspects",
+                    "recommended_adjustments",
                 ):
                     sanitized_dict[key] = cleaned_val
             else:
@@ -538,6 +556,7 @@ _KNOWN_RECORD_ATTRS = {
     "due_status",
     "closing_balance",
     "running_balance",
+    "statement_meta",
 }
 
 
@@ -627,7 +646,7 @@ def resolve_tool_record_count(tool_result: Any) -> int:
 
     if any(
         isinstance(tool_result.get(k), dict) and tool_result[k]
-        for k in ("summary", "totals", "confirmed_metrics", "stock_summary", "price_summary")
+        for k in ("summary", "totals", "confirmed_metrics", "stock_summary", "price_summary", "statement_meta")
     ):
         return 1
 

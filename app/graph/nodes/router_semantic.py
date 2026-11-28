@@ -371,6 +371,83 @@ def _try_route_branch_switch_followup(
     return route_res
 
 
+def _list_pdf_attachments(state: Optional[AgentState], include_thread: bool = True) -> List[Dict[str, Any]]:
+    """Collect PDF attachment dicts from current turn and optionally prior thread turns."""
+    if not isinstance(state, dict):
+        return []
+    buckets = ("attachments", "thread_attachments") if include_thread else ("attachments",)
+    pdfs: List[Dict[str, Any]] = []
+    for key in buckets:
+        for att in state.get(key) or []:
+            if not isinstance(att, dict):
+                continue
+            fname = str(att.get("filename") or "").lower()
+            fpath = str(att.get("file_path") or "").lower()
+            ext = str(att.get("ext") or "").lower()
+            if ext == ".pdf" or fname.endswith(".pdf") or fpath.endswith(".pdf"):
+                pdfs.append(att)
+    return pdfs
+
+
+_UNRELATED_PDF_DOMAIN_RE = re.compile(
+    r"\b(?:stok\s+(?:barang|produk|gudang)|kartu\s+stok|warehouse|sku|sales\s*order|"
+    r"shopee|tiktok|tokopedia|lazada|perbandingan\s+harga|selisih\s+harga|"
+    r"potongan\s+(?:fee|marketplace)|laba\s+rugi|neraca\s+keuangan|vendor\s*bills?|tagihan\s+vendor)\b",
+    re.IGNORECASE,
+)
+_THREAD_PDF_EXPLICIT_RE = re.compile(
+    r"\b(?:rekening\s*koran|rekonsiliasi\s+(?:file|pdf|berkas|lampiran|rekening\s*koran)|"
+    r"rekon\s+(?:file|pdf|berkas|lampiran|rekening\s*koran)|"
+    r"ringkasan\s+(?:mutasi|cr|db)|belum\s+(?:dijurnal|dicatat|cocok)|"
+    r"salah\s+kamar|checksum|mutasi\s+(?:cr|db|bank)|uang\s+masuk\s*\(?cr\)?|"
+    r"berkas\s+rekening|lampiran\s+pdf|file\s+pdf|\.pdf)\b",
+    re.IGNORECASE,
+)
+_THREAD_PDF_CONTEXTUAL_RE = re.compile(
+    r"\b(?:rekonsiliasi|rekon|mutasi|selisih|audit|pengeluaran|uang\s+masuk|"
+    r"cabang\s+aktif|semua\s+cabang|khusus\s+(?:untuk\s+)?(?:company|cabang|pt)|"
+    r"berkas|lampiran|file|pdf)\b",
+    re.IGNORECASE,
+)
+
+
+def try_route_pdf_attachment(user_query: str, state: AgentState) -> Optional[Dict[str, Any]]:
+    """
+    Route uploaded PDF bank statements (or follow-up questions referencing a thread PDF)
+    deterministically to accounting.reconcile_bank_statement.
+    """
+    current_pdfs = _list_pdf_attachments(state, include_thread=False)
+    cleaned = (user_query or "").lower().strip()
+
+    if current_pdfs:
+        if cleaned and _UNRELATED_PDF_DOMAIN_RE.search(cleaned) and not _THREAD_PDF_EXPLICIT_RE.search(cleaned):
+            return None
+        return _build_single_tool_route(
+            tool_name="reconcile_bank_statement",
+            domain="accounting",
+            user_query=user_query or f"[Berkas Dilampirkan: {current_pdfs[-1].get('filename', 'statement.pdf')}]",
+        )
+
+    thread_pdfs = _list_pdf_attachments(state, include_thread=True)
+    if thread_pdfs and cleaned:
+        mentions_filename = any(
+            str(att.get("filename") or "").lower() in cleaned
+            for att in thread_pdfs
+            if att.get("filename")
+        )
+        has_explicit_pdf_cue = mentions_filename or bool(_THREAD_PDF_EXPLICIT_RE.search(cleaned))
+        if _UNRELATED_PDF_DOMAIN_RE.search(cleaned) and not has_explicit_pdf_cue:
+            return None
+        is_prior_pdf_recon = state.get("prior_detected_tool") == "reconcile_bank_statement"
+        if has_explicit_pdf_cue or (is_prior_pdf_recon and _THREAD_PDF_CONTEXTUAL_RE.search(cleaned)):
+            return _build_single_tool_route(
+                tool_name="reconcile_bank_statement",
+                domain="accounting",
+                user_query=user_query,
+            )
+    return None
+
+
 def check_hard_guardrails(
     user_query: str,
     state: AgentState,
@@ -380,12 +457,18 @@ def check_hard_guardrails(
     contextual_analysis_fn: Optional[Callable[[str, AgentState], Optional[Dict[str, Any]]]] = None,
 ) -> Optional[Dict[str, Any]]:
     """
-    Evaluate the 4 zero-risk deterministic hard guardrails (+ P&L drill-down fast-path):
+    Evaluate the 4 zero-risk deterministic hard guardrails (+ PDF attachment & P&L drill-down fast-path):
+      0. PDF Bank Statement Attachment Fast-Path
       1. Pure Greeting / Help / Session Meta
       2. Write-Operation Block, Explicit Out-of-Scope, & Explicit Customer Billing
       3. Strict Document Identifier Fast-Path (single-clause only)
       4. Contextual Analysis & P&L Account Drill-Down Short-Circuit
     """
+    if not is_retry and len(clauses) <= 1:
+        pdf_route = try_route_pdf_attachment(user_query, state)
+        if pdf_route is not None:
+            return pdf_route
+
     cleaned = (user_query or "").lower().strip()
     if not cleaned:
         return _build_non_tool_route("general", "general", user_query)

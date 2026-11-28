@@ -33,6 +33,7 @@ from app.graph.nodes.extractors.accounting import (
     _fallback_extract_balance_sheet,
     _fallback_extract_vendor_bills,
     _fallback_extract_bank_reconciliation,
+    _fallback_extract_reconcile_bank_statement,
 )
 from app.graph.nodes.extractors.inventory import (
     _fallback_extract_stock_level,
@@ -111,6 +112,7 @@ __all__ = [
     "_fallback_extract_balance_sheet",
     "_fallback_extract_vendor_bills",
     "_fallback_extract_bank_reconciliation",
+    "_fallback_extract_reconcile_bank_statement",
     "_fallback_extract_stock_level",
     "_fallback_extract_locations",
     "_fallback_extract_product_info",
