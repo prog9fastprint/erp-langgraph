@@ -34,6 +34,8 @@ ACCOUNTING_GENERAL_LEDGER_PATTERNS = [
 
 ACCOUNTING_BANK_RECON_PATTERNS = [
     r"\b(rekonsiliasi\s*bank|bank\s*reconciliation|rekon\s*bank|selisih\s*(?:rekening\s*koran|bank)|statement\s*balance)\b",
+    r"\[berkas\s+dilampirkan:[^\]]*\.pdf[^\]]*\]",
+    r"\b(rekening\s*koran|mutasi\s*bank|rekonsiliasi\s*(?:rekening|koran|bca|mandiri|bni|bri))\b",
 ]
 
 ACCOUNTING_VENDOR_BILLS_PATTERNS = [

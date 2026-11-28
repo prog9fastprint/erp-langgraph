@@ -419,13 +419,15 @@ def try_route_pdf_attachment(user_query: str, state: AgentState) -> Optional[Dic
     current_pdfs = _list_pdf_attachments(state, include_thread=False)
     cleaned = (user_query or "").lower().strip()
 
-    if current_pdfs:
+    has_pdf_in_query = bool(re.search(r"(\[berkas\s+dilampirkan:[^\]]*\.pdf|\b[\w\-.]+\.pdf\b)", cleaned, re.IGNORECASE))
+    if current_pdfs or has_pdf_in_query:
         if cleaned and _UNRELATED_PDF_DOMAIN_RE.search(cleaned) and not _THREAD_PDF_EXPLICIT_RE.search(cleaned):
             return None
+        fallback_prompt = f"[Berkas Dilampirkan: {current_pdfs[-1].get('filename', 'statement.pdf')}]" if current_pdfs else user_query
         return _build_single_tool_route(
             tool_name="reconcile_bank_statement",
             domain="accounting",
-            user_query=user_query or f"[Berkas Dilampirkan: {current_pdfs[-1].get('filename', 'statement.pdf')}]",
+            user_query=user_query or fallback_prompt,
         )
 
     thread_pdfs = _list_pdf_attachments(state, include_thread=True)

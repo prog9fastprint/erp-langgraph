@@ -400,6 +400,10 @@ def _find_latest_pdf_attachment(
             if ext == ".pdf" or fname.endswith(".pdf") or fpath.endswith(".pdf"):
                 pdfs.append(att)
     if not pdfs:
+        m_file = re.search(r"\[Berkas Dilampirkan:\s*([^\]]+)\]", query or "", re.IGNORECASE)
+        if m_file:
+            extracted_name = m_file.group(1).split(",")[0].strip()
+            return {"filename": extracted_name, "file_path": extracted_name, "ext": ".pdf"}
         return None
     q_low = (query or "").lower()
     if q_low:
