@@ -143,6 +143,7 @@ class BankReconciliationFilterSchema(BaseModel):
     journal_name: Optional[str] = Field(None, description="Alias untuk bank_name dalam pencarian buku jurnal bank")
     date_from: Optional[str] = Field(None, description="Tanggal awal rentang rekonsiliasi (YYYY-MM-DD)")
     date_to: Optional[str] = Field(None, description="Tanggal akhir rentang rekonsiliasi (YYYY-MM-DD)")
+    consolidate_branches: bool = Field(False, description="Agregasi akun kembar lintas cabang jika nomor rekening dipakai bersama")
 
     @field_validator("date_from")
     @classmethod
@@ -153,6 +154,23 @@ class BankReconciliationFilterSchema(BaseModel):
     @classmethod
     def validate_date_to(cls, v: Optional[str]) -> Optional[str]:
         return _validate_date_str(v, "date_to")
+
+
+class ReconcileBankStatementFilterSchema(BaseModel):
+    """Input filter schema for accounting.reconcile_bank_statement."""
+    company_id: Optional[int] = Field(None, description="Company ID")
+    pdf_path: Optional[str] = Field(None, description="Path file PDF rekening koran bank (BCA / Mandiri)")
+    attachment_id: Optional[str] = Field(None, description="ID attachment PDF dari unggahan chat")
+    mode: Literal["inspect", "reconcile"] = Field(
+        "reconcile",
+        description="'inspect' untuk cek metadata & opsi klarifikasi; 'reconcile' untuk audit penuh PDF vs GL ERP",
+    )
+    account_codes: Optional[List[str]] = Field(None, description="Daftar kode akun bank ERP opsional")
+    consolidate_branches: bool = Field(True, description="Konsolidasi seluruh cabang yang memakai rekening fisik yang sama")
+    include_cross_check: bool = Field(False, description="Cek jurnal salah kamar di akun bank 112* lainnya")
+    window_days: int = Field(3, ge=0, le=30, description="Toleransi tanggal kliring (hari)")
+    mdr_rate: float = Field(0.007, ge=0.0, le=0.5, description="Tarif komisi MDR QRIS (default 0.007)")
+    max_items: int = Field(50, ge=1, le=200, description="Batas jumlah item selisih per daftar")
 
 
 class JournalEntriesFilterSchema(BaseModel):
@@ -1359,6 +1377,7 @@ TOOL_DOMAIN_MAP: Dict[str, str] = {
     "get_balance_sheet": "accounting",
     "get_vendor_bills": "accounting",
     "get_bank_reconciliation_summary": "accounting",
+    "reconcile_bank_statement": "accounting",
     "get_stock_level": "inventory",
     "get_product_info": "inventory",
     "get_locations": "inventory",
@@ -1387,5 +1406,76 @@ TOOL_DOMAIN_MAP: Dict[str, str] = {
     "get_deduction_and_settlement_summary": "marketplace",
     "get_cashflow_and_balance_summary": "marketplace",
     "get_competitor_insights": "marketplace",
+    # Odoo ERP Retail & POS Tools
+    "odoo_get_stock": "retail_inventory",
+    "odoo_get_products": "retail_inventory",
+    "odoo_get_pos_orders": "pos",
+    "odoo_get_sales_orders": "sales",
+    "odoo_execute_kw": "general",
+    # Mekari Talenta HRIS Tools
+    "talenta_get_employee": "hris",
+    "talenta_get_time_off_balance": "hris",
+    "talenta_get_attendance": "hris",
+    "talenta_get_payroll_summary": "hris",
 }
+
+
+def register_tool_domain(tool_name: str, domain: str) -> None:
+    """Dynamically register a tool and its domain into the global registry at runtime."""
+    TOOL_DOMAIN_MAP[tool_name] = domain
+
+
+# ==============================================================================
+# Multi-System Extension Schemas (Odoo Retail & Talenta HRIS)
+# ==============================================================================
+
+class OdooStockFilterSchema(BaseModel):
+    """Input filter schema for odoo_get_stock."""
+    product_name: Optional[str] = Field(None, description="Nama atau deskripsi produk di Odoo")
+    sku: Optional[str] = Field(None, description="Kode SKU atau default_code produk")
+    warehouse_id: Optional[int] = Field(None, description="ID gudang fisik/transit di Odoo")
+    location_id: Optional[int] = Field(None, description="ID lokasi stock.location spesifik")
+    limit: int = Field(50, ge=1, le=200, description="Batas baris data")
+
+
+class OdooProductsFilterSchema(BaseModel):
+    """Input filter schema for odoo_get_products."""
+    search: Optional[str] = Field(None, description="Kata kunci pencarian nama atau barcode produk")
+    limit: int = Field(20, ge=1, le=100, description="Batas jumlah produk")
+
+
+class OdooPosOrdersFilterSchema(BaseModel):
+    """Input filter schema for odoo_get_pos_orders."""
+    session_id: Optional[int] = Field(None, description="Filter sesi kasir POS")
+    date_from: Optional[str] = Field(None, description="Tanggal awal order POS (YYYY-MM-DD)")
+    date_to: Optional[str] = Field(None, description="Tanggal akhir order POS (YYYY-MM-DD)")
+    limit: int = Field(30, ge=1, le=100, description="Batas baris transaksi")
+
+
+class TalentaEmployeeFilterSchema(BaseModel):
+    """Input filter schema for talenta_get_employee."""
+    employee_id: Optional[str] = Field(None, description="ID karyawan atau employee code")
+    search: Optional[str] = Field(None, description="Nama atau email karyawan")
+    branch_id: Optional[str] = Field(None, description="Filter cabang/kantor karyawan")
+
+
+class TalentaTimeOffFilterSchema(BaseModel):
+    """Input filter schema for talenta_get_time_off_balance."""
+    employee_id: Optional[str] = Field(None, description="ID karyawan atau employee code")
+    year: Optional[int] = Field(None, description="Tahun kuota cuti (contoh: 2026)")
+
+
+class TalentaAttendanceFilterSchema(BaseModel):
+    """Input filter schema for talenta_get_attendance."""
+    employee_id: Optional[str] = Field(None, description="ID karyawan spesifik")
+    date_from: Optional[str] = Field(None, description="Tanggal awal periode presensi (YYYY-MM-DD)")
+    date_to: Optional[str] = Field(None, description="Tanggal akhir periode presensi (YYYY-MM-DD)")
+    branch_id: Optional[str] = Field(None, description="Filter cabang presensi")
+
+
+class TalentaPayrollFilterSchema(BaseModel):
+    """Input filter schema for talenta_get_payroll_summary."""
+    period: Optional[str] = Field(None, description="Periode payroll (format YYYY-MM)")
+    branch_id: Optional[str] = Field(None, description="Filter cabang organisasi")
+
 

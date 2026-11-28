@@ -36,6 +36,7 @@ from app.schemas.tools import (
     BalanceSheetFilterSchema,
     VendorBillsFilterSchema,
     BankReconciliationFilterSchema,
+    ReconcileBankStatementFilterSchema,
     StockLevelFilterSchema,
     ProductInfoFilterSchema,
     VendorInvoiceFilterSchema,
@@ -111,6 +112,7 @@ from app.graph.nodes.extractors import (
     _fallback_extract_account_health,
     _fallback_extract_balance_sheet,
     _fallback_extract_bank_reconciliation,
+    _fallback_extract_reconcile_bank_statement,
     _fallback_extract_cashflow_balance,
     _fallback_extract_competitor_insights,
     _fallback_extract_contacts,
@@ -168,6 +170,7 @@ TOOL_SCHEMA_REGISTRY: Dict[str, Type[BaseModel]] = {
     "get_balance_sheet": BalanceSheetFilterSchema,
     "get_vendor_bills": VendorBillsFilterSchema,
     "get_bank_reconciliation_summary": BankReconciliationFilterSchema,
+    "reconcile_bank_statement": ReconcileBankStatementFilterSchema,
     "get_stock_level": StockLevelFilterSchema,
     "get_product_info": ProductInfoFilterSchema,
     "get_locations": LocationsFilterSchema,
@@ -271,6 +274,8 @@ def _extract_single_tool_params(
             or not has_temporal_expression(sub_query)
         ):
             extracted_dict = dict(fast_params)
+    elif tool_name == "reconcile_bank_statement":
+        extracted_dict = _fallback_extract_reconcile_bank_statement(sub_query, state)
     elif tool_name == "get_bank_reconciliation_summary" and retry_count == 0 and not has_unresolved_temporal:
         fast_params = _fallback_extract_bank_reconciliation(sub_query, today)
         has_unmatched_bank_name = bool(
@@ -413,6 +418,8 @@ def _extract_single_tool_params(
             extracted_dict = _fallback_extract_balance_sheet(sub_query, today, state.get("messages"))
         elif tool_name == "get_vendor_bills":
             extracted_dict = _fallback_extract_vendor_bills(sub_query, today)
+        elif tool_name == "reconcile_bank_statement":
+            extracted_dict = _fallback_extract_reconcile_bank_statement(sub_query, state)
         elif tool_name == "get_bank_reconciliation_summary":
             extracted_dict = _fallback_extract_bank_reconciliation(sub_query, today)
         elif tool_name == "get_stock_history":
@@ -1278,6 +1285,7 @@ __all__ = [
     "_fallback_extract_balance_sheet",
     "_fallback_extract_vendor_bills",
     "_fallback_extract_bank_reconciliation",
+    "_fallback_extract_reconcile_bank_statement",
     "_fallback_extract_top_selling_products",
     "_fallback_extract_contacts",
     "_fallback_extract_sales_orders",

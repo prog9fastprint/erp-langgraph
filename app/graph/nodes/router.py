@@ -107,10 +107,10 @@ logger = logging.getLogger("router_node")
 
 class PlannedToolCall(BaseModel):
     """Structured representation of an individual ERP tool call planned by router."""
-    tool: str = Field(..., description="Target ERP tool name.")
-    domain: Literal["accounting", "inventory", "sales", "marketplace", "hr", "purchasing", "general"] = Field(
+    tool: str = Field(..., description="Target system tool name.")
+    domain: str = Field(
         ...,
-        description="Target ERP domain: 'accounting', 'inventory', 'sales', or 'marketplace'."
+        description="Target domain: 'accounting', 'inventory', 'sales', 'marketplace', 'hris', 'retail_inventory', 'pos', etc."
     )
     sub_query: Optional[str] = Field(
         None,
@@ -377,7 +377,7 @@ def _has_product_scoped_sales_intent(cleaned: str) -> bool:
     return False
 
 
-def classify_query_rule_based(query: str) -> Optional[Dict[str, Any]]:
+def classify_query_rule_based(query: str, state: Optional[AgentState] = None) -> Optional[Dict[str, Any]]:
     """
     Deterministic rule-based classifier for ERP queries.
     Detects single or multi-intent requests across inventory and accounting.
@@ -434,10 +434,15 @@ def classify_query_rule_based(query: str) -> Optional[Dict[str, Any]]:
     if m_bs:
         candidates.append(("get_balance_sheet", "accounting", m_bs.start()))
 
-    # Accounting: Bank Reconciliation Summary
+    # Accounting: Bank Reconciliation (PDF Statement vs Database Summary)
     m_recon = _find_first_match(ACCOUNTING_BANK_RECON_PATTERNS, cleaned)
     if m_recon:
-        candidates.append(("get_bank_reconciliation_summary", "accounting", m_recon.start()))
+        has_pdf = False
+        if state is not None:
+            from app.graph.nodes.router_semantic import _list_pdf_attachments
+            has_pdf = bool(_list_pdf_attachments(state, include_thread=True))
+        recon_tool = "reconcile_bank_statement" if has_pdf else "get_bank_reconciliation_summary"
+        candidates.append((recon_tool, "accounting", m_recon.start()))
 
     # Accounting: General Ledger (Buku Besar)
     m_gl = _find_first_match(ACCOUNTING_GENERAL_LEDGER_PATTERNS, cleaned)
@@ -1135,7 +1140,7 @@ def _classify_decomposed_clauses_core(
         clause = raw_clause.strip()
         if not clause:
             continue
-        c_res = classify_query_rule_based(clause)
+        c_res = classify_query_rule_based(clause, state=state)
         if c_res is None:
             active_model = model if model is not None else (model_factory() if model_factory else None)
             if active_model is not None:
@@ -1520,25 +1525,30 @@ def _prepare_router_context(
         return cached_model
 
     if not user_query:
-        return (
-            {
-                "detected_domain": "general",
-                "detected_tool": None,
-                "query_mode": "general",
-                "rag_query": None,
-                "rag_queries": [],
-                "sub_questions": [],
-                "non_tool_questions": [],
-                "is_multi_tool": False,
-                "detected_domains": ["general"],
-                "detected_tools": [],
-                "active_tools": [],
-            },
-            False,
-            None,
-            user_query,
-            _get_model,
-        )
+        atts = state.get("attachments") or []
+        if atts:
+            names = ", ".join(str(a.get("filename") or "file") for a in atts if isinstance(a, dict))
+            user_query = f"[Berkas Dilampirkan: {names}]"
+        else:
+            return (
+                {
+                    "detected_domain": "general",
+                    "detected_tool": None,
+                    "query_mode": "general",
+                    "rag_query": None,
+                    "rag_queries": [],
+                    "sub_questions": [],
+                    "non_tool_questions": [],
+                    "is_multi_tool": False,
+                    "detected_domains": ["general"],
+                    "detected_tools": [],
+                    "active_tools": [],
+                },
+                False,
+                None,
+                user_query,
+                _get_model,
+            )
 
     is_retry = is_retry_query(user_query)
     prior_query = find_previous_user_query(state.get("messages")) if is_retry else None
@@ -1580,7 +1590,7 @@ def _router_single_and_llm_steps(
 
     # Step 1: Fast Rule / Regex Pattern Matching (Single-Clause)
     try:
-        rule_result = classify_query_rule_based(user_query)
+        rule_result = classify_query_rule_based(user_query, state=state)
         if rule_result is not None:
             from app.services.tool_registry_service import get_tool_registry_service
             registry = get_tool_registry_service()
@@ -2039,6 +2049,8 @@ def _infer_prior_erp_domain_and_tool(
             return "accounting", "get_balance_sheet"
         if "buku besar" in txt or "general ledger" in txt:
             return "accounting", "get_general_ledger"
+        if "berkas rekening koran" in txt or "hasil rekonsiliasi rekening koran" in txt:
+            return "accounting", "reconcile_bank_statement"
         if "rekonsiliasi bank" in txt:
             return "accounting", "get_bank_reconciliation_summary"
         if "tagihan faktur vendor" in txt or "vendor bills" in txt:
@@ -2270,6 +2282,11 @@ def _legacy_router_node_impl(
 ) -> Dict[str, Any]:
     """Legacy regex-first synchronous routing pipeline."""
     if not is_retry:
+        from app.graph.nodes.router_semantic import try_route_pdf_attachment
+        pdf_res = try_route_pdf_attachment(eff_query, state)
+        if pdf_res is not None:
+            return pdf_res
+
         ctx_res = _try_route_contextual_analysis(eff_query, state)
         if ctx_res is not None:
             return ctx_res
@@ -2330,6 +2347,11 @@ async def _alegacy_router_node_impl(
 ) -> Dict[str, Any]:
     """Legacy regex-first asynchronous routing pipeline."""
     if not is_retry:
+        from app.graph.nodes.router_semantic import try_route_pdf_attachment
+        pdf_res = try_route_pdf_attachment(eff_query, state)
+        if pdf_res is not None:
+            return pdf_res
+
         ctx_res = _try_route_contextual_analysis(eff_query, state)
         if ctx_res is not None:
             return ctx_res

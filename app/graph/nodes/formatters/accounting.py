@@ -419,7 +419,17 @@ def format_get_bank_reconciliation_summary(
 
     lines.append(f"### Ringkasan Rekonsiliasi Bank — {j_name}\n")
     lines.append(f"- **Buku Jurnal**: {j_name} (`{acc_c}` — {acc_n})")
-    lines.append(f"- **Periode**: {d_from} s/d {d_to}\n")
+    lines.append(f"- **Periode**: {d_from} s/d {d_to}")
+    cons_accs = tool_result.get("consolidated_accounts") or []
+    if cons_accs:
+        cons_labels = ", ".join(
+            f"`{ca.get('account_code')}` ({ca.get('company_name') or '-'})"
+            for ca in cons_accs
+            if isinstance(ca, dict)
+        )
+        if cons_labels:
+            lines.append(f"- **Konsolidasi Akun Cabang**: {cons_labels}")
+    lines.append("")
 
     stmt_bal = summary.get("bank_statement_balance", 0.0)
     book_bal = summary.get("erp_book_balance", 0.0)
@@ -443,6 +453,127 @@ def format_get_bank_reconciliation_summary(
     return "\n".join(lines)
 
 
+def format_reconcile_bank_statement(
+    tool: str,
+    tool_result: Any,
+    user_query: Optional[str] = None,
+    extracted_params: Optional[Dict[str, Any]] = None,
+    default_company_id: Optional[int] = None,
+) -> str:
+    """Format accounting.reconcile_bank_statement payload into Markdown."""
+    if not isinstance(tool_result, dict):
+        return "Hasil rekonsiliasi rekening koran tidak valid."
+
+    meta = tool_result.get("statement_meta") or {}
+    checksum = tool_result.get("checksum_gate") or {}
+    summary = tool_result.get("summary") or {}
+    bank_code = meta.get("bank_code") or "BANK"
+    acc_no = meta.get("account_number") or "-"
+    acc_holder = meta.get("account_holder") or "-"
+    period = meta.get("statement_period") or "-"
+    currency = meta.get("currency") or "IDR"
+    status = tool_result.get("status") or "DISCREPANCY_FOUND"
+    scope = tool_result.get("scope") or "-"
+
+    lines: List[str] = []
+    status_label = "KLOP 100% (Selisih Rp 0)" if status == "KLOP_100" else "Terdapat Selisih / Mutasi Belum Terjurnal"
+    lines.append(f"### Hasil Rekonsiliasi Rekening Koran {bank_code} `{acc_no}` — {period}\n")
+    lines.append(f"- **Pemilik Rekening**: {acc_holder}")
+    lines.append(f"- **Mata Uang / Scope**: {currency} &bull; `{scope}`")
+    lines.append(f"- **Golden Checksum Gate PDF**: {'**PASS**' if checksum.get('passed') else '**FAIL (Perlu Cek Parser)**'}")
+    lines.append(f"- **Status Audit**: **{status_label}**")
+
+    erp_accs = tool_result.get("erp_accounts_used") or []
+    if erp_accs:
+        acc_labels = ", ".join(
+            f"`{a.get('account_code')}` ({a.get('company_name') or a.get('account_name') or '-'})"
+            for a in erp_accs
+        )
+        lines.append(f"- **Akun GL ERP Terkait**: {acc_labels}")
+
+    lines.append("")
+    lines.append("| Indikator Mutasi | Rekening Koran Bank | Buku Besar (GL) ERP | Selisih |")
+    lines.append("|:---|:---|:---|:---|")
+    lines.append(
+        f"| **Uang Masuk (Bank CR / GL Debit)** | {_format_rupiah(summary.get('bank_total_cr', 0.0))} | "
+        f"{_format_rupiah(summary.get('erp_total_debit', 0.0))} | "
+        f"**{_format_rupiah(summary.get('difference_inflow', 0.0))}** |"
+    )
+    lines.append(
+        f"| **Uang Keluar (Bank DB / GL Kredit)** | {_format_rupiah(summary.get('bank_total_db', 0.0))} | "
+        f"{_format_rupiah(summary.get('erp_total_credit', 0.0))} | "
+        f"**{_format_rupiah(summary.get('difference_outflow', 0.0))}** |"
+    )
+    lines.append(
+        f"\n- **Saldo Awal Bank**: {_format_rupiah(meta.get('saldo_awal', 0.0))} &bull; "
+        f"**Saldo Akhir Bank**: **{_format_rupiah(meta.get('saldo_akhir', 0.0))}**"
+    )
+    lines.append(
+        f"- **Transaksi Cocok**: **{summary.get('matched_count', 0)}** &bull; "
+        f"Belum di ERP (CR: **{summary.get('unmatched_bank_inflows_count', 0)}**, "
+        f"DB: **{summary.get('unmatched_bank_outflows_count', 0)}**) &bull; "
+        f"Jurnal GL Tanpa Mutasi Bank: **{summary.get('unmatched_erp_count', 0)}**"
+    )
+
+    unm_cr = tool_result.get("unmatched_bank_inflows") or []
+    if unm_cr:
+        lines.append("\n#### 1. Uang Masuk Bank (CR) Belum Tercatat di ERP")
+        lines.append("| No | Tanggal | Nominal | Keterangan Bank | Diagnosis & Rekomendasi (Read-Only) |")
+        lines.append("|:---|:---|:---|:---|:---|")
+        for idx, item in enumerate(unm_cr[:25], 1):
+            desc = str(item.get("description") or "-")[:90].replace("|", "/")
+            diag = item.get("diagnosis") or item.get("root_cause") or "-"
+            rec = f"{diag} (Debit: `{item.get('recommended_debit')}` / Kredit: `{item.get('recommended_credit')}`)"
+            lines.append(f"| {idx} | {item.get('date') or '-'} | {_format_rupiah(item.get('amount', 0.0))} | {desc} | {rec} |")
+
+    unm_db = tool_result.get("unmatched_bank_outflows") or []
+    if unm_db:
+        lines.append("\n#### 2. Pengeluaran Bank (DB) Belum Tercatat di ERP")
+        lines.append("| No | Tanggal | Nominal | Keterangan Bank | Diagnosis & Rekomendasi (Read-Only) |")
+        lines.append("|:---|:---|:---|:---|:---|")
+        for idx, item in enumerate(unm_db[:25], 1):
+            desc = str(item.get("description") or "-")[:90].replace("|", "/")
+            diag = item.get("diagnosis") or item.get("root_cause") or "-"
+            rec = f"{diag} (Debit: `{item.get('recommended_debit')}` / Kredit: `{item.get('recommended_credit')}`)"
+            lines.append(f"| {idx} | {item.get('date') or '-'} | {_format_rupiah(item.get('amount', 0.0))} | {desc} | {rec} |")
+
+    unm_erp = tool_result.get("unmatched_erp_entries") or []
+    if unm_erp:
+        lines.append("\n#### 3. Jurnal GL ERP Tidak Ditemukan di Rekening Koran")
+        lines.append("| No | Tanggal | No. Jurnal | Cabang | Arah | Nominal |")
+        lines.append("|:---|:---|:---|:---|:---|:---|")
+        for idx, item in enumerate(unm_erp[:25], 1):
+            lines.append(
+                f"| {idx} | {item.get('date') or '-'} | `{item.get('number') or '-'}` | "
+                f"{item.get('company_name') or '-'} | {item.get('direction') or '-'} | {_format_rupiah(item.get('amount', 0.0))} |"
+            )
+
+    cross = tool_result.get("cross_account_suspects") or []
+    if cross:
+        lines.append("\n#### 4. Dugaan Salah Kamar (Tercatat di Rekening Bank Lain)")
+        lines.append("| No | Tgl Bank | Nominal | No. Jurnal ERP | Akun ERP | Keterangan |")
+        lines.append("|:---|:---|:---|:---|:---|:---|")
+        for idx, item in enumerate(cross[:20], 1):
+            lines.append(
+                f"| {idx} | {item.get('bank_date') or '-'} | {_format_rupiah(item.get('amount', 0.0))} | "
+                f"`{item.get('erp_number') or '-'}` | `{item.get('erp_account_code') or '-'}` | {item.get('rule') or '-'} |"
+            )
+
+    adjs = tool_result.get("recommended_adjustments") or []
+    real_adjs = [a for a in adjs if float(a.get("nominal") or 0.0) > 0]
+    if real_adjs:
+        lines.append("\n#### Rekomendasi Jurnal Penyesuaian Manual (Read-Only)")
+        lines.append("| No | Tanggal | Tipe Penyesuaian | Akun Debit | Akun Kredit | Nominal |")
+        lines.append("|:---|:---|:---|:---|:---|:---|")
+        for a in real_adjs:
+            lines.append(
+                f"| {a.get('no')} | {a.get('tanggal')} | {a.get('tipe_penyesuaian')} | "
+                f"{a.get('akun_debit')} | {a.get('akun_kredit')} | **{_format_rupiah(a.get('nominal', 0.0))}** |"
+            )
+
+    return "\n".join(lines)
+
+
 ACCOUNTING_FORMATTERS: Dict[str, Callable[..., str]] = {
     "fetch_vendor_invoices": format_get_journal_entries,
     "get_journal_entries": format_get_journal_entries,
@@ -452,4 +583,5 @@ ACCOUNTING_FORMATTERS: Dict[str, Callable[..., str]] = {
     "get_balance_sheet": format_get_balance_sheet,
     "get_vendor_bills": format_get_vendor_bills,
     "get_bank_reconciliation_summary": format_get_bank_reconciliation_summary,
+    "reconcile_bank_statement": format_reconcile_bank_statement,
 }

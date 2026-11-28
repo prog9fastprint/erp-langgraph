@@ -3,7 +3,7 @@ Chat schemas for FastPrint ERP LangGraph AI Orchestrator API.
 Provides request and response validation models for the /api/v1/chat endpoint.
 """
 from typing import Any, Dict, List, Optional
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 MAX_QUERY_LENGTH = 4_000
@@ -14,6 +14,20 @@ MAX_USER_ID_LENGTH = 128
 MAX_COMPANY_IDS_COUNT = 50
 MAX_USER_ROLES_COUNT = 100
 MAX_TOKEN_LENGTH = 8_192
+MAX_ATTACHMENTS_COUNT = 10
+MAX_THREAD_ATTACHMENTS_COUNT = 50
+
+
+class ChatAttachmentItem(BaseModel):
+    """Metadata for a file attached to a user message or persisted in thread history."""
+    model_config = ConfigDict(extra="ignore")
+
+    attachment_id: Optional[str] = Field(default=None, max_length=128)
+    filename: str = Field(..., min_length=1, max_length=512)
+    file_path: str = Field(..., min_length=1, max_length=2048)
+    size: Optional[int] = Field(default=0, ge=0)
+    mime_type: Optional[str] = Field(default="", max_length=256)
+    ext: Optional[str] = Field(default="", max_length=32)
 
 
 class ChatMessageHistoryItem(BaseModel):
@@ -32,7 +46,7 @@ class ChatRequest(BaseModel):
     """
     model_config = ConfigDict(extra="ignore")
 
-    query: str = Field(..., min_length=1, max_length=MAX_QUERY_LENGTH, description="Natural language query from user")
+    query: str = Field(default="", max_length=MAX_QUERY_LENGTH, description="Natural language query from user")
     company_id: Optional[int] = Field(default=1, description="Target ERP company ID (defaults to 1)")
     company_ids: Optional[List[int]] = Field(
         default=None,
@@ -58,15 +72,33 @@ class ChatRequest(BaseModel):
         max_length=MAX_HISTORY_ITEMS,
         description="Optional list of recent conversation messages for stateless memory recovery",
     )
+    attachments: Optional[List[ChatAttachmentItem]] = Field(
+        default=None,
+        max_length=MAX_ATTACHMENTS_COUNT,
+        description="Optional list of file attachments uploaded in this turn",
+    )
+    thread_attachments: Optional[List[ChatAttachmentItem]] = Field(
+        default=None,
+        max_length=MAX_THREAD_ATTACHMENTS_COUNT,
+        description="Optional list of prior file attachments persisted on the thread",
+    )
 
     @field_validator("query")
     @classmethod
-    def validate_non_empty_query(cls, v: str) -> str:
-        """Ensure query is not empty or pure whitespace."""
-        cleaned = v.strip()
-        if not cleaned:
-            raise ValueError("Query string cannot be empty or whitespace only.")
-        return cleaned
+    def normalize_query(cls, v: str) -> str:
+        """Trim surrounding whitespace."""
+        return (v or "").strip()
+
+    @model_validator(mode="after")
+    def validate_query_or_attachments(self) -> "ChatRequest":
+        """Require non-empty query unless at least one attachment is provided."""
+        if not self.query:
+            if self.attachments:
+                names = ", ".join(a.filename for a in self.attachments)
+                self.query = f"[Berkas Dilampirkan: {names}]"
+            else:
+                raise ValueError("Query string cannot be empty or whitespace only.")
+        return self
 
 
 class FollowupSuggestion(BaseModel):

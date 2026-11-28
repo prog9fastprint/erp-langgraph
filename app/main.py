@@ -304,6 +304,10 @@ def _build_workflow_kwargs(
         else:
             logger.warning("Stripping unverified client-supplied user_roles without verified X-Internal-Service-Key.")
             kwargs["user_roles"] = []
+    if payload.attachments is not None:
+        kwargs["attachments"] = [a.model_dump() for a in payload.attachments]
+    if payload.thread_attachments is not None:
+        kwargs["thread_attachments"] = [a.model_dump() for a in payload.thread_attachments]
     return kwargs
 
 

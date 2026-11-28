@@ -590,12 +590,11 @@ def _make_tool_fetcher(domain: str, tool_name: str) -> Callable[..., Any]:
     return _fetcher
 
 
-# Declaratively bind fetch_<name> helpers for every get_* tool in TOOL_DOMAIN_MAP
+# Declaratively bind tool fetch helpers for every tool in TOOL_DOMAIN_MAP
 for _tool_name, _domain in TOOL_DOMAIN_MAP.items():
-    if _tool_name.startswith("get_"):
-        _method_name = f"fetch_{_tool_name[4:]}"
-        if not hasattr(DjangoCoreClient, _method_name):
-            setattr(DjangoCoreClient, _method_name, _make_tool_fetcher(_domain, _tool_name))
+    _method_name = f"fetch_{_tool_name[4:]}" if _tool_name.startswith("get_") else _tool_name
+    if not hasattr(DjangoCoreClient, _method_name):
+        setattr(DjangoCoreClient, _method_name, _make_tool_fetcher(_domain, _tool_name))
 
 
 # Class alias for seamless naming compatibility

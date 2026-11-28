@@ -7,7 +7,12 @@ router, extractor, tool_node, synthesizer, and workflow.
 """
 import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple
-from langchain_core.messages import HumanMessage
+try:
+    from langchain_core.messages import HumanMessage
+except ImportError:
+    class HumanMessage:  # type: ignore
+        """Fallback lightweight HumanMessage stub when langchain_core is not present."""
+        pass
 
 from app.core.context import has_anaphoric_reference
 
@@ -139,6 +144,54 @@ _AI_REPORT_BRANCH_HEADER_RE = re.compile(
 )
 
 
+class BranchRegistry:
+    """
+    Dynamic Registry for Multi-Tenant / Dynamic Branch and Company Mapping.
+    Permits external systems (Odoo, ERPs, Retail POS) to register their branches dynamically.
+    """
+    def __init__(self) -> None:
+        self._tenants: Dict[str, Dict[str, Any]] = {}
+        self._default_branch_map = BRANCH_COMPANY_MAP
+        self._default_name_map = COMPANY_NAME_MAP
+
+    def register_tenant(
+        self,
+        tenant_id: str,
+        branch_map: Dict[str, int],
+        name_map: Dict[int, str],
+    ) -> None:
+        self._tenants[tenant_id] = {
+            "branch_map": {k.lower().strip(): int(v) for k, v in branch_map.items()},
+            "name_map": {int(k): str(v) for k, v in name_map.items()},
+        }
+
+    def get_branch_map(self, tenant_id: Optional[str] = None) -> Dict[str, int]:
+        if tenant_id and tenant_id in self._tenants:
+            return self._tenants[tenant_id]["branch_map"]
+        return self._default_branch_map
+
+    def get_name_map(self, tenant_id: Optional[str] = None) -> Dict[int, str]:
+        if tenant_id and tenant_id in self._tenants:
+            return self._tenants[tenant_id]["name_map"]
+        return self._default_name_map
+
+    def add_branch(
+        self,
+        branch_key: str,
+        company_id: int,
+        display_name: Optional[str] = None,
+        tenant_id: Optional[str] = None,
+    ) -> None:
+        b_map = self.get_branch_map(tenant_id)
+        n_map = self.get_name_map(tenant_id)
+        b_map[branch_key.lower().strip()] = int(company_id)
+        if display_name:
+            n_map[int(company_id)] = str(display_name)
+
+
+branch_registry = BranchRegistry()
+
+
 def is_cross_branch_account_code(
     account_code: Optional[str],
     target_company_id: Optional[int],
@@ -159,7 +212,10 @@ def is_cross_branch_account_code(
         return False
 
 
-def resolve_all_branch_company_ids(text: Optional[str]) -> Tuple[List[int], bool]:
+def resolve_all_branch_company_ids(
+    text: Optional[str],
+    tenant_id: Optional[str] = None,
+) -> Tuple[List[int], bool]:
     """
     Resolve multiple branch/city mentions or 'semua cabang' into a list of company_ids.
     Filters out contrastive/negated branches (e.g. 'kenapa masih ho bukanya aku minta mainstore')
@@ -172,12 +228,15 @@ def resolve_all_branch_company_ids(text: Optional[str]) -> Tuple[List[int], bool
         return [], False
     cleaned = text.lower().strip()
 
+    active_name_map = branch_registry.get_name_map(tenant_id)
+    active_branch_map = branch_registry.get_branch_map(tenant_id)
+
     # Check for all-companies / network-wide rollup keywords
     if any(re.search(rf"\b{re.escape(kw)}\b", cleaned) for kw in ALL_COMPANIES_KEYWORDS):
-        return sorted(list(COMPANY_NAME_MAP.keys())), True
+        return sorted(list(active_name_map.keys())), True
 
     matched_spans: List[Tuple[int, int, int, bool]] = []  # (start_idx, end_idx, company_id, is_negated)
-    for branch_key in sorted(BRANCH_COMPANY_MAP.keys(), key=lambda k: -len(k)):
+    for branch_key in sorted(active_branch_map.keys(), key=lambda k: -len(k)):
         esc_key = re.escape(branch_key)
         if branch_key in _PREFIX_ONLY_BRANCH_KEYS:
             pattern = rf"\b{_BRANCH_PREFIX}{esc_key}\b"
@@ -193,7 +252,7 @@ def resolve_all_branch_company_ids(text: Optional[str]) -> Tuple[List[int], bool
             if not any(max(start, s) < min(end, e) for s, e, _, _ in matched_spans):
                 prefix_window = cleaned[max(0, start - 32):start]
                 is_negated = bool(_CONTRASTIVE_NEGATED_BRANCH_RE.search(prefix_window))
-                matched_spans.append((start, end, BRANCH_COMPANY_MAP[branch_key], is_negated))
+                matched_spans.append((start, end, active_branch_map[branch_key], is_negated))
 
     matched_spans.sort(key=lambda x: x[0])
     positive_spans = [item for item in matched_spans if not item[3]]
@@ -209,14 +268,17 @@ def resolve_all_branch_company_ids(text: Optional[str]) -> Tuple[List[int], bool
     return ordered_ids, False
 
 
-def resolve_branch_company_id(text: Optional[str]) -> Optional[int]:
+def resolve_branch_company_id(
+    text: Optional[str],
+    tenant_id: Optional[str] = None,
+) -> Optional[int]:
     """
-    Resolve single Indonesian city or branch mention into official FastPrint ERP company_id.
+    Resolve single Indonesian city or branch mention into official company_id.
     Matches phrases like 'cabang bandung', 'dicabang bandung', 'di bandung', 'kantor pusat', etc.
     """
     if not text:
         return None
-    ids, is_all = resolve_all_branch_company_ids(text)
+    ids, is_all = resolve_all_branch_company_ids(text, tenant_id=tenant_id)
     if is_all:
         return None
     return ids[0] if ids else None
@@ -339,6 +401,8 @@ __all__ = [
     "COMPANY_NAME_MAP",
     "ALL_COMPANIES_KEYWORDS",
     "LOCATION_STOP_WORDS",
+    "BranchRegistry",
+    "branch_registry",
     "is_cross_branch_account_code",
     "resolve_all_branch_company_ids",
     "resolve_branch_company_id",
